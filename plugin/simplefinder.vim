@@ -26,27 +26,6 @@ command! SimpleFinderRecent          simplefinder#RecentFiles()
 command! SimpleFinderBuffers         simplefinder#Buffers()
 
 # =============================================================
-# Keybindings (matching vim-clap)
-# =============================================================
-# Interactive grep
-nnoremap <silent> <leader>st <Cmd>SimpleFinderIGrep<CR>
-# Grep
-nnoremap <silent> <leader>sg <Cmd>SimpleFinderGrep<CR>
-xnoremap <silent> <leader>sg :<C-U>call simplefinder#GrepVisual()<CR>
-# Grep word under cursor
-nnoremap <silent> <leader>sw <Cmd>call simplefinder#GrepWord()<CR>
-xnoremap <silent> <leader>sw :<C-U>call simplefinder#GrepVisual()<CR>
-# File finder
-nnoremap <silent> <leader>ff <Cmd>SimpleFinderFiles<CR>
-nnoremap <silent> <leader><Space> <Cmd>SimpleFinderFiles<CR>
-# Recent files
-nnoremap <silent> <leader>fr <Cmd>SimpleFinderRecent<CR>
-nnoremap <silent> <leader>fo <Cmd>SimpleFinderRecent<CR>
-nnoremap <silent> <leader>fh <Cmd>SimpleFinderRecent<CR>
-# Buffers
-nnoremap <silent> <leader>bb <Cmd>SimpleFinderBuffers<CR>
-
-# =============================================================
 # Highlights
 # =============================================================
 highlight default SFinderBorder   ctermfg=75  guifg=#5fafff
