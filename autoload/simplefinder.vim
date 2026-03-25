@@ -630,9 +630,9 @@ export def Buffers()
     })
   endfor
   sort(s_all_buffers, (a, b) => b.lastused - a.lastused)
+  PopupOpen('buffers')
   s_items = copy(s_all_buffers)
   s_total = len(s_items)
-  PopupOpen('buffers')
   PopupRender()
 enddef
 
@@ -676,9 +676,9 @@ export def RecentFiles()
     combined = combined[: mx - 1]
   endif
   s_all_recent = mapnew(combined, (_, f) => ({path: fnamemodify(f, ':~:.')}))
+  PopupOpen('recent')
   s_items = copy(s_all_recent)
   s_total = len(s_items)
-  PopupOpen('recent')
   PopupRender()
 enddef
 
