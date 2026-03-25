@@ -317,7 +317,7 @@ def PopupRender()
   add(lines, title_line)
 
   # Input line
-  add(lines, ' > ' .. s_query .. "\u{2581}")
+  add(lines, ' > ' .. s_query .. "\u2581")
 
   # Separator
   add(lines, repeat('─', width))
@@ -340,7 +340,7 @@ def PopupRender()
   while display_count < max_items && idx < len(s_items)
     var item = s_items[idx]
     var line = ''
-    var marker = idx == s_cursor_idx ? "\u{25b8} " : '  '
+    var marker = idx == s_cursor_idx ? "\u25b8 " : '  '
 
     if s_mode ==# 'files' || s_mode ==# 'recent'
       line = marker .. get(item, 'path', '')
@@ -357,7 +357,7 @@ def PopupRender()
 
     # Truncate if too long
     if strchars(line) > width
-      line = strcharpart(line, 0, width - 1) .. "\u{2026}"
+      line = strcharpart(line, 0, width - 1) .. "\u2026"
     endif
     add(lines, line)
     display_count += 1
@@ -371,7 +371,7 @@ def PopupRender()
   endwhile
 
   # Help line
-  add(lines, ' \u{23ce} open  ^v vsplit  ^x split  ^t tab  esc close')
+  add(lines, " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close")
 
   # Write to buffer
   setbufline(s_popup_bufnr, 1, lines)
