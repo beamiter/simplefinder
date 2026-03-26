@@ -22,6 +22,7 @@ var s_total: number = 0
 var s_current_id: number = 0
 var s_debounce_timer: number = 0
 var s_project_root: string = ''
+var s_scroll_off: number = 0
 
 # ─────────────────── Recent files ───────────────────
 
@@ -334,32 +335,12 @@ def PopupRender()
   if s_cursor_idx >= max_items
     scroll_off = s_cursor_idx - max_items + 1
   endif
+  s_scroll_off = scroll_off
 
   var display_count = 0
   var idx = scroll_off
   while display_count < max_items && idx < len(s_items)
-    var item = s_items[idx]
-    var line = ''
-    var marker = idx == s_cursor_idx ? "\u25b8 " : '  '
-
-    if s_mode ==# 'files' || s_mode ==# 'recent'
-      line = marker .. get(item, 'path', '')
-    elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
-      var path = get(item, 'path', '')
-      var lnum = get(item, 'lnum', 0)
-      var text = get(item, 'text', '')
-      line = marker .. path .. ':' .. string(lnum) .. ': ' .. text
-    elseif s_mode ==# 'buffers'
-      var path = get(item, 'path', '')
-      var mod = get(item, 'modified', 0) ? ' [+]' : ''
-      line = marker .. path .. mod
-    endif
-
-    # Truncate if too long
-    if strchars(line) > width
-      line = strcharpart(line, 0, width - 1) .. "\u2026"
-    endif
-    add(lines, line)
+    add(lines, FormatItemLine(idx, width))
     display_count += 1
     idx += 1
   endwhile
@@ -373,17 +354,69 @@ def PopupRender()
   # Help line
   add(lines, " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close")
 
-  # Write to buffer
-  setbufline(s_popup_bufnr, 1, lines)
-  # Remove extra lines if buffer had more before
-  var buflines = getbufline(s_popup_bufnr, 1, '$')
-  if len(buflines) > len(lines)
-    deletebufline(s_popup_bufnr, len(lines) + 1, '$')
-  endif
-
-  # Refresh popup
+  # Update popup content
   if s_popup_id > 0
     popup_settext(s_popup_id, lines)
+  endif
+enddef
+
+def FormatItemLine(idx: number, width: number): string
+  var item = s_items[idx]
+  var marker = idx == s_cursor_idx ? "\u25b8 " : '  '
+  var line = ''
+
+  if s_mode ==# 'files' || s_mode ==# 'recent'
+    line = marker .. get(item, 'path', '')
+  elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
+    var path = get(item, 'path', '')
+    var lnum = get(item, 'lnum', 0)
+    var text = get(item, 'text', '')
+    line = marker .. path .. ':' .. string(lnum) .. ': ' .. text
+  elseif s_mode ==# 'buffers'
+    var path = get(item, 'path', '')
+    var mod = get(item, 'modified', 0) ? ' [+]' : ''
+    line = marker .. path .. mod
+  endif
+
+  if strchars(line) > width
+    line = strcharpart(line, 0, width - 1) .. "\u2026"
+  endif
+  return line
+enddef
+
+def PopupMoveCursor(old_idx: number, new_idx: number)
+  if s_popup_id == 0
+    return
+  endif
+
+  var height = get(g:, 'simplefinder_popup_height', 20)
+  var max_items = height - 4
+  if max_items < 1
+    max_items = 1
+  endif
+
+  # Check if scrolling is needed
+  var new_scroll_off = 0
+  if new_idx >= max_items
+    new_scroll_off = new_idx - max_items + 1
+  endif
+
+  if new_scroll_off != s_scroll_off
+    # Viewport changed — full re-render needed
+    PopupRender()
+    return
+  endif
+
+  var width = get(g:, 'simplefinder_popup_width', 80)
+  # Buffer line = display_position + 4 (title + input + sep + 1-indexed)
+  var old_bufline = old_idx - s_scroll_off + 4
+  var new_bufline = new_idx - s_scroll_off + 4
+
+  if old_idx >= 0 && old_idx < len(s_items)
+    setbufline(s_popup_bufnr, old_bufline, FormatItemLine(old_idx, width))
+  endif
+  if new_idx >= 0 && new_idx < len(s_items)
+    setbufline(s_popup_bufnr, new_bufline, FormatItemLine(new_idx, width))
   endif
 enddef
 
@@ -431,15 +464,17 @@ def PopupFilter(winid: number, key: string): bool
   # Navigation
   if key ==# "\<C-j>" || key ==# "\<C-n>" || key ==# "\<Down>" || key ==# "\<Tab>"
     if s_cursor_idx < len(s_items) - 1
+      var old = s_cursor_idx
       s_cursor_idx += 1
-      PopupRender()
+      PopupMoveCursor(old, s_cursor_idx)
     endif
     return true
   endif
   if key ==# "\<C-k>" || key ==# "\<C-p>" || key ==# "\<Up>" || key ==# "\<S-Tab>"
     if s_cursor_idx > 0
+      var old = s_cursor_idx
       s_cursor_idx -= 1
-      PopupRender()
+      PopupMoveCursor(old, s_cursor_idx)
     endif
     return true
   endif
@@ -640,16 +675,16 @@ def FilterBuffers()
   if s_query ==# ''
     s_items = copy(s_all_buffers)
   else
+    var by_path: dict<any> = {}
+    for buf in s_all_buffers
+      by_path[buf.path] = buf
+    endfor
     s_items = []
     var paths = mapnew(s_all_buffers, (_, v) => v.path)
-    var matched = matchfuzzy(paths, s_query)
-    for mp in matched
-      for buf in s_all_buffers
-        if buf.path ==# mp
-          add(s_items, buf)
-          break
-        endif
-      endfor
+    for mp in matchfuzzy(paths, s_query)
+      if has_key(by_path, mp)
+        add(s_items, by_path[mp])
+      endif
     endfor
   endif
   s_total = len(s_items)
@@ -686,16 +721,16 @@ def FilterRecentFiles()
   if s_query ==# ''
     s_items = copy(s_all_recent)
   else
+    var by_path: dict<any> = {}
+    for item in s_all_recent
+      by_path[item.path] = item
+    endfor
     s_items = []
     var paths = mapnew(s_all_recent, (_, v) => v.path)
-    var matched = matchfuzzy(paths, s_query)
-    for mp in matched
-      for item in s_all_recent
-        if item.path ==# mp
-          add(s_items, item)
-          break
-        endif
-      endfor
+    for mp in matchfuzzy(paths, s_query)
+      if has_key(by_path, mp)
+        add(s_items, by_path[mp])
+      endif
     endfor
   endif
   s_total = len(s_items)

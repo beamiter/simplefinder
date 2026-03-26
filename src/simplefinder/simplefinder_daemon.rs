@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -87,52 +88,75 @@ struct GrepItem {
 
 // ─────────────────── File cache ───────────────────
 
-type FileCache = Arc<RwLock<HashMap<String, Arc<Vec<String>>>>>;
+const CACHE_TTL_SECS: u64 = 30;
+
+struct CacheEntry {
+    files: Arc<Vec<String>>,
+    created: Instant,
+}
+
+type FileCache = Arc<RwLock<HashMap<String, CacheEntry>>>;
 
 async fn get_or_walk_files(
     cache: &FileCache,
     root: &str,
     token: &CancellationToken,
 ) -> Option<Arc<Vec<String>>> {
-    // Check cache first
+    // Check cache first (with TTL)
     {
         let c = cache.read().await;
-        if let Some(files) = c.get(root) {
-            return Some(Arc::clone(files));
+        if let Some(entry) = c.get(root) {
+            if entry.created.elapsed().as_secs() < CACHE_TTL_SECS {
+                return Some(Arc::clone(&entry.files));
+            }
         }
     }
 
-    // Walk
-    let root_path = PathBuf::from(root);
-    let walker = WalkBuilder::new(&root_path)
-        .hidden(false) // include dotfiles
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    // Walk in blocking thread to avoid stalling the async runtime
+    let root_owned = root.to_string();
+    let token_clone = token.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        let root_path = PathBuf::from(&root_owned);
+        let walker = WalkBuilder::new(&root_path)
+            .hidden(false) // include dotfiles
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
 
-    let mut files = Vec::new();
-    for entry in walker {
-        if token.is_cancelled() {
-            return None;
+        let mut files = Vec::new();
+        for entry in walker {
+            if token_clone.is_cancelled() {
+                return None;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                continue;
+            }
+            if let Ok(rel) = entry.path().strip_prefix(&root_path) {
+                files.push(rel.to_string_lossy().into_owned());
+            }
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
-        if let Ok(rel) = entry.path().strip_prefix(&root_path) {
-            files.push(rel.to_string_lossy().into_owned());
-        }
-    }
-    files.sort();
+        files.sort();
+        Some(files)
+    })
+    .await
+    .ok()
+    .flatten()?;
 
     let files = Arc::new(files);
     {
         let mut c = cache.write().await;
-        c.insert(root.to_string(), Arc::clone(&files));
+        c.insert(
+            root.to_string(),
+            CacheEntry {
+                files: Arc::clone(&files),
+                created: Instant::now(),
+            },
+        );
     }
     Some(files)
 }
@@ -186,61 +210,84 @@ fn handle_grep_sync(
         RegexMatcher::new(&regex_syntax::escape(pattern)).map_err(|e| e.to_string())?
     };
 
+    let root_path = Path::new(root);
+    let results: Arc<std::sync::Mutex<Vec<GrepItem>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .build();
+        .threads(num_cpus::get().min(8))
+        .build_parallel();
 
-    let root_path = Path::new(root);
-    let mut results = Vec::new();
-    let mut searcher = Searcher::new();
+    walker.run(|| {
+        let matcher = matcher.clone();
+        let root_path = root_path.to_path_buf();
+        let results = Arc::clone(&results);
+        let done = Arc::clone(&done);
+        let token = token.clone();
+        let mut searcher = Searcher::new();
 
-    for entry in walker {
-        if token.is_cancelled() || results.len() >= max {
-            break;
-        }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
+        Box::new(move |entry| {
+            if token.is_cancelled() || done.load(std::sync::atomic::Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
 
-        let path = entry.path().to_path_buf();
-        let rel = path
-            .strip_prefix(root_path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
 
-        let _ = searcher.search_path(
-            &matcher,
-            &path,
-            UTF8(|lnum, line| {
-                if results.len() >= max {
-                    return Ok(false);
+            let path = entry.path().to_path_buf();
+            let rel = path
+                .strip_prefix(&root_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+
+            let mut local_items = Vec::new();
+            let _ = searcher.search_path(
+                &matcher,
+                &path,
+                UTF8(|lnum, line| {
+                    let col = matcher
+                        .find(line.as_bytes())
+                        .ok()
+                        .flatten()
+                        .map(|m| m.start() + 1)
+                        .unwrap_or(1);
+                    local_items.push(GrepItem {
+                        path: rel.clone(),
+                        lnum: lnum as usize,
+                        col,
+                        text: line.trim_end().to_string(),
+                    });
+                    Ok(true)
+                }),
+            );
+
+            if !local_items.is_empty() {
+                let mut r = results.lock().unwrap();
+                r.extend(local_items);
+                if r.len() >= max {
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
                 }
-                let col = matcher
-                    .find(line.as_bytes())
-                    .ok()
-                    .flatten()
-                    .map(|m| m.start() + 1)
-                    .unwrap_or(1);
-                results.push(GrepItem {
-                    path: rel.clone(),
-                    lnum: lnum as usize,
-                    col,
-                    text: line.trim_end().to_string(),
-                });
-                Ok(true)
-            }),
-        );
-    }
+            }
 
-    Ok(results)
+            ignore::WalkState::Continue
+        })
+    });
+
+    let mut results = results.lock().unwrap();
+    results.truncate(max);
+    Ok(std::mem::take(&mut *results))
 }
 
 // ─────────────────── stdout writer ───────────────────
