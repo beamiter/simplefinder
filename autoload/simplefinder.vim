@@ -23,6 +23,8 @@ var s_current_id: number = 0
 var s_debounce_timer: number = 0
 var s_project_root: string = ''
 var s_scroll_off: number = 0
+var s_eff_width: number = 80     # popup width clamped to screen
+var s_eff_height: number = 20    # popup height clamped to screen
 
 # ─────────────────── Recent files ───────────────────
 
@@ -226,8 +228,18 @@ def PopupOpen(mode: string, initial_query: string = '')
   s_current_id = 0
   s_project_root = FindProjectRoot()
 
-  var width = get(g:, 'simplefinder_popup_width', 80)
-  var height = get(g:, 'simplefinder_popup_height', 20)
+  # Clamp to the available screen so the popup never overflows on small terminals.
+  # Reserve a few cells/rows for the border + breathing room.
+  var width = min([get(g:, 'simplefinder_popup_width', 80), &columns - 4])
+  var height = min([get(g:, 'simplefinder_popup_height', 20), &lines - 4])
+  if width < 20
+    width = max([&columns - 4, 10])
+  endif
+  if height < 5
+    height = max([&lines - 4, 4])
+  endif
+  s_eff_width = width
+  s_eff_height = height
 
   # Create an empty buffer for the popup
   s_popup_bufnr = bufadd('')
@@ -249,6 +261,7 @@ def PopupOpen(mode: string, initial_query: string = '')
     highlight: 'Normal',
     padding: [0, 1, 0, 1],
     scrollbar: 0,
+    cursorline: true,
     filter: function('PopupFilter'),
     callback: function('PopupOnClose'),
     mapping: 0,
@@ -281,12 +294,33 @@ def PopupOnClose(id: number, result: any)
   s_popup_bufnr = -1
 enddef
 
+# Truncate a string to a maximum display width (handles wide/ambiguous glyphs),
+# appending an ellipsis when content is cut.
+def TruncDisplay(str: string, maxwidth: number): string
+  if strdisplaywidth(str) <= maxwidth
+    return str
+  endif
+  if maxwidth <= 1
+    return "…"
+  endif
+  var budget = maxwidth - 1   # leave room for the ellipsis
+  var out = ''
+  for ch in split(str, '\zs')
+    var w = strdisplaywidth(ch)
+    if strdisplaywidth(out) + w > budget
+      break
+    endif
+    out ..= ch
+  endfor
+  return out .. "…"
+enddef
+
 def PopupRender()
   if s_popup_id == 0 || s_popup_bufnr < 0
     return
   endif
 
-  var width = get(g:, 'simplefinder_popup_width', 80)
+  var width = s_eff_width
   var lines: list<string> = []
 
   # Mode icons
@@ -310,7 +344,7 @@ def PopupRender()
   var title = get(mode_names, s_mode, s_mode)
   var count_str = string(s_total) .. ' results'
   var title_line = ' ' .. icon .. title
-  var pad = width - strchars(title_line) - strchars(count_str) - 2
+  var pad = width - strdisplaywidth(title_line) - strdisplaywidth(count_str)
   if pad < 1
     pad = 1
   endif
@@ -324,7 +358,7 @@ def PopupRender()
   add(lines, repeat('─', width))
 
   # Result items
-  var height = get(g:, 'simplefinder_popup_height', 20)
+  var height = s_eff_height
   var max_items = height - 4  # title + input + sep + help
   if max_items < 1
     max_items = 1
@@ -357,7 +391,21 @@ def PopupRender()
   # Update popup content
   if s_popup_id > 0
     popup_settext(s_popup_id, lines)
+    SyncCursorLine()
   endif
+enddef
+
+# Move the popup's internal cursor onto the selected result row so the native
+# cursorline highlight tracks the selection.
+def SyncCursorLine()
+  if s_popup_id == 0 || s_popup_bufnr < 0
+    return
+  endif
+  if empty(s_items)
+    return
+  endif
+  var bufline = s_cursor_idx - s_scroll_off + 4
+  win_execute(s_popup_id, 'normal! ' .. bufline .. 'G')
 enddef
 
 def FormatItemLine(idx: number, width: number): string
@@ -378,10 +426,7 @@ def FormatItemLine(idx: number, width: number): string
     line = marker .. path .. mod
   endif
 
-  if strchars(line) > width
-    line = strcharpart(line, 0, width - 1) .. "\u2026"
-  endif
-  return line
+  return TruncDisplay(line, width)
 enddef
 
 def PopupMoveCursor(old_idx: number, new_idx: number)
@@ -389,7 +434,7 @@ def PopupMoveCursor(old_idx: number, new_idx: number)
     return
   endif
 
-  var height = get(g:, 'simplefinder_popup_height', 20)
+  var height = s_eff_height
   var max_items = height - 4
   if max_items < 1
     max_items = 1
@@ -407,7 +452,7 @@ def PopupMoveCursor(old_idx: number, new_idx: number)
     return
   endif
 
-  var width = get(g:, 'simplefinder_popup_width', 80)
+  var width = s_eff_width
   # Buffer line = display_position + 4 (title + input + sep + 1-indexed)
   var old_bufline = old_idx - s_scroll_off + 4
   var new_bufline = new_idx - s_scroll_off + 4
@@ -418,6 +463,7 @@ def PopupMoveCursor(old_idx: number, new_idx: number)
   if new_idx >= 0 && new_idx < len(s_items)
     setbufline(s_popup_bufnr, new_bufline, FormatItemLine(new_idx, width))
   endif
+  SyncCursorLine()
 enddef
 
 def SetupSyntax()
@@ -431,9 +477,8 @@ def SetupSyntax()
   win_execute(s_popup_id, 'syntax match SFinderSep /^─\+$/')
   win_execute(s_popup_id, 'syntax match SFinderLnum /:\d\+:/')
   win_execute(s_popup_id, 'syntax match SFinderStatus /^ .\+ open.*esc close$/')
-  # Selected item (line starting with triangle marker)
-  win_execute(s_popup_id, 'syntax match SFinderSelected /^\%u25b8 .*$/')
-  win_execute(s_popup_id, 'setlocal cursorline!')
+  # Selection is shown by the native popup cursorline (PopupSelected), driven by
+  # SyncCursorLine(); no fragile marker-regex match or cursorline toggle needed.
 enddef
 
 # ─────────────────── Filter callback ───────────────────
