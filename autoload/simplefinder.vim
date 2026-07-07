@@ -10,10 +10,11 @@ var s_job: any = v:null
 var s_running: bool = false
 var s_next_id: number = 0
 
-# ─────────────────── Popup state ───────────────────
+# ─────────────────── Panel state ───────────────────
 
-var s_popup_id: number = 0
-var s_popup_bufnr: number = -1
+var s_panel_winid: number = 0
+var s_panel_bufnr: number = -1
+var s_source_winid: number = 0
 var s_mode: string = ''          # 'files' | 'grep' | 'igrep' | 'recent' | 'buffers'
 var s_query: string = ''
 var s_items: list<dict<any>> = []
@@ -23,8 +24,8 @@ var s_current_id: number = 0
 var s_debounce_timer: number = 0
 var s_project_root: string = ''
 var s_scroll_off: number = 0
-var s_eff_width: number = 80     # popup width clamped to screen
-var s_eff_height: number = 20    # popup height clamped to screen
+var s_eff_width: number = 50
+var s_eff_height: number = 20
 
 # ─────────────────── Recent files ───────────────────
 
@@ -169,7 +170,7 @@ def OnFilesResult(ev: dict<any>)
   endfor
   s_total = get(ev, 'total', len(s_items))
   s_cursor_idx = 0
-  PopupRender()
+  PanelRender()
 enddef
 
 def OnGrepResult(ev: dict<any>)
@@ -184,7 +185,7 @@ def OnGrepResult(ev: dict<any>)
   endfor
   s_total = get(ev, 'total', len(s_items))
   s_cursor_idx = 0
-  PopupRender()
+  PanelRender()
 enddef
 
 # =============================================================
@@ -211,13 +212,14 @@ def FindProjectRoot(): string
 enddef
 
 # =============================================================
-# Popup UI
+# Panel UI
 # =============================================================
 
-def PopupOpen(mode: string, initial_query: string = '')
-  # Close existing popup first
-  if s_popup_id > 0
-    PopupClose()
+def PanelOpen(mode: string, initial_query: string = '')
+  if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
+    s_source_winid = win_getid()
+  elseif win_getid() != s_panel_winid
+    s_source_winid = win_getid()
   endif
 
   s_mode = mode
@@ -228,51 +230,42 @@ def PopupOpen(mode: string, initial_query: string = '')
   s_current_id = 0
   s_project_root = FindProjectRoot()
 
-  # Clamp to the available screen so the popup never overflows on small terminals.
-  # Reserve a few cells/rows for the border + breathing room.
-  var width = min([get(g:, 'simplefinder_popup_width', 80), &columns - 4])
-  var height = min([get(g:, 'simplefinder_popup_height', 20), &lines - 4])
-  if width < 20
-    width = max([&columns - 4, 10])
-  endif
-  if height < 5
-    height = max([&lines - 4, 4])
-  endif
-  s_eff_width = width
-  s_eff_height = height
-
-  # Create an empty buffer for the popup
-  s_popup_bufnr = bufadd('')
-  bufload(s_popup_bufnr)
-  setbufvar(s_popup_bufnr, '&buftype', 'nofile')
-  setbufvar(s_popup_bufnr, '&bufhidden', 'wipe')
-  setbufvar(s_popup_bufnr, '&buflisted', 0)
-  setbufvar(s_popup_bufnr, '&swapfile', 0)
-
-  s_popup_id = popup_create(s_popup_bufnr, {
-    pos: 'center',
-    minwidth: width,
-    maxwidth: width,
-    minheight: height,
-    maxheight: height,
-    border: [],
-    borderchars: ['─', '│', '─', '│', '╭', '╮', '╰', '╯'],
-    borderhighlight: ['SFinderBorder'],
-    highlight: 'Normal',
-    padding: [0, 1, 0, 1],
-    scrollbar: 0,
-    cursorline: true,
-    filter: function('PopupFilter'),
-    callback: function('PopupOnClose'),
-    mapping: 0,
-    zindex: 200,
-  })
-
+  EnsurePanel()
   SetupSyntax()
-  PopupRender()
+  PanelRender()
 enddef
 
-def PopupClose()
+def EnsurePanel()
+  var width = get(g:, 'simplefinder_panel_width', 50)
+  width = min([max([width, 24]), max([&columns - 10, 24])])
+
+  if s_panel_bufnr <= 0 || !bufexists(s_panel_bufnr)
+    s_panel_bufnr = bufadd('SimpleFinder')
+    bufload(s_panel_bufnr)
+    setbufvar(s_panel_bufnr, '&buftype', 'nofile')
+    setbufvar(s_panel_bufnr, '&bufhidden', 'hide')
+    setbufvar(s_panel_bufnr, '&buflisted', 0)
+    setbufvar(s_panel_bufnr, '&swapfile', 0)
+  endif
+
+  if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
+    botright vertical new
+    s_panel_winid = win_getid()
+    execute 'buffer ' .. s_panel_bufnr
+  else
+    win_gotoid(s_panel_winid)
+  endif
+
+  execute 'vertical resize ' .. width
+  s_eff_width = winwidth(0)
+  s_eff_height = winheight(0)
+  setlocal nowrap nonumber norelativenumber signcolumn=no foldcolumn=0
+  setlocal nobuflisted noswapfile buftype=nofile bufhidden=hide
+  setlocal cursorline nomodifiable
+  SetupMappings()
+enddef
+
+def PanelClose()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
     s_debounce_timer = 0
@@ -282,16 +275,15 @@ def PopupClose()
     Send({type: 'cancel', id: s_current_id})
     s_current_id = 0
   endif
-  if s_popup_id > 0
-    popup_close(s_popup_id)
-    s_popup_id = 0
+  if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
+    var src = s_source_winid
+    win_gotoid(s_panel_winid)
+    close
+    if src > 0 && win_id2win(src) > 0
+      win_gotoid(src)
+    endif
   endif
-  s_popup_bufnr = -1
-enddef
-
-def PopupOnClose(id: number, result: any)
-  s_popup_id = 0
-  s_popup_bufnr = -1
+  s_panel_winid = 0
 enddef
 
 # Truncate a string to a maximum display width (handles wide/ambiguous glyphs),
@@ -315,11 +307,13 @@ def TruncDisplay(str: string, maxwidth: number): string
   return out .. "…"
 enddef
 
-def PopupRender()
-  if s_popup_id == 0 || s_popup_bufnr < 0
+def PanelRender()
+  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0 || s_panel_bufnr < 0
     return
   endif
 
+  s_eff_width = winwidth(win_id2win(s_panel_winid))
+  s_eff_height = winheight(win_id2win(s_panel_winid))
   var width = s_eff_width
   var lines: list<string> = []
 
@@ -388,24 +382,27 @@ def PopupRender()
   # Help line
   add(lines, " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close")
 
-  # Update popup content
-  if s_popup_id > 0
-    popup_settext(s_popup_id, lines)
-    SyncCursorLine()
+  setbufvar(s_panel_bufnr, '&modifiable', 1)
+  setbufline(s_panel_bufnr, 1, lines)
+  var extra_start = len(lines) + 1
+  var last = getbufinfo(s_panel_bufnr)[0].linecount
+  if last >= extra_start
+    deletebufline(s_panel_bufnr, extra_start, last)
   endif
+  setbufvar(s_panel_bufnr, '&modifiable', 0)
+  SyncCursorLine()
 enddef
 
-# Move the popup's internal cursor onto the selected result row so the native
-# cursorline highlight tracks the selection.
+# Move the panel cursor onto the selected result row so cursorline tracks it.
 def SyncCursorLine()
-  if s_popup_id == 0 || s_popup_bufnr < 0
+  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0 || s_panel_bufnr < 0
     return
   endif
   if empty(s_items)
     return
   endif
   var bufline = s_cursor_idx - s_scroll_off + 4
-  win_execute(s_popup_id, 'normal! ' .. bufline .. 'G')
+  win_execute(s_panel_winid, 'normal! ' .. bufline .. 'G')
 enddef
 
 def FormatItemLine(idx: number, width: number): string
@@ -429,8 +426,8 @@ def FormatItemLine(idx: number, width: number): string
   return TruncDisplay(line, width)
 enddef
 
-def PopupMoveCursor(old_idx: number, new_idx: number)
-  if s_popup_id == 0
+def PanelMoveCursor(old_idx: number, new_idx: number)
+  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
     return
   endif
 
@@ -448,7 +445,7 @@ def PopupMoveCursor(old_idx: number, new_idx: number)
 
   if new_scroll_off != s_scroll_off
     # Viewport changed — full re-render needed
-    PopupRender()
+    PanelRender()
     return
   endif
 
@@ -457,101 +454,155 @@ def PopupMoveCursor(old_idx: number, new_idx: number)
   var old_bufline = old_idx - s_scroll_off + 4
   var new_bufline = new_idx - s_scroll_off + 4
 
+  setbufvar(s_panel_bufnr, '&modifiable', 1)
   if old_idx >= 0 && old_idx < len(s_items)
-    setbufline(s_popup_bufnr, old_bufline, FormatItemLine(old_idx, width))
+    setbufline(s_panel_bufnr, old_bufline, FormatItemLine(old_idx, width))
   endif
   if new_idx >= 0 && new_idx < len(s_items)
-    setbufline(s_popup_bufnr, new_bufline, FormatItemLine(new_idx, width))
+    setbufline(s_panel_bufnr, new_bufline, FormatItemLine(new_idx, width))
   endif
+  setbufvar(s_panel_bufnr, '&modifiable', 0)
   SyncCursorLine()
 enddef
 
 def SetupSyntax()
-  if s_popup_id == 0
+  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
     return
   endif
-  win_execute(s_popup_id, 'syntax clear')
-  win_execute(s_popup_id, 'syntax match SFinderTitle /^ .\+ \(Files\|Grep\|Interactive Grep\|Recent Files\|Buffers\)/')
-  win_execute(s_popup_id, 'syntax match SFinderStatus /\d\+ results$/')
-  win_execute(s_popup_id, 'syntax match SFinderPrompt /^ > /')
-  win_execute(s_popup_id, 'syntax match SFinderSep /^─\+$/')
-  win_execute(s_popup_id, 'syntax match SFinderLnum /:\d\+:/')
-  win_execute(s_popup_id, 'syntax match SFinderStatus /^ .\+ open.*esc close$/')
-  # Selection is shown by the native popup cursorline (PopupSelected), driven by
-  # SyncCursorLine(); no fragile marker-regex match or cursorline toggle needed.
+  win_execute(s_panel_winid, 'syntax clear')
+  win_execute(s_panel_winid, 'syntax match SFinderTitle /^ .\+ \(Files\|Grep\|Interactive Grep\|Recent Files\|Buffers\)/')
+  win_execute(s_panel_winid, 'syntax match SFinderStatus /\d\+ results$/')
+  win_execute(s_panel_winid, 'syntax match SFinderPrompt /^ > /')
+  win_execute(s_panel_winid, 'syntax match SFinderSep /^─\+$/')
+  win_execute(s_panel_winid, 'syntax match SFinderLnum /:\d\+:/')
+  win_execute(s_panel_winid, 'syntax match SFinderStatus /^ .\+ open.*esc close$/')
 enddef
 
-# ─────────────────── Filter callback ───────────────────
+def SetupMappings()
+  nnoremap <silent><buffer> <CR> <ScriptCmd>PanelHandleKey(0, '<lt>CR>')<CR>
+  nnoremap <silent><buffer> <Esc> <ScriptCmd>PanelHandleKey(0, '<lt>Esc>')<CR>
+  nnoremap <silent><buffer> <C-c> <ScriptCmd>PanelHandleKey(0, '<lt>C-c>')<CR>
+  nnoremap <silent><buffer> <C-v> <ScriptCmd>PanelHandleKey(0, '<lt>C-v>')<CR>
+  nnoremap <silent><buffer> <C-x> <ScriptCmd>PanelHandleKey(0, '<lt>C-x>')<CR>
+  nnoremap <silent><buffer> <C-s> <ScriptCmd>PanelHandleKey(0, '<lt>C-s>')<CR>
+  nnoremap <silent><buffer> <C-t> <ScriptCmd>PanelHandleKey(0, '<lt>C-t>')<CR>
+  nnoremap <silent><buffer> <C-j> <ScriptCmd>PanelHandleKey(0, '<lt>C-j>')<CR>
+  nnoremap <silent><buffer> <C-n> <ScriptCmd>PanelHandleKey(0, '<lt>C-n>')<CR>
+  nnoremap <silent><buffer> <Down> <ScriptCmd>PanelHandleKey(0, '<lt>Down>')<CR>
+  nnoremap <silent><buffer> <Tab> <ScriptCmd>PanelHandleKey(0, '<lt>Tab>')<CR>
+  nnoremap <silent><buffer> <C-k> <ScriptCmd>PanelHandleKey(0, '<lt>C-k>')<CR>
+  nnoremap <silent><buffer> <C-p> <ScriptCmd>PanelHandleKey(0, '<lt>C-p>')<CR>
+  nnoremap <silent><buffer> <Up> <ScriptCmd>PanelHandleKey(0, '<lt>Up>')<CR>
+  nnoremap <silent><buffer> <S-Tab> <ScriptCmd>PanelHandleKey(0, '<lt>S-Tab>')<CR>
+  nnoremap <silent><buffer> <BS> <ScriptCmd>PanelHandleKey(0, '<lt>BS>')<CR>
+  nnoremap <silent><buffer> <C-h> <ScriptCmd>PanelHandleKey(0, '<lt>C-h>')<CR>
+  nnoremap <silent><buffer> <C-u> <ScriptCmd>PanelHandleKey(0, '<lt>C-u>')<CR>
+  nnoremap <silent><buffer> <C-w> <ScriptCmd>PanelHandleKey(0, '<lt>C-w>')<CR>
+  nnoremap <silent><buffer> <Space> <ScriptCmd>PanelHandleKey(0, " ")<CR>
 
-def PopupFilter(winid: number, key: string): bool
-  if key ==# "\<Esc>" || key ==# "\<C-c>"
-    PopupClose()
+  var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@#~'
+  for ch in split(chars, '\zs')
+    execute 'nnoremap <silent><buffer> ' .. ch .. ' <ScriptCmd>PanelHandleKey(0, ' .. string(ch) .. ')<CR>'
+  endfor
+enddef
+
+# ─────────────────── Panel key handling ───────────────────
+
+def PanelHandleKey(winid: number, key: string): bool
+  var k = key
+  var special_keys = {
+    '<Esc>': "\<Esc>",
+    '<C-c>': "\<C-c>",
+    '<CR>': "\<CR>",
+    '<C-v>': "\<C-v>",
+    '<C-x>': "\<C-x>",
+    '<C-s>': "\<C-s>",
+    '<C-t>': "\<C-t>",
+    '<C-j>': "\<C-j>",
+    '<C-n>': "\<C-n>",
+    '<Down>': "\<Down>",
+    '<Tab>': "\<Tab>",
+    '<C-k>': "\<C-k>",
+    '<C-p>': "\<C-p>",
+    '<Up>': "\<Up>",
+    '<S-Tab>': "\<S-Tab>",
+    '<BS>': "\<BS>",
+    '<C-h>': "\<C-h>",
+    '<C-u>': "\<C-u>",
+    '<C-w>': "\<C-w>",
+  }
+  if has_key(special_keys, key)
+    k = special_keys[key]
+  endif
+
+  if k ==# "\<Esc>" || k ==# "\<C-c>"
+    PanelClose()
     return true
   endif
 
-  if key ==# "\<CR>"
+  if k ==# "\<CR>"
     AcceptItem('edit')
     return true
   endif
-  if key ==# "\<C-v>"
+  if k ==# "\<C-v>"
     AcceptItem('vsplit')
     return true
   endif
-  if key ==# "\<C-x>" || key ==# "\<C-s>"
+  if k ==# "\<C-x>" || k ==# "\<C-s>"
     AcceptItem('split')
     return true
   endif
-  if key ==# "\<C-t>"
+  if k ==# "\<C-t>"
     AcceptItem('tabedit')
     return true
   endif
 
   # Navigation
-  if key ==# "\<C-j>" || key ==# "\<C-n>" || key ==# "\<Down>" || key ==# "\<Tab>"
+  if k ==# "\<C-j>" || k ==# "\<C-n>" || k ==# "\<Down>" || k ==# "\<Tab>"
     if s_cursor_idx < len(s_items) - 1
       var old = s_cursor_idx
       s_cursor_idx += 1
-      PopupMoveCursor(old, s_cursor_idx)
+      PanelMoveCursor(old, s_cursor_idx)
     endif
     return true
   endif
-  if key ==# "\<C-k>" || key ==# "\<C-p>" || key ==# "\<Up>" || key ==# "\<S-Tab>"
+  if k ==# "\<C-k>" || k ==# "\<C-p>" || k ==# "\<Up>" || k ==# "\<S-Tab>"
     if s_cursor_idx > 0
       var old = s_cursor_idx
       s_cursor_idx -= 1
-      PopupMoveCursor(old, s_cursor_idx)
+      PanelMoveCursor(old, s_cursor_idx)
     endif
     return true
   endif
 
   # Editing
-  if key ==# "\<BS>" || key ==# "\<C-h>"
+  if k ==# "\<BS>" || k ==# "\<C-h>"
     if len(s_query) > 0
       s_query = strcharpart(s_query, 0, strchars(s_query) - 1)
       DebouncedSearch()
-      PopupRender()
+      PanelRender()
     endif
     return true
   endif
-  if key ==# "\<C-u>"
+  if k ==# "\<C-u>"
     s_query = ''
     DebouncedSearch()
-    PopupRender()
+    PanelRender()
     return true
   endif
-  if key ==# "\<C-w>"
+  if k ==# "\<C-w>"
     # Delete last word
     s_query = substitute(s_query, '\S*\s*$', '', '')
     DebouncedSearch()
-    PopupRender()
+    PanelRender()
     return true
   endif
 
   # Printable character
-  if strlen(key) == 1 && char2nr(key) >= 32
-    s_query ..= key
+  if strlen(k) == 1 && char2nr(k) >= 32
+    s_query ..= k
     DebouncedSearch()
-    PopupRender()
+    PanelRender()
     return true
   endif
 
@@ -613,7 +664,7 @@ def SendGrepRequest(pattern: string)
   if pattern ==# ''
     s_items = []
     s_total = 0
-    PopupRender()
+    PanelRender()
     return
   endif
   if !EnsureBackend()
@@ -639,7 +690,7 @@ enddef
 # =============================================================
 
 export def Files(query: string = '')
-  PopupOpen('files', query)
+  PanelOpen('files', query)
   SendFilesRequest(query)
 enddef
 
@@ -651,12 +702,12 @@ export def Grep(pattern: string = '')
       return
     endif
   endif
-  PopupOpen('grep', p)
+  PanelOpen('grep', p)
   SendGrepRequest(p)
 enddef
 
 export def IGrep(initial: string = '')
-  PopupOpen('igrep', initial)
+  PanelOpen('igrep', initial)
   if initial !=# ''
     SendGrepRequest(initial)
   endif
@@ -665,7 +716,7 @@ enddef
 export def GrepWord()
   var word = expand('<cword>')
   if word !=# ''
-    PopupOpen('igrep', word)
+    PanelOpen('igrep', word)
     SendGrepRequest(word)
   endif
 enddef
@@ -685,7 +736,7 @@ export def GrepVisual()
   endif
   var text = join(lines, ' ')
   if text !=# ''
-    PopupOpen('igrep', text)
+    PanelOpen('igrep', text)
     SendGrepRequest(text)
   endif
 enddef
@@ -710,10 +761,10 @@ export def Buffers()
     })
   endfor
   sort(s_all_buffers, (a, b) => b.lastused - a.lastused)
-  PopupOpen('buffers')
+  PanelOpen('buffers')
   s_items = copy(s_all_buffers)
   s_total = len(s_items)
-  PopupRender()
+  PanelRender()
 enddef
 
 def FilterBuffers()
@@ -734,7 +785,7 @@ def FilterBuffers()
   endif
   s_total = len(s_items)
   s_cursor_idx = 0
-  PopupRender()
+  PanelRender()
 enddef
 
 # =============================================================
@@ -756,10 +807,10 @@ export def RecentFiles()
     combined = combined[: mx - 1]
   endif
   s_all_recent = mapnew(combined, (_, f) => ({path: fnamemodify(f, ':~:.')}))
-  PopupOpen('recent')
+  PanelOpen('recent')
   s_items = copy(s_all_recent)
   s_total = len(s_items)
-  PopupRender()
+  PanelRender()
 enddef
 
 def FilterRecentFiles()
@@ -780,7 +831,7 @@ def FilterRecentFiles()
   endif
   s_total = len(s_items)
   s_cursor_idx = 0
-  PopupRender()
+  PanelRender()
 enddef
 
 export def TrackRecentFile()
@@ -812,13 +863,15 @@ def AcceptItem(mode: string)
   var lnum = get(item, 'lnum', 0)
   var col = get(item, 'col', 0)
 
-  PopupClose()
-
   # For files/grep results, resolve relative path from project root
   if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep') && s_project_root !=# ''
-    if path[0] !=# '/' && path[0] !=# '~'
+    if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
       path = s_project_root .. '/' .. path
     endif
+  endif
+
+  if s_source_winid > 0 && win_id2win(s_source_winid) > 0
+    win_gotoid(s_source_winid)
   endif
 
   # For buffers, use bufnr if available
@@ -832,5 +885,10 @@ def AcceptItem(mode: string)
   if lnum > 0
     cursor(lnum, max([1, col]))
     normal! zz
+  endif
+
+  if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
+    win_gotoid(s_panel_winid)
+    SyncCursorLine()
   endif
 enddef
