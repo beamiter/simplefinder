@@ -278,7 +278,11 @@ def PanelClose()
   if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
     var src = s_source_winid
     win_gotoid(s_panel_winid)
-    close
+    if winnr('$') > 1
+      close
+    else
+      enew
+    endif
     if src > 0 && win_id2win(src) > 0
       win_gotoid(src)
     endif
