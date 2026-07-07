@@ -888,7 +888,6 @@ def AcceptItem(mode: string)
   endif
 
   if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
-    win_gotoid(s_panel_winid)
-    SyncCursorLine()
+    win_execute(s_panel_winid, 'normal! ' .. (s_cursor_idx - s_scroll_off + 4) .. 'G')
   endif
 enddef
