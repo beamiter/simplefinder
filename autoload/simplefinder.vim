@@ -26,6 +26,14 @@ var s_project_root: string = ''
 var s_scroll_off: number = 0
 var s_eff_width: number = 50
 var s_eff_height: number = 20
+var s_loading: bool = false
+var s_error: string = ''
+var s_elapsed_ms: number = 0
+var s_capped: bool = false
+var s_regex: bool = false
+var s_ignore_case: bool = false
+var s_hidden: bool = false
+var s_no_ignore: bool = false
 
 # ─────────────────── Recent files ───────────────────
 
@@ -86,6 +94,12 @@ def EnsureBackend(): bool
       exit_cb: (ch, code) => {
         s_running = false
         s_job = v:null
+        if s_current_id > 0
+          s_loading = false
+          s_error = 'Backend exited unexpectedly (code ' .. string(code) .. ')'
+          s_current_id = 0
+          PanelRender()
+        endif
         Log('daemon exited with code ' .. string(code))
       },
       stoponexit: 'term'
@@ -141,7 +155,11 @@ def OnDaemonEvent(line: string)
   elseif ev.type ==# 'grep_result'
     OnGrepResult(ev)
   elseif ev.type ==# 'error'
-    Log('error from daemon: ' .. get(ev, 'message', ''))
+    s_loading = false
+    s_error = get(ev, 'message', 'Unknown backend error')
+    s_current_id = 0
+    Log('error from daemon: ' .. s_error)
+    PanelRender()
   endif
 enddef
 
@@ -169,6 +187,11 @@ def OnFilesResult(ev: dict<any>)
     })
   endfor
   s_total = get(ev, 'total', len(s_items))
+  s_capped = get(ev, 'capped', false)
+  s_elapsed_ms = get(ev, 'elapsed_ms', 0)
+  s_loading = false
+  s_error = ''
+  s_current_id = 0
   s_cursor_idx = 0
   PanelRender()
 enddef
@@ -184,6 +207,11 @@ def OnGrepResult(ev: dict<any>)
     })
   endfor
   s_total = get(ev, 'total', len(s_items))
+  s_capped = get(ev, 'capped', false)
+  s_elapsed_ms = get(ev, 'elapsed_ms', 0)
+  s_loading = false
+  s_error = ''
+  s_current_id = 0
   s_cursor_idx = 0
   PanelRender()
 enddef
@@ -193,7 +221,14 @@ enddef
 # =============================================================
 
 def FindProjectRoot(): string
-  var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root']
+  var configured = get(g:, 'simplefinder_root', '')
+  if configured !=# ''
+    var root = fnamemodify(expand(configured), ':p')
+    if isdirectory(root)
+      return substitute(root, '/$', '', '')
+    endif
+  endif
+  var markers = get(g:, 'simplefinder_root_markers', ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
   var dir = expand('%:p:h')
   if dir ==# ''
     dir = getcwd()
@@ -228,6 +263,14 @@ def PanelOpen(mode: string, initial_query: string = '')
   s_cursor_idx = 0
   s_total = 0
   s_current_id = 0
+  s_loading = false
+  s_error = ''
+  s_elapsed_ms = 0
+  s_capped = false
+  s_regex = get(g:, 'simplefinder_regex', 0) != 0
+  s_ignore_case = get(g:, 'simplefinder_ignore_case', 0) != 0
+  s_hidden = get(g:, 'simplefinder_hidden', 0) != 0
+  s_no_ignore = get(g:, 'simplefinder_no_ignore', 0) != 0
   s_project_root = FindProjectRoot()
 
   EnsurePanel()
@@ -249,7 +292,11 @@ def EnsurePanel()
   endif
 
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
-    botright vertical new
+    if get(g:, 'simplefinder_position', 'right') ==# 'left'
+      topleft vertical new
+    else
+      botright vertical new
+    endif
     s_panel_winid = win_getid()
     execute 'buffer ' .. s_panel_bufnr
   else
@@ -262,6 +309,7 @@ def EnsurePanel()
   setlocal nowrap nonumber norelativenumber signcolumn=no foldcolumn=0
   setlocal nobuflisted noswapfile buftype=nofile bufhidden=hide
   setlocal cursorline nomodifiable
+  setlocal winfixwidth
   SetupMappings()
 enddef
 
@@ -321,14 +369,6 @@ def PanelRender()
   var width = s_eff_width
   var lines: list<string> = []
 
-  # Mode icons
-  var mode_icons = {
-    files: ' ',
-    grep: ' ',
-    igrep: ' ',
-    recent: ' ',
-    buffers: '﬘ ',
-  }
   var mode_names = {
     files: 'Files',
     grep: 'Grep',
@@ -338,10 +378,23 @@ def PanelRender()
   }
 
   # Title line
-  var icon = get(mode_icons, s_mode, '')
   var title = get(mode_names, s_mode, s_mode)
-  var count_str = string(s_total) .. ' results'
-  var title_line = ' ' .. icon .. title
+  var count_str = ''
+  if s_loading
+    count_str = 'searching…'
+  elseif s_error !=# ''
+    count_str = 'error'
+  elseif s_capped
+    count_str = string(len(s_items)) .. '+ results'
+  elseif s_total != len(s_items)
+    count_str = string(len(s_items)) .. '/' .. string(s_total) .. ' results'
+  else
+    count_str = string(s_total) .. ' results'
+  endif
+  if !s_loading && s_error ==# '' && s_elapsed_ms > 0
+    count_str ..= ' · ' .. string(s_elapsed_ms) .. 'ms'
+  endif
+  var title_line = ' ' .. title
   var pad = width - strdisplaywidth(title_line) - strdisplaywidth(count_str)
   if pad < 1
     pad = 1
@@ -349,8 +402,19 @@ def PanelRender()
   title_line ..= repeat(' ', pad) .. count_str
   add(lines, title_line)
 
-  # Input line
-  add(lines, ' > ' .. s_query .. "\u2581")
+  # Input line and active search flags
+  var flags = ''
+  if s_mode ==# 'grep' || s_mode ==# 'igrep'
+    flags ..= s_regex ? ' [.*]' : ' [txt]'
+    flags ..= s_ignore_case ? ' [aa]' : ' [Aa]'
+  endif
+  if s_hidden
+    flags ..= ' [hidden]'
+  endif
+  if s_no_ignore
+    flags ..= ' [all]'
+  endif
+  add(lines, TruncDisplay(' > ' .. s_query .. "\u2581" .. flags, width))
 
   # Separator
   add(lines, repeat('─', width))
@@ -377,6 +441,22 @@ def PanelRender()
     idx += 1
   endwhile
 
+  if display_count == 0
+    if s_error !=# ''
+      add(lines, TruncDisplay(' ! ' .. s_error, width))
+      display_count += 1
+    elseif s_loading
+      add(lines, '   Searching…')
+      display_count += 1
+    elseif (s_mode ==# 'grep' || s_mode ==# 'igrep') && s_query ==# ''
+      add(lines, '   Type to search project text')
+      display_count += 1
+    else
+      add(lines, '   No matches')
+      display_count += 1
+    endif
+  endif
+
   # Pad empty lines
   while display_count < max_items
     add(lines, '')
@@ -384,7 +464,11 @@ def PanelRender()
   endwhile
 
   # Help line
-  add(lines, " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close")
+  var help = " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close"
+  if s_mode ==# 'grep' || s_mode ==# 'igrep'
+    help = ' ^r regex  ^a case  ^o hidden  ^g ignores'
+  endif
+  add(lines, TruncDisplay(help, width))
 
   setbufvar(s_panel_bufnr, '&modifiable', 1)
   setbufline(s_panel_bufnr, 1, lines)
@@ -477,9 +561,15 @@ def SetupSyntax()
   win_execute(s_panel_winid, 'syntax match SFinderTitle /^ .\+ \(Files\|Grep\|Interactive Grep\|Recent Files\|Buffers\)/')
   win_execute(s_panel_winid, 'syntax match SFinderStatus /\d\+ results$/')
   win_execute(s_panel_winid, 'syntax match SFinderPrompt /^ > /')
+  win_execute(s_panel_winid, 'syntax match SFinderError /^ ! .*/')
+  win_execute(s_panel_winid, 'syntax match SFinderFlag /\[[^]]\+\]/')
   win_execute(s_panel_winid, 'syntax match SFinderSep /^─\+$/')
   win_execute(s_panel_winid, 'syntax match SFinderLnum /:\d\+:/')
   win_execute(s_panel_winid, 'syntax match SFinderStatus /^ .\+ open.*esc close$/')
+enddef
+
+def PanelHandleChar(code: number)
+  PanelHandleKey(0, nr2char(code))
 enddef
 
 def SetupMappings()
@@ -502,11 +592,14 @@ def SetupMappings()
   nnoremap <silent><buffer> <C-h> <ScriptCmd>PanelHandleKey(0, '<lt>C-h>')<CR>
   nnoremap <silent><buffer> <C-u> <ScriptCmd>PanelHandleKey(0, '<lt>C-u>')<CR>
   nnoremap <silent><buffer> <C-w> <ScriptCmd>PanelHandleKey(0, '<lt>C-w>')<CR>
-  nnoremap <silent><buffer> <Space> <ScriptCmd>PanelHandleKey(0, " ")<CR>
+  nnoremap <silent><buffer> <C-r> <ScriptCmd>PanelHandleKey(0, '<lt>C-r>')<CR>
+  nnoremap <silent><buffer> <C-a> <ScriptCmd>PanelHandleKey(0, '<lt>C-a>')<CR>
+  nnoremap <silent><buffer> <C-o> <ScriptCmd>PanelHandleKey(0, '<lt>C-o>')<CR>
+  nnoremap <silent><buffer> <C-g> <ScriptCmd>PanelHandleKey(0, '<lt>C-g>')<CR>
 
-  var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:@#~'
-  for ch in split(chars, '\zs')
-    execute 'nnoremap <silent><buffer> ' .. ch .. ' <ScriptCmd>PanelHandleKey(0, ' .. string(ch) .. ')<CR>'
+  # Map the complete printable ASCII range, including regex punctuation.
+  for code in range(32, 126)
+    execute 'nnoremap <silent><buffer> <Char-' .. code .. '> <ScriptCmd>PanelHandleChar(' .. code .. ')<CR>'
   endfor
 enddef
 
@@ -534,6 +627,10 @@ def PanelHandleKey(winid: number, key: string): bool
     '<C-h>': "\<C-h>",
     '<C-u>': "\<C-u>",
     '<C-w>': "\<C-w>",
+    '<C-r>': "\<C-r>",
+    '<C-a>': "\<C-a>",
+    '<C-o>': "\<C-o>",
+    '<C-g>': "\<C-g>",
   }
   if has_key(special_keys, key)
     k = special_keys[key]
@@ -558,6 +655,32 @@ def PanelHandleKey(winid: number, key: string): bool
   endif
   if k ==# "\<C-t>"
     AcceptItem('tabedit')
+    return true
+  endif
+
+  # Search option toggles
+  if k ==# "\<C-r>" && (s_mode ==# 'grep' || s_mode ==# 'igrep')
+    s_regex = !s_regex
+    DispatchSearch()
+    PanelRender()
+    return true
+  endif
+  if k ==# "\<C-a>" && (s_mode ==# 'grep' || s_mode ==# 'igrep')
+    s_ignore_case = !s_ignore_case
+    DispatchSearch()
+    PanelRender()
+    return true
+  endif
+  if k ==# "\<C-o>"
+    s_hidden = !s_hidden
+    DispatchSearch()
+    PanelRender()
+    return true
+  endif
+  if k ==# "\<C-g>"
+    s_no_ignore = !s_no_ignore
+    DispatchSearch()
+    PanelRender()
     return true
   endif
 
@@ -655,19 +778,32 @@ def SendFilesRequest(query: string)
   endif
   var id = NextId()
   s_current_id = id
+  s_loading = true
+  s_error = ''
+  PanelRender()
   Send({
     type: 'files',
     id: id,
     root: s_project_root,
     query: query,
     max: get(g:, 'simplefinder_max_results', 200),
+    hidden: s_hidden,
+    no_ignore: s_no_ignore,
   })
 enddef
 
 def SendGrepRequest(pattern: string)
   if pattern ==# ''
+    if s_current_id > 0
+      Send({type: 'cancel', id: s_current_id})
+    endif
+    s_current_id = 0
     s_items = []
     s_total = 0
+    s_loading = false
+    s_error = ''
+    s_capped = false
+    s_elapsed_ms = 0
     PanelRender()
     return
   endif
@@ -680,12 +816,19 @@ def SendGrepRequest(pattern: string)
   endif
   var id = NextId()
   s_current_id = id
+  s_loading = true
+  s_error = ''
+  PanelRender()
   Send({
     type: 'grep',
     id: id,
     root: s_project_root,
     pattern: pattern,
+    regex: s_regex,
+    ignore_case: s_ignore_case,
     max: get(g:, 'simplefinder_max_results', 200),
+    hidden: s_hidden,
+    no_ignore: s_no_ignore,
   })
 enddef
 
@@ -743,6 +886,22 @@ export def GrepVisual()
     PanelOpen('igrep', text)
     SendGrepRequest(text)
   endif
+enddef
+
+export def ProjectRoot(path: string = '')
+  if path ==# ''
+    echom '[SimpleFinder] root: ' .. FindProjectRoot()
+    return
+  endif
+  var root = fnamemodify(expand(path), ':p')
+  if !isdirectory(root)
+    echohl ErrorMsg
+    echom '[SimpleFinder] not a directory: ' .. path
+    echohl None
+    return
+  endif
+  g:simplefinder_root = substitute(root, '/$', '', '')
+  echom '[SimpleFinder] root: ' .. g:simplefinder_root
 enddef
 
 # =============================================================
@@ -874,7 +1033,9 @@ def AcceptItem(mode: string)
     endif
   endif
 
-  if s_source_winid > 0 && win_id2win(s_source_winid) > 0
+  if get(g:, 'simplefinder_close_on_select', 1) != 0
+    PanelClose()
+  elseif s_source_winid > 0 && win_id2win(s_source_winid) > 0
     win_gotoid(s_source_winid)
   endif
 
@@ -893,5 +1054,11 @@ def AcceptItem(mode: string)
 
   if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
     win_execute(s_panel_winid, 'normal! ' .. (s_cursor_idx - s_scroll_off + 4) .. 'G')
+  endif
+enddef
+
+export def Reflow()
+  if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
+    PanelRender()
   endif
 enddef

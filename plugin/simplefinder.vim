@@ -14,6 +14,14 @@ g:simplefinder_max_results = get(g:, 'simplefinder_max_results', 200)
 g:simplefinder_debounce_ms = get(g:, 'simplefinder_debounce_ms', 50)
 g:simplefinder_panel_width = get(g:, 'simplefinder_panel_width', 50)
 g:simplefinder_recent_files_max = get(g:, 'simplefinder_recent_files_max', 100)
+g:simplefinder_position = get(g:, 'simplefinder_position', 'right')
+g:simplefinder_close_on_select = get(g:, 'simplefinder_close_on_select', 1)
+g:simplefinder_hidden = get(g:, 'simplefinder_hidden', 0)
+g:simplefinder_no_ignore = get(g:, 'simplefinder_no_ignore', 0)
+g:simplefinder_regex = get(g:, 'simplefinder_regex', 0)
+g:simplefinder_ignore_case = get(g:, 'simplefinder_ignore_case', 0)
+g:simplefinder_root = get(g:, 'simplefinder_root', '')
+g:simplefinder_root_markers = get(g:, 'simplefinder_root_markers', ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
 
 # =============================================================
 # Commands
@@ -23,6 +31,9 @@ command! -nargs=? SimpleFinderGrep   simplefinder#Grep(<q-args>)
 command! -nargs=? SimpleFinderIGrep  simplefinder#IGrep(<q-args>)
 command! SimpleFinderRecent          simplefinder#RecentFiles()
 command! SimpleFinderBuffers         simplefinder#Buffers()
+command! SimpleFinderGrepWord        simplefinder#GrepWord()
+command! -range SimpleFinderGrepVisual simplefinder#GrepVisual()
+command! -nargs=? -complete=dir SimpleFinderRoot simplefinder#ProjectRoot(<q-args>)
 
 # =============================================================
 # Highlights
@@ -36,6 +47,8 @@ highlight default SFinderLnum     ctermfg=180 guifg=#d7af87
 highlight default SFinderPath     ctermfg=109 guifg=#87afaf
 highlight default SFinderStatus   ctermfg=245 guifg=#8a8a8a
 highlight default SFinderSelected ctermfg=NONE guifg=NONE ctermbg=236 guibg=#303030 cterm=bold gui=bold
+highlight default SFinderError    ctermfg=203 guifg=#ff5f5f
+highlight default SFinderFlag     ctermfg=142 guifg=#afaf00
 
 # =============================================================
 # Autocommands
@@ -44,4 +57,5 @@ augroup SimpleFinder
   autocmd!
   autocmd VimLeavePre * try | simplefinder#Stop() | catch | endtry
   autocmd BufEnter * simplefinder#TrackRecentFile()
+  autocmd VimResized * simplefinder#Reflow()
 augroup END

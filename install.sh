@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cargo build --release
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-rm -rf lib
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: Rust/Cargo is required (https://rustup.rs)" >&2
+  exit 1
+fi
+
+cargo build --release --locked
 mkdir -p lib
-cp target/release/simplefinder-daemon lib/
+install -m 755 target/release/simplefinder-daemon lib/simplefinder-daemon
 
-echo "Installed to ./lib. Ensure this plugin directory is on 'runtimepath'."
+echo "SimpleFinder installed: $ROOT_DIR/lib/simplefinder-daemon"

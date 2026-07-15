@@ -1,18 +1,12 @@
 use grep_matcher::Matcher;
-use grep_regex::RegexMatcher;
-use grep_searcher::{sinks::UTF8, Searcher};
+use grep_searcher::{Searcher, sinks::UTF8};
 use ignore::WalkBuilder;
 use nucleo_matcher::{
-    pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher as NucleoMatcher, Utf32Str,
+    pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::RwLock,
@@ -32,6 +26,10 @@ enum Request {
         query: String,
         #[serde(default = "default_max")]
         max: usize,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        no_ignore: bool,
     },
     #[serde(rename = "grep")]
     Grep {
@@ -40,8 +38,14 @@ enum Request {
         pattern: String,
         #[serde(default)]
         regex: bool,
+        #[serde(default)]
+        ignore_case: bool,
         #[serde(default = "default_max")]
         max: usize,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        no_ignore: bool,
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
@@ -60,6 +64,8 @@ enum Event {
         items: Vec<FileItem>,
         done: bool,
         total: usize,
+        capped: bool,
+        elapsed_ms: u128,
     },
     #[serde(rename = "grep_result")]
     GrepResult {
@@ -67,6 +73,8 @@ enum Event {
         items: Vec<GrepItem>,
         done: bool,
         total: usize,
+        capped: bool,
+        elapsed_ms: u128,
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
@@ -100,29 +108,36 @@ type FileCache = Arc<RwLock<HashMap<String, CacheEntry>>>;
 async fn get_or_walk_files(
     cache: &FileCache,
     root: &str,
+    hidden: bool,
+    no_ignore: bool,
     token: &CancellationToken,
-) -> Option<Arc<Vec<String>>> {
+) -> Result<Option<Arc<Vec<String>>>, String> {
+    let root_path = validate_root(root)?;
+    let cache_key = format!("{}\0{hidden}\0{no_ignore}", root_path.to_string_lossy());
+
     // Check cache first (with TTL)
     {
         let c = cache.read().await;
-        if let Some(entry) = c.get(root) {
+        if let Some(entry) = c.get(&cache_key) {
             if entry.created.elapsed().as_secs() < CACHE_TTL_SECS {
-                return Some(Arc::clone(&entry.files));
+                return Ok(Some(Arc::clone(&entry.files)));
             }
         }
     }
 
     // Walk in blocking thread to avoid stalling the async runtime
-    let root_owned = root.to_string();
     let token_clone = token.clone();
     let files = tokio::task::spawn_blocking(move || {
-        let root_path = PathBuf::from(&root_owned);
-        let walker = WalkBuilder::new(&root_path)
-            .hidden(false) // include dotfiles
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
+        let mut builder = WalkBuilder::new(&root_path);
+        builder.hidden(!hidden);
+        if no_ignore {
+            builder
+                .ignore(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false);
+        }
+        let walker = builder.build();
 
         let mut files = Vec::new();
         for entry in walker {
@@ -133,7 +148,7 @@ async fn get_or_walk_files(
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
             if let Ok(rel) = entry.path().strip_prefix(&root_path) {
@@ -144,28 +159,47 @@ async fn get_or_walk_files(
         Some(files)
     })
     .await
-    .ok()
-    .flatten()?;
+    .map_err(|e| format!("file scan failed: {e}"))?;
+
+    let Some(files) = files else {
+        return Ok(None);
+    };
 
     let files = Arc::new(files);
     {
         let mut c = cache.write().await;
         c.insert(
-            root.to_string(),
+            cache_key,
             CacheEntry {
                 files: Arc::clone(&files),
                 created: Instant::now(),
             },
         );
     }
-    Some(files)
+    Ok(Some(files))
+}
+
+fn validate_root(root: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(root);
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("cannot access root {root:?}: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("search root is not a directory: {root}"));
+    }
+    Ok(canonical)
 }
 
 // ─────────────────── Fuzzy matching ───────────────────
 
-fn fuzzy_filter(files: &[String], query: &str, max: usize) -> Vec<FileItem> {
+fn fuzzy_filter(
+    files: &[String],
+    query: &str,
+    max: usize,
+    token: &CancellationToken,
+) -> Option<(Vec<FileItem>, usize)> {
     if query.is_empty() {
-        return files
+        let items = files
             .iter()
             .take(max)
             .map(|p| FileItem {
@@ -173,55 +207,78 @@ fn fuzzy_filter(files: &[String], query: &str, max: usize) -> Vec<FileItem> {
                 score: 0,
             })
             .collect();
+        return Some((items, files.len()));
     }
 
     let mut matcher = NucleoMatcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
 
-    let mut scored: Vec<FileItem> = files
-        .iter()
-        .filter_map(|p| {
+    let mut scored: Vec<FileItem> = Vec::new();
+    for (index, p) in files.iter().enumerate() {
+        if index % 1024 == 0 && token.is_cancelled() {
+            return None;
+        }
+        if let Some(score) = {
             let mut buf = Vec::new();
             let haystack = Utf32Str::new(p, &mut buf);
-            pattern.score(haystack, &mut matcher).map(|score| FileItem {
+            pattern.score(haystack, &mut matcher)
+        } {
+            scored.push(FileItem {
                 path: p.clone(),
                 score: score as i64,
-            })
-        })
-        .collect();
+            });
+        }
+    }
 
-    scored.sort_by(|a, b| b.score.cmp(&a.score));
+    let total = scored.len();
+    scored.sort_unstable_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
     scored.truncate(max);
-    scored
+    Some((scored, total))
 }
 
 // ─────────────────── Grep ───────────────────
 
+#[derive(Clone, Copy)]
+struct GrepOptions {
+    is_regex: bool,
+    ignore_case: bool,
+    max: usize,
+    hidden: bool,
+    no_ignore: bool,
+}
+
 fn handle_grep_sync(
     root: &str,
     pattern: &str,
-    is_regex: bool,
-    max: usize,
+    options: GrepOptions,
     token: &CancellationToken,
-) -> Result<Vec<GrepItem>, String> {
-    let matcher = if is_regex {
-        RegexMatcher::new(pattern).map_err(|e| e.to_string())?
+) -> Result<(Vec<GrepItem>, bool), String> {
+    let expression = if options.is_regex {
+        pattern.to_string()
     } else {
-        RegexMatcher::new(&regex_syntax::escape(pattern)).map_err(|e| e.to_string())?
+        regex_syntax::escape(pattern)
     };
+    let matcher = grep_regex::RegexMatcherBuilder::new()
+        .case_insensitive(options.ignore_case)
+        .build(&expression)
+        .map_err(|e| e.to_string())?;
 
-    let root_path = Path::new(root);
-    let results: Arc<std::sync::Mutex<Vec<GrepItem>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let root_path = validate_root(root)?;
+    let results: Arc<std::sync::Mutex<Vec<GrepItem>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .threads(num_cpus::get().min(8))
-        .build_parallel();
+    let mut builder = WalkBuilder::new(&root_path);
+    builder
+        .hidden(!options.hidden)
+        .threads(num_cpus::get().min(8));
+    if options.no_ignore {
+        builder
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
+    let walker = builder.build_parallel();
 
     walker.run(|| {
         let matcher = matcher.clone();
@@ -240,7 +297,7 @@ fn handle_grep_sync(
                 Ok(e) => e,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
 
@@ -268,14 +325,14 @@ fn handle_grep_sync(
                         col,
                         text: line.trim_end().to_string(),
                     });
-                    Ok(true)
+                    Ok(!token.is_cancelled() && local_items.len() <= options.max)
                 }),
             );
 
             if !local_items.is_empty() {
                 let mut r = results.lock().unwrap();
                 r.extend(local_items);
-                if r.len() >= max {
+                if r.len() > options.max {
                     done.store(true, std::sync::atomic::Ordering::Relaxed);
                     return ignore::WalkState::Quit;
                 }
@@ -286,8 +343,15 @@ fn handle_grep_sync(
     });
 
     let mut results = results.lock().unwrap();
-    results.truncate(max);
-    Ok(std::mem::take(&mut *results))
+    let capped = results.len() > options.max;
+    results.truncate(options.max);
+    results.sort_unstable_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.lnum.cmp(&b.lnum))
+            .then_with(|| a.col.cmp(&b.col))
+    });
+    Ok((std::mem::take(&mut *results), capped))
 }
 
 // ─────────────────── stdout writer ───────────────────
@@ -359,6 +423,8 @@ async fn main() -> std::io::Result<()> {
                 root,
                 query,
                 max,
+                hidden,
+                no_ignore,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -370,15 +436,23 @@ async fn main() -> std::io::Result<()> {
                 }
 
                 tokio::spawn(async move {
-                    let files = match get_or_walk_files(&cache, &root, &token).await {
-                        Some(f) => f,
-                        None => {
-                            // Cancelled during walk
-                            let mut map = cancels.write().await;
-                            map.remove(&id);
-                            return;
-                        }
-                    };
+                    let started = Instant::now();
+                    let files =
+                        match get_or_walk_files(&cache, &root, hidden, no_ignore, &token).await {
+                            Ok(Some(f)) => f,
+                            Ok(None) => {
+                                // Cancelled during walk
+                                let mut map = cancels.write().await;
+                                map.remove(&id);
+                                return;
+                            }
+                            Err(message) => {
+                                send_event(&tx, &Event::Error { id, message }).await;
+                                let mut map = cancels.write().await;
+                                map.remove(&id);
+                                return;
+                            }
+                        };
 
                     if token.is_cancelled() {
                         let mut map = cancels.write().await;
@@ -386,8 +460,34 @@ async fn main() -> std::io::Result<()> {
                         return;
                     }
 
-                    let items = fuzzy_filter(&files, &query, max);
-                    let total = items.len();
+                    let max = max.min(5_000);
+                    let token_clone = token.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        fuzzy_filter(&files, &query, max, &token_clone)
+                    })
+                    .await;
+                    let (items, total) = match result {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            let mut map = cancels.write().await;
+                            map.remove(&id);
+                            return;
+                        }
+                        Err(e) => {
+                            send_event(
+                                &tx,
+                                &Event::Error {
+                                    id,
+                                    message: format!("fuzzy match failed: {e}"),
+                                },
+                            )
+                            .await;
+                            let mut map = cancels.write().await;
+                            map.remove(&id);
+                            return;
+                        }
+                    };
+                    let capped = total > items.len();
                     send_event(
                         &tx,
                         &Event::FilesResult {
@@ -395,6 +495,8 @@ async fn main() -> std::io::Result<()> {
                             items,
                             done: true,
                             total,
+                            capped,
+                            elapsed_ms: started.elapsed().as_millis(),
                         },
                     )
                     .await;
@@ -408,7 +510,10 @@ async fn main() -> std::io::Result<()> {
                 root,
                 pattern,
                 regex,
+                ignore_case,
                 max,
+                hidden,
+                no_ignore,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -419,14 +524,27 @@ async fn main() -> std::io::Result<()> {
                 }
 
                 tokio::spawn(async move {
+                    let started = Instant::now();
                     let token_clone = token.clone();
+                    let max = max.min(5_000);
                     let result = tokio::task::spawn_blocking(move || {
-                        handle_grep_sync(&root, &pattern, regex, max, &token_clone)
+                        handle_grep_sync(
+                            &root,
+                            &pattern,
+                            GrepOptions {
+                                is_regex: regex,
+                                ignore_case,
+                                max,
+                                hidden,
+                                no_ignore,
+                            },
+                            &token_clone,
+                        )
                     })
                     .await;
 
                     match result {
-                        Ok(Ok(items)) => {
+                        Ok(Ok((items, capped))) => {
                             let total = items.len();
                             send_event(
                                 &tx,
@@ -435,6 +553,8 @@ async fn main() -> std::io::Result<()> {
                                     items,
                                     done: true,
                                     total,
+                                    capped,
+                                    elapsed_ms: started.elapsed().as_millis(),
                                 },
                             )
                             .await;
@@ -461,4 +581,89 @@ async fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time::SystemTime};
+
+    fn temp_project() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("simplefinder-test-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn fuzzy_filter_is_ranked_and_deterministic() {
+        let files = vec![
+            "src/simple_finder.rs".to_string(),
+            "docs/finder.md".to_string(),
+            "src/other.rs".to_string(),
+        ];
+        let token = CancellationToken::new();
+        let (items, total) = fuzzy_filter(&files, "finder", 10, &token).unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].score >= items[1].score);
+        assert!(items.iter().all(|item| item.path.contains("finder")));
+    }
+
+    #[test]
+    fn fuzzy_filter_reports_total_before_truncation() {
+        let files = vec!["a.rs".into(), "ab.rs".into(), "abc.rs".into()];
+        let (items, total) = fuzzy_filter(&files, "a", 1, &CancellationToken::new()).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn grep_literal_and_case_options_work() {
+        let root = temp_project();
+        fs::write(root.join("sample.txt"), "alpha [one]\nALPHA two\n").unwrap();
+
+        let (literal, _) = handle_grep_sync(
+            root.to_str().unwrap(),
+            "[one]",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: false,
+                max: 20,
+                hidden: false,
+                no_ignore: false,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let (folded, _) = handle_grep_sync(
+            root.to_str().unwrap(),
+            "alpha",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: true,
+                max: 20,
+                hidden: false,
+                no_ignore: false,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(literal.len(), 1);
+        assert_eq!(literal[0].col, 7);
+        assert_eq!(folded.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_root_returns_a_useful_error() {
+        let error = validate_root("/path/that/does/not/exist/simplefinder").unwrap_err();
+        assert!(error.contains("cannot access root"));
+    }
 }
