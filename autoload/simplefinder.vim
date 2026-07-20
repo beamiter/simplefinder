@@ -293,12 +293,11 @@ def EnsurePanel()
 
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
     if get(g:, 'simplefinder_position', 'right') ==# 'left'
-      topleft vertical new
+      execute 'topleft vertical sbuffer ' .. s_panel_bufnr
     else
-      botright vertical new
+      execute 'botright vertical sbuffer ' .. s_panel_bufnr
     endif
     s_panel_winid = win_getid()
-    execute 'buffer ' .. s_panel_bufnr
   else
     win_gotoid(s_panel_winid)
   endif
@@ -330,6 +329,7 @@ def PanelClose()
       close
     else
       enew
+      setlocal nobuflisted bufhidden=wipe
     endif
     if src > 0 && win_id2win(src) > 0
       win_gotoid(src)
