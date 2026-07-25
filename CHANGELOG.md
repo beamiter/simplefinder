@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2026-07-25
+
+- 刷新依赖 lockfile，重建 daemon；行为无变化。
+
 ## 0.3.0
 
 - 预览弹窗:实时显示选中文件内容或匹配行上下文,`<C-e>` 开关,`g:simplefinder_preview` 控制默认值

@@ -1,6 +1,6 @@
 [package]
 name = "simplefinder"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast fuzzy file finder and project grep backend for Vim9"
