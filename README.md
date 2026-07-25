@@ -44,6 +44,8 @@ Plug 'your-name/simplefinder', { 'do': './install.sh' }
 | `:SimpleFinderGrepVisual` | 搜索最近一次可视选择 |
 | `:SimpleFinderBuffers` | 查找已打开缓冲区 |
 | `:SimpleFinderRecent` | 查找最近文件 |
+| `:SimpleFinderLines` | 模糊搜索当前缓冲区的行 |
+| `:SimpleFinderHelp` | 模糊搜索帮助标签并打开 `:help` |
 | `:SimpleFinderResume` | 恢复上次搜索（模式、查询、选项） |
 | `:SimpleFinderRoot [dir]` | 查看或设置固定搜索根目录 |
 

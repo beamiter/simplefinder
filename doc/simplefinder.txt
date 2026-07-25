@@ -47,6 +47,15 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                                                          *:SimpleFinderRecent*
 :SimpleFinderRecent          Fuzzy-find recently used files.
 
+                                                          *:SimpleFinderLines*
+:SimpleFinderLines           Fuzzy-find lines in the current buffer; <CR>
+                             jumps to the line (works for unnamed buffers
+                             too). The preview popup centers on the line.
+
+                                                           *:SimpleFinderHelp*
+:SimpleFinderHelp            Fuzzy-find help tags from all of 'runtimepath'
+                             and open the selection with :help.
+
                                                          *:SimpleFinderResume*
 :SimpleFinderResume          Re-open the last search: same mode, query and
                              option toggles.

@@ -37,6 +37,8 @@ command! SimpleFinderGrepWord        simplefinder#GrepWord()
 command! -range SimpleFinderGrepVisual simplefinder#GrepVisual()
 command! -nargs=? -complete=dir SimpleFinderRoot simplefinder#ProjectRoot(<q-args>)
 command! SimpleFinderResume         simplefinder#Resume()
+command! SimpleFinderLines          simplefinder#Lines()
+command! SimpleFinderHelp           simplefinder#HelpTags()
 
 # =============================================================
 # Highlights

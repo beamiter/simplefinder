@@ -15,7 +15,7 @@ var s_next_id: number = 0
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
 var s_source_winid: number = 0
-var s_mode: string = ''          # 'files' | 'grep' | 'igrep' | 'recent' | 'buffers'
+var s_mode: string = ''          # 'files' | 'grep' | 'igrep' | 'recent' | 'buffers' | 'lines' | 'help'
 var s_query: string = ''
 var s_items: list<dict<any>> = []
 var s_cursor_idx: number = 0
@@ -313,7 +313,10 @@ def EnsurePanel()
     setbufvar(s_panel_bufnr, '&swapfile', 0)
   endif
 
+  # The tracked window must still display the panel buffer; the user may
+  # have :edit-ed another file into it.
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
+      || winbufnr(s_panel_winid) != s_panel_bufnr
     if get(g:, 'simplefinder_position', 'right') ==# 'left'
       execute 'topleft vertical sbuffer ' .. s_panel_bufnr
     else
@@ -401,6 +404,8 @@ def PanelRender()
     igrep: 'Interactive Grep',
     recent: 'Recent Files',
     buffers: 'Buffers',
+    lines: 'Buffer Lines',
+    help: 'Help Tags',
   }
 
   # Title line
@@ -574,6 +579,10 @@ def FormatItemLine(idx: number, width: number): string
     var path = get(item, 'path', '')
     var mod = get(item, 'modified', 0) ? ' [+]' : ''
     line = marker .. path .. mod
+  elseif s_mode ==# 'lines'
+    line = marker .. string(get(item, 'lnum', 0)) .. ': ' .. get(item, 'text', '')
+  elseif s_mode ==# 'help'
+    line = marker .. get(item, 'path', '')
   endif
 
   return TruncDisplay(line, width)
@@ -606,8 +615,13 @@ def AddItemProps(idx: number)
     else
       var truncated = line =~# "\u2026$"
       var last_ci = strchars(line) - 1
+      # Char offset of the matched field within the rendered row.
+      var prefix_chars = 3
+      if s_mode ==# 'lines'
+        prefix_chars = 3 + strchars(string(get(item, 'lnum', 0)) .. ': ')
+      endif
       for i in get(item, 'indices', [])
-        var ci = 3 + i
+        var ci = prefix_chars + i
         if truncated && ci >= last_ci
           break
         endif
@@ -1030,6 +1044,10 @@ def DispatchSearch()
     FilterBuffers()
   elseif s_mode ==# 'recent'
     FilterRecentFiles()
+  elseif s_mode ==# 'lines'
+    FilterLines()
+  elseif s_mode ==# 'help'
+    FilterHelp()
   endif
 enddef
 
@@ -1263,6 +1281,18 @@ export def Resume()
     FilterRecentFiles()
     return
   endif
+  if mode ==# 'lines'
+    Lines()
+    s_query = query
+    FilterLines()
+    return
+  endif
+  if mode ==# 'help'
+    HelpTags()
+    s_query = query
+    FilterHelp()
+    return
+  endif
   PanelOpen(mode, query, true)
   if mode ==# 'files' || query !=# ''
     DispatchSearch()
@@ -1320,24 +1350,93 @@ def FilterBuffers()
   PanelRender()
 enddef
 
-# Fuzzy-filter a local item list on its `path` field, attaching match
-# positions (char indices) as `indices` for highlighting.
-def FuzzyFilterLocal(all: list<dict<any>>, query: string): list<dict<any>>
+# =============================================================
+# Buffer lines (pure Vim9)
+# =============================================================
+
+var s_all_lines: list<dict<any>> = []
+
+export def Lines()
+  var src_buf = bufnr('%')
+  var src_name = fnamemodify(bufname(src_buf), ':~:.')
+  var mx = get(g:, 'simplefinder_lines_max', 50000)
+  s_all_lines = []
+  var ln = 0
+  for text in getline(1, '$')
+    ln += 1
+    if trim(text) ==# ''
+      continue
+    endif
+    add(s_all_lines, {path: src_name, bufnr: src_buf, lnum: ln, text: text})
+    if len(s_all_lines) >= mx
+      break
+    endif
+  endfor
+  PanelOpen('lines')
+  s_items = copy(s_all_lines)
+  s_total = len(s_items)
+  PanelRender()
+enddef
+
+def FilterLines()
+  s_items = FuzzyFilterLocal(s_all_lines, s_query, 'text')
+  s_total = len(s_items)
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
+  PanelRender()
+enddef
+
+# =============================================================
+# Help tags (pure Vim9)
+# =============================================================
+
+var s_all_help: list<dict<any>> = []
+
+export def HelpTags()
+  s_all_help = []
+  var seen: dict<bool> = {}
+  for tagfile in globpath(&runtimepath, 'doc/tags', 0, 1)
+    var lines: list<string> = []
+    try
+      lines = readfile(tagfile)
+    catch
+      continue
+    endtry
+    for tagline in lines
+      var parts = split(tagline, "\t")
+      if len(parts) >= 2 && !has_key(seen, parts[0])
+        seen[parts[0]] = true
+        add(s_all_help, {path: parts[0]})
+      endif
+    endfor
+  endfor
+  sort(s_all_help, (a, b) => a.path <# b.path ? -1 : a.path ==# b.path ? 0 : 1)
+  PanelOpen('help')
+  s_items = copy(s_all_help)
+  s_total = len(s_items)
+  PanelRender()
+enddef
+
+def FilterHelp()
+  s_items = FuzzyFilterLocal(s_all_help, s_query)
+  s_total = len(s_items)
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
+  PanelRender()
+enddef
+
+# Fuzzy-filter a local item list on `key`, attaching match positions
+# (char indices) as `indices` for highlighting.
+def FuzzyFilterLocal(all: list<dict<any>>, query: string, key = 'path'): list<dict<any>>
   if query ==# ''
     return mapnew(all, (_, v) => extendnew(v, {indices: []}))
   endif
-  var by_path: dict<any> = {}
-  for it in all
-    by_path[it.path] = it
-  endfor
-  var paths = mapnew(all, (_, v) => v.path)
-  var res = matchfuzzypos(paths, query)
+  var res = matchfuzzypos(all, query, {key: key})
   var out: list<dict<any>> = []
   for pi in range(len(res[0]))
-    var mp = res[0][pi]
-    if has_key(by_path, mp)
-      add(out, extendnew(by_path[mp], {indices: res[1][pi]}))
-    endif
+    add(out, extendnew(res[0][pi], {indices: res[1][pi]}))
   endfor
   return out
 enddef
@@ -1401,6 +1500,23 @@ def AcceptItem(mode: string)
     return
   endif
   var item = s_items[s_cursor_idx]
+
+  # Help tags open with :help instead of :edit.
+  if s_mode ==# 'help'
+    var tag = get(item, 'path', '')
+    if get(g:, 'simplefinder_close_on_select', 1) != 0
+      PanelClose()
+    elseif s_source_winid > 0 && win_id2win(s_source_winid) > 0
+      win_gotoid(s_source_winid)
+    endif
+    try
+      execute 'help ' .. fnameescape(tag)
+    catch
+      echohl WarningMsg | echomsg 'simplefinder: ' .. v:exception | echohl None
+    endtry
+    return
+  endif
+
   var path = ResolvePath(item)
   var lnum = get(item, 'lnum', 0)
   var col = get(item, 'col', 0)
@@ -1411,9 +1527,12 @@ def AcceptItem(mode: string)
     win_gotoid(s_source_winid)
   endif
 
-  # For buffers, use bufnr if available
+  # For buffers and buffer lines, prefer bufnr so unnamed buffers work too.
   var bufnr = get(item, 'bufnr', -1)
   if bufnr > 0 && mode ==# 'edit'
+    execute 'buffer ' .. bufnr
+  elseif bufnr > 0
+    execute mode
     execute 'buffer ' .. bufnr
   else
     execute mode .. ' ' .. fnameescape(path)

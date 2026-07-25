@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 - 2026-07-26
+
+- 新增 `:SimpleFinderLines`:模糊搜索当前缓冲区的行,`<CR>` 跳转到对应行(无名缓冲区也可用),预览弹窗以该行为中心。`g:simplefinder_lines_max`(默认 50000)限制收集行数。
+- 新增 `:SimpleFinderHelp`:模糊搜索 'runtimepath' 下所有帮助标签,选中后直接 `:help` 打开。
+- `:SimpleFinderResume` 支持恢复以上两种本地源。
+- 修复:panel 窗口的 buffer 被用户 `:edit` 换走后,再次打开会渲染到隐藏 buffer;现在会检测并新开 panel 窗口。
+- 内部:本地源的模糊过滤改用 `matchfuzzypos()` 的 key 匹配,路径重复的条目不再被折叠。
+
 ## 0.3.1 - 2026-07-25
 
 - 刷新依赖 lockfile，重建 daemon；行为无变化。
