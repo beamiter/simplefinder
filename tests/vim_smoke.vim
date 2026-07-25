@@ -7,6 +7,8 @@ runtime plugin/simplefinder.vim
 SimpleFinderBuffers
 SimpleFinderRecent
 SimpleFinderIGrep simplefinder
+SimpleFinderResume
+SimpleFinderFiles daemon
 SimpleFinderRoot
 
 qa!

@@ -1,0 +1,148 @@
+*simplefinder.txt*  Fast fuzzy file finder & project grep for Vim 9
+
+Author: beamiter
+License: same terms as Vim
+
+==============================================================================
+CONTENTS                                                *simplefinder-contents*
+
+  1. Introduction ................ |simplefinder-intro|
+  2. Commands .................... |simplefinder-commands|
+  3. Panel keys .................. |simplefinder-keys|
+  4. Configuration ............... |simplefinder-config|
+  5. Highlights .................. |simplefinder-highlights|
+
+==============================================================================
+1. INTRODUCTION                                            *simplefinder-intro*
+
+SimpleFinder is a lightweight project finder for Vim 9. Vim9 script drives a
+native side panel; a resident Rust daemon does parallel file scanning, fuzzy
+ranking (nucleo) and full-text search (ripgrep libraries). They talk over
+stdin/stdout with one JSON message per line.
+
+Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
+|+popupwin|. Run ./install.sh once to compile the daemon (Rust 1.85+).
+
+==============================================================================
+2. COMMANDS                                             *simplefinder-commands*
+
+                                                          *:SimpleFinderFiles*
+:SimpleFinderFiles [query]   Fuzzy-find project files.
+
+                                                           *:SimpleFinderGrep*
+:SimpleFinderGrep [text]     Grep project text (prompts if no argument).
+
+                                                          *:SimpleFinderIGrep*
+:SimpleFinderIGrep [text]    Live grep: results update as you type.
+
+                                                       *:SimpleFinderGrepWord*
+:SimpleFinderGrepWord        Live grep for the word under the cursor.
+
+                                                     *:SimpleFinderGrepVisual*
+:SimpleFinderGrepVisual      Live grep for the last visual selection.
+
+                                                        *:SimpleFinderBuffers*
+:SimpleFinderBuffers         Fuzzy-find open buffers (most recent first).
+
+                                                         *:SimpleFinderRecent*
+:SimpleFinderRecent          Fuzzy-find recently used files.
+
+                                                         *:SimpleFinderResume*
+:SimpleFinderResume          Re-open the last search: same mode, query and
+                             option toggles.
+
+                                                           *:SimpleFinderRoot*
+:SimpleFinderRoot [dir]      Show, or pin, the search root directory.
+
+==============================================================================
+3. PANEL KEYS                                               *simplefinder-keys*
+
+Navigation and opening~
+  <CR>            open the selected result
+  <C-v> / <C-x>   open in vertical / horizontal split
+  <C-t>           open in a new tab
+  <C-j> <C-n> <Down>   next result
+  <C-k> <C-p> <Up>     previous result
+  <Esc> <C-c>     close the panel
+
+Multi-select and quickfix~
+  <Tab>           toggle mark on the current result, then move down
+  <S-Tab>         toggle mark, then move up
+  <C-q>           send marked results (or all, when none are marked) to the
+                  quickfix list and open it
+
+Query editing~
+  <BS> <C-h>      delete last character
+  <C-u>           clear the query
+  <C-w>           delete the last word
+
+Search options (grep modes)~
+  <C-r>           toggle literal text / regex     flag: [txt] / [.*]
+  <C-a>           cycle case mode                 flag: [sC] / [aa] / [Aa]
+                  smart: case-insensitive unless the query contains an
+                  uppercase letter
+
+All modes~
+  <C-o>           toggle hidden files             flag: [hidden]
+  <C-g>           toggle ignore files             flag: [all]
+  <C-e>           toggle the preview popup
+
+Buffers mode~
+  <C-d>           delete (:bdelete) the selected buffer
+
+==============================================================================
+4. CONFIGURATION                                          *simplefinder-config*
+
+Set before the plugin loads; defaults shown. >
+
+  g:simplefinder_max_results = 200       max results per query
+  g:simplefinder_debounce_ms = 50        input debounce
+  g:simplefinder_panel_width = 50        panel width in columns
+  g:simplefinder_position = 'right'      'left' or 'right'
+  g:simplefinder_close_on_select = 1     close panel after opening a result
+  g:simplefinder_preview = 1             preview popup on by default
+  g:simplefinder_hidden = 0              include hidden files
+  g:simplefinder_no_ignore = 0           ignore the ignore files
+  g:simplefinder_regex = 0               grep starts in regex mode
+  g:simplefinder_smart_case = 1          smart case for grep
+  g:simplefinder_ignore_case = 0         force case-insensitive grep
+  g:simplefinder_recent_files_max = 100  recent file list size
+  g:simplefinder_root = ''               pin the search root ('' = auto)
+  g:simplefinder_root_markers = ['.git', 'Cargo.toml', 'package.json',
+                                 'go.mod', 'CMakeLists.txt', 'Makefile',
+                                 '.project_root']
+  g:simplefinder_daemon_path = ''        daemon binary override
+  g:simplefinder_debug = 0               log daemon chatter with :echom
+<
+The project root is found by walking up from the current file looking for a
+root marker, falling back to |getcwd()|. Scanning honours `.ignore`,
+`.gitignore`, the global git ignore and `.git/info/exclude`.
+
+Suggested mappings: >
+
+  nnoremap <leader>ff <Cmd>SimpleFinderFiles<CR>
+  nnoremap <leader>fg <Cmd>SimpleFinderIGrep<CR>
+  nnoremap <leader>fb <Cmd>SimpleFinderBuffers<CR>
+  nnoremap <leader>fw <Cmd>SimpleFinderGrepWord<CR>
+  nnoremap <leader>fr <Cmd>SimpleFinderResume<CR>
+  xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
+<
+==============================================================================
+5. HIGHLIGHTS                                         *simplefinder-highlights*
+
+Override any of these with :highlight after the plugin loads.
+
+  SFinderTitle        panel title
+  SFinderPrompt       query prompt
+  SFinderStatus       status / help text
+  SFinderFlag         option flags like [.*] [sC] [hidden]
+  SFinderSep          separator line
+  SFinderLnum         line numbers in grep results
+  SFinderPath         file paths
+  SFinderMatch        matched characters in results
+  SFinderMarked       multi-select mark (*)
+  SFinderError        error messages
+  SFinderBorder       preview popup border
+  SFinderPreviewLine  highlighted match line in the preview
+
+vim:tw=78:ts=8:noet:ft=help:norl:

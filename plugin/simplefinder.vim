@@ -20,6 +20,8 @@ g:simplefinder_hidden = get(g:, 'simplefinder_hidden', 0)
 g:simplefinder_no_ignore = get(g:, 'simplefinder_no_ignore', 0)
 g:simplefinder_regex = get(g:, 'simplefinder_regex', 0)
 g:simplefinder_ignore_case = get(g:, 'simplefinder_ignore_case', 0)
+g:simplefinder_smart_case = get(g:, 'simplefinder_smart_case', 1)
+g:simplefinder_preview = get(g:, 'simplefinder_preview', 1)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
 g:simplefinder_root_markers = get(g:, 'simplefinder_root_markers', ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
 
@@ -34,6 +36,7 @@ command! SimpleFinderBuffers         simplefinder#Buffers()
 command! SimpleFinderGrepWord        simplefinder#GrepWord()
 command! -range SimpleFinderGrepVisual simplefinder#GrepVisual()
 command! -nargs=? -complete=dir SimpleFinderRoot simplefinder#ProjectRoot(<q-args>)
+command! SimpleFinderResume         simplefinder#Resume()
 
 # =============================================================
 # Highlights
@@ -49,6 +52,9 @@ highlight default SFinderStatus   ctermfg=245 guifg=#8a8a8a
 highlight default SFinderSelected ctermfg=NONE guifg=NONE ctermbg=236 guibg=#303030 cterm=bold gui=bold
 highlight default SFinderError    ctermfg=203 guifg=#ff5f5f
 highlight default SFinderFlag     ctermfg=142 guifg=#afaf00
+highlight default SFinderMatch    ctermfg=215 guifg=#ffaf5f cterm=bold gui=bold
+highlight default SFinderMarked   ctermfg=114 guifg=#87d787 cterm=bold gui=bold
+highlight default SFinderPreviewLine ctermbg=237 guibg=#3a3a3a
 
 # =============================================================
 # Autocommands

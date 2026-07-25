@@ -1,5 +1,5 @@
 use grep_matcher::Matcher;
-use grep_searcher::{Searcher, sinks::UTF8};
+use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
 use ignore::WalkBuilder;
 use nucleo_matcher::{
     Config, Matcher as NucleoMatcher, Utf32Str,
@@ -84,6 +84,8 @@ enum Event {
 struct FileItem {
     path: String,
     score: i64,
+    /// Char indices into `path` matched by the query, for highlighting.
+    indices: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -91,7 +93,24 @@ struct GrepItem {
     path: String,
     lnum: usize,
     col: usize,
+    /// 1-based exclusive byte offset of the match end within `text`.
+    col_end: usize,
     text: String,
+}
+
+/// Cap stored line length so minified/generated files don't flood the UI.
+const MAX_LINE_BYTES: usize = 512;
+
+fn truncate_line(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.len() <= MAX_LINE_BYTES {
+        return trimmed.to_string();
+    }
+    let mut end = MAX_LINE_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &trimmed[..end])
 }
 
 // ─────────────────── File cache ───────────────────
@@ -129,7 +148,7 @@ async fn get_or_walk_files(
     let token_clone = token.clone();
     let files = tokio::task::spawn_blocking(move || {
         let mut builder = WalkBuilder::new(&root_path);
-        builder.hidden(!hidden);
+        builder.hidden(!hidden).threads(num_cpus::get().min(8));
         if no_ignore {
             builder
                 .ignore(false)
@@ -137,24 +156,35 @@ async fn get_or_walk_files(
                 .git_global(false)
                 .git_exclude(false);
         }
-        let walker = builder.build();
 
-        let mut files = Vec::new();
-        for entry in walker {
-            if token_clone.is_cancelled() {
-                return None;
-            }
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
-            }
-            if let Ok(rel) = entry.path().strip_prefix(&root_path) {
-                files.push(rel.to_string_lossy().into_owned());
-            }
+        let (file_tx, file_rx) = std::sync::mpsc::channel::<String>();
+        builder.build_parallel().run(|| {
+            let file_tx = file_tx.clone();
+            let root_path = root_path.clone();
+            let token = token_clone.clone();
+            Box::new(move |entry| {
+                if token.is_cancelled() {
+                    return ignore::WalkState::Quit;
+                }
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return ignore::WalkState::Continue,
+                };
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                if let Ok(rel) = entry.path().strip_prefix(&root_path) {
+                    let _ = file_tx.send(rel.to_string_lossy().into_owned());
+                }
+                ignore::WalkState::Continue
+            })
+        });
+        drop(file_tx);
+
+        if token_clone.is_cancelled() {
+            return None;
         }
+        let mut files: Vec<String> = file_rx.into_iter().collect();
         files.sort();
         Some(files)
     })
@@ -205,6 +235,7 @@ fn fuzzy_filter(
             .map(|p| FileItem {
                 path: p.clone(),
                 score: 0,
+                indices: Vec::new(),
             })
             .collect();
         return Some((items, files.len()));
@@ -226,6 +257,7 @@ fn fuzzy_filter(
             scored.push(FileItem {
                 path: p.clone(),
                 score: score as i64,
+                indices: Vec::new(),
             });
         }
     }
@@ -233,6 +265,22 @@ fn fuzzy_filter(
     let total = scored.len();
     scored.sort_unstable_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
     scored.truncate(max);
+
+    // Only the surviving page needs highlight positions.
+    let mut idx_buf: Vec<u32> = Vec::new();
+    for item in &mut scored {
+        idx_buf.clear();
+        let mut buf = Vec::new();
+        let haystack = Utf32Str::new(&item.path, &mut buf);
+        if pattern
+            .indices(haystack, &mut matcher, &mut idx_buf)
+            .is_some()
+        {
+            idx_buf.sort_unstable();
+            idx_buf.dedup();
+            item.indices = idx_buf.iter().map(|&i| i as usize).collect();
+        }
+    }
     Some((scored, total))
 }
 
@@ -286,7 +334,9 @@ fn handle_grep_sync(
         let results = Arc::clone(&results);
         let done = Arc::clone(&done);
         let token = token.clone();
-        let mut searcher = Searcher::new();
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
 
         Box::new(move |entry| {
             if token.is_cancelled() || done.load(std::sync::atomic::Ordering::Relaxed) {
@@ -313,17 +363,18 @@ fn handle_grep_sync(
                 &matcher,
                 &path,
                 UTF8(|lnum, line| {
-                    let col = matcher
+                    let (col, col_end) = matcher
                         .find(line.as_bytes())
                         .ok()
                         .flatten()
-                        .map(|m| m.start() + 1)
-                        .unwrap_or(1);
+                        .map(|m| (m.start() + 1, m.end() + 1))
+                        .unwrap_or((1, 1));
                     local_items.push(GrepItem {
                         path: rel.clone(),
                         lnum: lnum as usize,
                         col,
-                        text: line.trim_end().to_string(),
+                        col_end,
+                        text: truncate_line(line),
                     });
                     Ok(!token.is_cancelled() && local_items.len() <= options.max)
                 }),
@@ -612,6 +663,13 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items[0].score >= items[1].score);
         assert!(items.iter().all(|item| item.path.contains("finder")));
+        // Highlight indices point at the matched chars in each path.
+        for item in &items {
+            assert!(!item.indices.is_empty());
+            let chars: Vec<char> = item.path.chars().collect();
+            let matched: String = item.indices.iter().map(|&i| chars[i]).collect();
+            assert_eq!(matched.to_lowercase(), "finder");
+        }
     }
 
     #[test]
@@ -657,7 +715,36 @@ mod tests {
 
         assert_eq!(literal.len(), 1);
         assert_eq!(literal[0].col, 7);
+        assert_eq!(literal[0].col_end, 12);
         assert_eq!(folded.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_skips_binary_and_truncates_long_lines() {
+        let root = temp_project();
+        fs::write(root.join("bin.dat"), b"needle\x00binary").unwrap();
+        let long = format!("{}needle", "x".repeat(600));
+        fs::write(root.join("long.txt"), &long).unwrap();
+
+        let (items, _) = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: false,
+                max: 20,
+                hidden: false,
+                no_ignore: false,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "long.txt");
+        assert!(items[0].text.len() <= MAX_LINE_BYTES + '…'.len_utf8());
+        assert!(items[0].text.ends_with('…'));
         fs::remove_dir_all(root).unwrap();
     }
 

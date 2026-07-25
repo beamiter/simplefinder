@@ -31,9 +31,13 @@ var s_error: string = ''
 var s_elapsed_ms: number = 0
 var s_capped: bool = false
 var s_regex: bool = false
-var s_ignore_case: bool = false
+var s_case_mode: string = 'smart'   # 'smart' | 'ignore' | 'sensitive'
 var s_hidden: bool = false
 var s_no_ignore: bool = false
+var s_marked: dict<bool> = {}       # multi-select: item index -> marked
+var s_preview_on: bool = false
+var s_preview_winid: number = 0
+var s_has_session: bool = false     # a search was opened before (for Resume)
 
 # ─────────────────── Recent files ───────────────────
 
@@ -184,6 +188,7 @@ def OnFilesResult(ev: dict<any>)
     add(s_items, {
       path: get(item, 'path', ''),
       score: get(item, 'score', 0),
+      indices: get(item, 'indices', []),
     })
   endfor
   s_total = get(ev, 'total', len(s_items))
@@ -193,6 +198,8 @@ def OnFilesResult(ev: dict<any>)
   s_error = ''
   s_current_id = 0
   s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
   PanelRender()
 enddef
 
@@ -203,6 +210,7 @@ def OnGrepResult(ev: dict<any>)
       path: get(item, 'path', ''),
       lnum: get(item, 'lnum', 0),
       col: get(item, 'col', 0),
+      col_end: get(item, 'col_end', 0),
       text: get(item, 'text', ''),
     })
   endfor
@@ -213,6 +221,8 @@ def OnGrepResult(ev: dict<any>)
   s_error = ''
   s_current_id = 0
   s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
   PanelRender()
 enddef
 
@@ -250,7 +260,7 @@ enddef
 # Panel UI
 # =============================================================
 
-def PanelOpen(mode: string, initial_query: string = '')
+def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = false)
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
     s_source_winid = win_getid()
   elseif win_getid() != s_panel_winid
@@ -261,16 +271,28 @@ def PanelOpen(mode: string, initial_query: string = '')
   s_query = initial_query
   s_items = []
   s_cursor_idx = 0
+  s_scroll_off = 0
   s_total = 0
   s_current_id = 0
   s_loading = false
   s_error = ''
   s_elapsed_ms = 0
   s_capped = false
-  s_regex = get(g:, 'simplefinder_regex', 0) != 0
-  s_ignore_case = get(g:, 'simplefinder_ignore_case', 0) != 0
-  s_hidden = get(g:, 'simplefinder_hidden', 0) != 0
-  s_no_ignore = get(g:, 'simplefinder_no_ignore', 0) != 0
+  s_marked = {}
+  s_has_session = true
+  if !keep_options
+    s_regex = get(g:, 'simplefinder_regex', 0) != 0
+    if get(g:, 'simplefinder_ignore_case', 0) != 0
+      s_case_mode = 'ignore'
+    elseif get(g:, 'simplefinder_smart_case', 1) != 0
+      s_case_mode = 'smart'
+    else
+      s_case_mode = 'sensitive'
+    endif
+    s_hidden = get(g:, 'simplefinder_hidden', 0) != 0
+    s_no_ignore = get(g:, 'simplefinder_no_ignore', 0) != 0
+  endif
+  s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
   s_project_root = FindProjectRoot()
 
   EnsurePanel()
@@ -309,10 +331,14 @@ def EnsurePanel()
   setlocal nobuflisted noswapfile buftype=nofile bufhidden=hide
   setlocal cursorline nomodifiable
   setlocal winfixwidth
+  if empty(prop_type_get('sf_match', {bufnr: s_panel_bufnr}))
+    prop_type_add('sf_match', {bufnr: s_panel_bufnr, highlight: 'SFinderMatch', combine: true})
+  endif
   SetupMappings()
 enddef
 
 def PanelClose()
+  PreviewClose()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
     s_debounce_timer = 0
@@ -394,6 +420,9 @@ def PanelRender()
   if !s_loading && s_error ==# '' && s_elapsed_ms > 0
     count_str ..= ' · ' .. string(s_elapsed_ms) .. 'ms'
   endif
+  if !empty(s_marked)
+    count_str = string(len(s_marked)) .. ' marked · ' .. count_str
+  endif
   var title_line = ' ' .. title
   var pad = width - strdisplaywidth(title_line) - strdisplaywidth(count_str)
   if pad < 1
@@ -406,7 +435,13 @@ def PanelRender()
   var flags = ''
   if s_mode ==# 'grep' || s_mode ==# 'igrep'
     flags ..= s_regex ? ' [.*]' : ' [txt]'
-    flags ..= s_ignore_case ? ' [aa]' : ' [Aa]'
+    if s_case_mode ==# 'smart'
+      flags ..= ' [sC]'
+    elseif s_case_mode ==# 'ignore'
+      flags ..= ' [aa]'
+    else
+      flags ..= ' [Aa]'
+    endif
   endif
   if s_hidden
     flags ..= ' [hidden]'
@@ -426,10 +461,16 @@ def PanelRender()
     max_items = 1
   endif
 
-  # Scrolling: ensure cursor is visible
-  var scroll_off = 0
-  if s_cursor_idx >= max_items
+  # Scrolling: keep the viewport stable, only shift when the cursor leaves it
+  var scroll_off = s_scroll_off
+  if s_cursor_idx < scroll_off
+    scroll_off = s_cursor_idx
+  elseif s_cursor_idx >= scroll_off + max_items
     scroll_off = s_cursor_idx - max_items + 1
+  endif
+  var max_off = max([0, len(s_items) - max_items])
+  if scroll_off > max_off
+    scroll_off = max_off
   endif
   s_scroll_off = scroll_off
 
@@ -464,9 +505,11 @@ def PanelRender()
   endwhile
 
   # Help line
-  var help = " \u23ce open  ^v vsplit  ^x split  ^t tab  esc close"
+  var help = " \u23ce open  \u21e5 mark  ^q quickfix  ^e preview  esc close"
   if s_mode ==# 'grep' || s_mode ==# 'igrep'
-    help = ' ^r regex  ^a case  ^o hidden  ^g ignores'
+    help = ' ^r regex  ^a case  ^o hidden  ^g ignores  ^q quickfix'
+  elseif s_mode ==# 'buffers'
+    help = " \u23ce open  \u21e5 mark  ^d bdelete  ^q quickfix  esc close"
   endif
   add(lines, TruncDisplay(help, width))
 
@@ -478,7 +521,22 @@ def PanelRender()
     deletebufline(s_panel_bufnr, extra_start, last)
   endif
   setbufvar(s_panel_bufnr, '&modifiable', 0)
+
+  # Highlight matched characters on the visible rows
+  try
+    prop_remove({type: 'sf_match', bufnr: s_panel_bufnr, all: true})
+  catch
+  endtry
+  var pidx = scroll_off
+  var pcount = 0
+  while pcount < max_items && pidx < len(s_items)
+    AddItemProps(pidx)
+    pcount += 1
+    pidx += 1
+  endwhile
+
   SyncCursorLine()
+  PreviewUpdate()
 enddef
 
 # Move the panel cursor onto the selected result row so cursorline tracks it.
@@ -493,9 +551,16 @@ def SyncCursorLine()
   win_execute(s_panel_winid, 'normal! ' .. bufline .. 'G')
 enddef
 
+# 3-char row prefix: cursor indicator, multi-select mark, space.
+def ItemMarker(idx: number): string
+  var cursor_ch = idx == s_cursor_idx ? "\u25b8" : ' '
+  var mark_ch = has_key(s_marked, string(idx)) ? '*' : ' '
+  return cursor_ch .. mark_ch .. ' '
+enddef
+
 def FormatItemLine(idx: number, width: number): string
   var item = s_items[idx]
-  var marker = idx == s_cursor_idx ? "\u25b8 " : '  '
+  var marker = ItemMarker(idx)
   var line = ''
 
   if s_mode ==# 'files' || s_mode ==# 'recent'
@@ -514,6 +579,53 @@ def FormatItemLine(idx: number, width: number): string
   return TruncDisplay(line, width)
 enddef
 
+# Add match-highlight text properties for one visible item row.
+def AddItemProps(idx: number)
+  if idx < s_scroll_off || s_panel_bufnr < 0
+    return
+  endif
+  var bufline = idx - s_scroll_off + 4
+  var line = FormatItemLine(idx, s_eff_width)
+  var item = s_items[idx]
+  try
+    if s_mode ==# 'grep' || s_mode ==# 'igrep'
+      var col = get(item, 'col', 0)
+      var col_end = get(item, 'col_end', 0)
+      if col <= 0 || col_end <= col
+        return
+      endif
+      var prefix = ItemMarker(idx) .. get(item, 'path', '') .. ':'
+        .. string(get(item, 'lnum', 0)) .. ': '
+      var start = strlen(prefix) + col - 1     # 0-based byte offset in line
+      var maxb = strlen(line)
+      if start >= maxb
+        return
+      endif
+      var length = min([col_end - col, maxb - start])
+      prop_add(bufline, start + 1, {type: 'sf_match', bufnr: s_panel_bufnr, length: length})
+    else
+      var truncated = line =~# "\u2026$"
+      var last_ci = strchars(line) - 1
+      for i in get(item, 'indices', [])
+        var ci = 3 + i
+        if truncated && ci >= last_ci
+          break
+        endif
+        var b0 = byteidx(line, ci)
+        if b0 < 0
+          break
+        endif
+        var b1 = byteidx(line, ci + 1)
+        if b1 < 0
+          b1 = strlen(line)
+        endif
+        prop_add(bufline, b0 + 1, {type: 'sf_match', bufnr: s_panel_bufnr, length: b1 - b0})
+      endfor
+    endif
+  catch
+  endtry
+enddef
+
 def PanelMoveCursor(old_idx: number, new_idx: number)
   if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
     return
@@ -525,9 +637,11 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
     max_items = 1
   endif
 
-  # Check if scrolling is needed
-  var new_scroll_off = 0
-  if new_idx >= max_items
+  # Check if scrolling is needed (viewport shifts only when cursor leaves it)
+  var new_scroll_off = s_scroll_off
+  if new_idx < new_scroll_off
+    new_scroll_off = new_idx
+  elseif new_idx >= new_scroll_off + max_items
     new_scroll_off = new_idx - max_items + 1
   endif
 
@@ -550,7 +664,14 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
     setbufline(s_panel_bufnr, new_bufline, FormatItemLine(new_idx, width))
   endif
   setbufvar(s_panel_bufnr, '&modifiable', 0)
+  if old_idx >= 0 && old_idx < len(s_items)
+    AddItemProps(old_idx)
+  endif
+  if new_idx >= 0 && new_idx < len(s_items)
+    AddItemProps(new_idx)
+  endif
   SyncCursorLine()
+  PreviewUpdate()
 enddef
 
 def SetupSyntax()
@@ -565,7 +686,107 @@ def SetupSyntax()
   win_execute(s_panel_winid, 'syntax match SFinderFlag /\[[^]]\+\]/')
   win_execute(s_panel_winid, 'syntax match SFinderSep /^─\+$/')
   win_execute(s_panel_winid, 'syntax match SFinderLnum /:\d\+:/')
-  win_execute(s_panel_winid, 'syntax match SFinderStatus /^ .\+ open.*esc close$/')
+  win_execute(s_panel_winid, 'syntax match SFinderStatus /^ \(⏎ open\|\^r regex\).*$/')
+  win_execute(s_panel_winid, 'syntax match SFinderMarked /\%2v\*/')
+enddef
+
+# ─────────────────── Preview popup ───────────────────
+
+def PreviewClose()
+  if s_preview_winid > 0
+    try
+      popup_close(s_preview_winid)
+    catch
+    endtry
+    s_preview_winid = 0
+  endif
+enddef
+
+def PreviewUpdate()
+  if !s_preview_on || s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
+    PreviewClose()
+    return
+  endif
+  if empty(s_items) || s_cursor_idx >= len(s_items)
+    PreviewClose()
+    return
+  endif
+  var item = s_items[s_cursor_idx]
+  var path = fnamemodify(expand(ResolvePath(item)), ':p')
+  if path ==# '' || !filereadable(path)
+    PreviewClose()
+    return
+  endif
+
+  # Fill the space beside the panel; skip when too narrow to be useful
+  var [_, pcol] = win_screenpos(win_id2win(s_panel_winid))
+  var width = 0
+  var col = 2
+  if get(g:, 'simplefinder_position', 'right') !=# 'left'
+    width = pcol - 4
+    col = 2
+  else
+    col = pcol + s_eff_width + 3
+    width = &columns - col - 1
+  endif
+  if width < 30
+    PreviewClose()
+    return
+  endif
+  var height = max([5, s_eff_height - 2])
+
+  var lnum = get(item, 'lnum', 0)
+  var lines: list<string> = []
+  var hl_line = 0
+  var fsize = getfsize(path)
+  if fsize < 0 || fsize > 2097152
+    lines = ['── file too large to preview ──']
+  else
+    var start = 1
+    if lnum > 0
+      start = max([1, lnum - height / 2])
+    endif
+    var raw = readfile(path, '', start + height - 1)
+    lines = len(raw) > start - 1 ? raw[start - 1 :] : []
+    if empty(lines)
+      lines = ['── empty file ──']
+    elseif lnum > 0
+      hl_line = lnum - start + 1
+    endif
+  endif
+
+  var title = ' ' .. TruncDisplay(get(item, 'path', ''), width - 4) .. ' '
+  if s_preview_winid <= 0 || empty(popup_getpos(s_preview_winid))
+    s_preview_winid = popup_create(lines, {
+      line: 2,
+      col: col,
+      minwidth: width,
+      maxwidth: width,
+      minheight: height,
+      maxheight: height,
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+      borderhighlight: ['SFinderBorder'],
+      title: title,
+      wrap: false,
+      zindex: 60,
+    })
+  else
+    popup_settext(s_preview_winid, lines)
+    popup_setoptions(s_preview_winid, {
+      line: 2,
+      col: col,
+      minwidth: width,
+      maxwidth: width,
+      minheight: height,
+      maxheight: height,
+      title: title,
+    })
+  endif
+  win_execute(s_preview_winid, 'call clearmatches()')
+  if hl_line > 0
+    win_execute(s_preview_winid, 'call matchaddpos("SFinderPreviewLine", [' .. hl_line .. '])')
+  endif
 enddef
 
 def PanelHandleChar(code: number)
@@ -596,6 +817,9 @@ def SetupMappings()
   nnoremap <silent><buffer> <C-a> <ScriptCmd>PanelHandleKey(0, '<lt>C-a>')<CR>
   nnoremap <silent><buffer> <C-o> <ScriptCmd>PanelHandleKey(0, '<lt>C-o>')<CR>
   nnoremap <silent><buffer> <C-g> <ScriptCmd>PanelHandleKey(0, '<lt>C-g>')<CR>
+  nnoremap <silent><buffer> <C-e> <ScriptCmd>PanelHandleKey(0, '<lt>C-e>')<CR>
+  nnoremap <silent><buffer> <C-q> <ScriptCmd>PanelHandleKey(0, '<lt>C-q>')<CR>
+  nnoremap <silent><buffer> <C-d> <ScriptCmd>PanelHandleKey(0, '<lt>C-d>')<CR>
 
   # Map the complete printable ASCII range, including regex punctuation.
   for code in range(32, 126)
@@ -631,6 +855,9 @@ def PanelHandleKey(winid: number, key: string): bool
     '<C-a>': "\<C-a>",
     '<C-o>': "\<C-o>",
     '<C-g>': "\<C-g>",
+    '<C-e>': "\<C-e>",
+    '<C-q>': "\<C-q>",
+    '<C-d>': "\<C-d>",
   }
   if has_key(special_keys, key)
     k = special_keys[key]
@@ -666,7 +893,14 @@ def PanelHandleKey(winid: number, key: string): bool
     return true
   endif
   if k ==# "\<C-a>" && (s_mode ==# 'grep' || s_mode ==# 'igrep')
-    s_ignore_case = !s_ignore_case
+    # Cycle: smart -> ignore -> sensitive
+    if s_case_mode ==# 'smart'
+      s_case_mode = 'ignore'
+    elseif s_case_mode ==# 'ignore'
+      s_case_mode = 'sensitive'
+    else
+      s_case_mode = 'smart'
+    endif
     DispatchSearch()
     PanelRender()
     return true
@@ -683,9 +917,44 @@ def PanelHandleKey(winid: number, key: string): bool
     PanelRender()
     return true
   endif
+  if k ==# "\<C-e>"
+    s_preview_on = !s_preview_on
+    PreviewUpdate()
+    return true
+  endif
+  if k ==# "\<C-q>"
+    SendToQuickfix()
+    return true
+  endif
+  if k ==# "\<C-d>" && s_mode ==# 'buffers'
+    DeleteCurrentBuffer()
+    return true
+  endif
+
+  # Multi-select: mark and move
+  if k ==# "\<Tab>"
+    if !empty(s_items) && s_cursor_idx < len(s_items)
+      ToggleMark(s_cursor_idx)
+      if s_cursor_idx < len(s_items) - 1
+        s_cursor_idx += 1
+      endif
+      PanelRender()
+    endif
+    return true
+  endif
+  if k ==# "\<S-Tab>"
+    if !empty(s_items) && s_cursor_idx < len(s_items)
+      ToggleMark(s_cursor_idx)
+      if s_cursor_idx > 0
+        s_cursor_idx -= 1
+      endif
+      PanelRender()
+    endif
+    return true
+  endif
 
   # Navigation
-  if k ==# "\<C-j>" || k ==# "\<C-n>" || k ==# "\<Down>" || k ==# "\<Tab>"
+  if k ==# "\<C-j>" || k ==# "\<C-n>" || k ==# "\<Down>"
     if s_cursor_idx < len(s_items) - 1
       var old = s_cursor_idx
       s_cursor_idx += 1
@@ -693,7 +962,7 @@ def PanelHandleKey(winid: number, key: string): bool
     endif
     return true
   endif
-  if k ==# "\<C-k>" || k ==# "\<C-p>" || k ==# "\<Up>" || k ==# "\<S-Tab>"
+  if k ==# "\<C-k>" || k ==# "\<C-p>" || k ==# "\<Up>"
     if s_cursor_idx > 0
       var old = s_cursor_idx
       s_cursor_idx -= 1
@@ -819,17 +1088,103 @@ def SendGrepRequest(pattern: string)
   s_loading = true
   s_error = ''
   PanelRender()
+  # smart: case-insensitive unless the pattern contains an uppercase letter
+  var eff_ignore_case = s_case_mode ==# 'ignore'
+    || (s_case_mode ==# 'smart' && match(pattern, '\u') < 0)
   Send({
     type: 'grep',
     id: id,
     root: s_project_root,
     pattern: pattern,
     regex: s_regex,
-    ignore_case: s_ignore_case,
+    ignore_case: eff_ignore_case,
     max: get(g:, 'simplefinder_max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
   })
+enddef
+
+# =============================================================
+# Multi-select & quickfix
+# =============================================================
+
+def ToggleMark(idx: number)
+  var key = string(idx)
+  if has_key(s_marked, key)
+    remove(s_marked, key)
+  else
+    s_marked[key] = true
+  endif
+enddef
+
+# Resolve an item's path against the project root when relative.
+def ResolvePath(item: dict<any>): string
+  var path = get(item, 'path', '')
+  if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep') && s_project_root !=# ''
+    if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
+      return s_project_root .. '/' .. path
+    endif
+  endif
+  return path
+enddef
+
+# Send marked items (or all items when none are marked) to the quickfix list.
+def SendToQuickfix()
+  if empty(s_items)
+    return
+  endif
+  var idxs: list<number> = []
+  if !empty(s_marked)
+    for key in keys(s_marked)
+      var i = str2nr(key)
+      if i >= 0 && i < len(s_items)
+        add(idxs, i)
+      endif
+    endfor
+    sort(idxs, 'n')
+  else
+    idxs = range(len(s_items))
+  endif
+
+  var qf: list<dict<any>> = []
+  for i in idxs
+    var item = s_items[i]
+    var entry: dict<any> = {filename: ResolvePath(item)}
+    if get(item, 'lnum', 0) > 0
+      entry.lnum = item.lnum
+      entry.col = max([1, get(item, 'col', 1)])
+      entry.text = get(item, 'text', '')
+    endif
+    add(qf, entry)
+  endfor
+  if empty(qf)
+    return
+  endif
+
+  var title = 'SimpleFinder ' .. s_mode .. (s_query ==# '' ? '' : ': ' .. s_query)
+  setqflist([], ' ', {title: title, items: qf})
+  PanelClose()
+  copen
+enddef
+
+def DeleteCurrentBuffer()
+  if empty(s_items) || s_cursor_idx >= len(s_items)
+    return
+  endif
+  var bufnr = get(s_items[s_cursor_idx], 'bufnr', -1)
+  if bufnr <= 0
+    return
+  endif
+  try
+    execute 'bdelete ' .. bufnr
+  catch
+    s_error = 'Cannot delete buffer ' .. bufnr .. ' (unsaved changes?)'
+    PanelRender()
+    return
+  endtry
+  s_error = ''
+  filter(s_all_buffers, (_, v) => v.bufnr != bufnr)
+  FilterBuffers()
 enddef
 
 # =============================================================
@@ -888,6 +1243,32 @@ export def GrepVisual()
   endif
 enddef
 
+# Re-open the panel exactly as it was last closed (mode, query, options).
+export def Resume()
+  if !s_has_session || s_mode ==# ''
+    Files('')
+    return
+  endif
+  var mode = s_mode
+  var query = s_query
+  if mode ==# 'buffers'
+    Buffers()
+    s_query = query
+    FilterBuffers()
+    return
+  endif
+  if mode ==# 'recent'
+    RecentFiles()
+    s_query = query
+    FilterRecentFiles()
+    return
+  endif
+  PanelOpen(mode, query, true)
+  if mode ==# 'files' || query !=# ''
+    DispatchSearch()
+  endif
+enddef
+
 export def ProjectRoot(path: string = '')
   if path ==# ''
     echom '[SimpleFinder] root: ' .. FindProjectRoot()
@@ -931,24 +1312,34 @@ export def Buffers()
 enddef
 
 def FilterBuffers()
-  if s_query ==# ''
-    s_items = copy(s_all_buffers)
-  else
-    var by_path: dict<any> = {}
-    for buf in s_all_buffers
-      by_path[buf.path] = buf
-    endfor
-    s_items = []
-    var paths = mapnew(s_all_buffers, (_, v) => v.path)
-    for mp in matchfuzzy(paths, s_query)
-      if has_key(by_path, mp)
-        add(s_items, by_path[mp])
-      endif
-    endfor
-  endif
+  s_items = FuzzyFilterLocal(s_all_buffers, s_query)
   s_total = len(s_items)
   s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
   PanelRender()
+enddef
+
+# Fuzzy-filter a local item list on its `path` field, attaching match
+# positions (char indices) as `indices` for highlighting.
+def FuzzyFilterLocal(all: list<dict<any>>, query: string): list<dict<any>>
+  if query ==# ''
+    return mapnew(all, (_, v) => extendnew(v, {indices: []}))
+  endif
+  var by_path: dict<any> = {}
+  for it in all
+    by_path[it.path] = it
+  endfor
+  var paths = mapnew(all, (_, v) => v.path)
+  var res = matchfuzzypos(paths, query)
+  var out: list<dict<any>> = []
+  for pi in range(len(res[0]))
+    var mp = res[0][pi]
+    if has_key(by_path, mp)
+      add(out, extendnew(by_path[mp], {indices: res[1][pi]}))
+    endif
+  endfor
+  return out
 enddef
 
 # =============================================================
@@ -977,23 +1368,11 @@ export def RecentFiles()
 enddef
 
 def FilterRecentFiles()
-  if s_query ==# ''
-    s_items = copy(s_all_recent)
-  else
-    var by_path: dict<any> = {}
-    for item in s_all_recent
-      by_path[item.path] = item
-    endfor
-    s_items = []
-    var paths = mapnew(s_all_recent, (_, v) => v.path)
-    for mp in matchfuzzy(paths, s_query)
-      if has_key(by_path, mp)
-        add(s_items, by_path[mp])
-      endif
-    endfor
-  endif
+  s_items = FuzzyFilterLocal(s_all_recent, s_query)
   s_total = len(s_items)
   s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
   PanelRender()
 enddef
 
@@ -1022,16 +1401,9 @@ def AcceptItem(mode: string)
     return
   endif
   var item = s_items[s_cursor_idx]
-  var path = get(item, 'path', '')
+  var path = ResolvePath(item)
   var lnum = get(item, 'lnum', 0)
   var col = get(item, 'col', 0)
-
-  # For files/grep results, resolve relative path from project root
-  if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep') && s_project_root !=# ''
-    if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
-      path = s_project_root .. '/' .. path
-    endif
-  endif
 
   if get(g:, 'simplefinder_close_on_select', 1) != 0
     PanelClose()
