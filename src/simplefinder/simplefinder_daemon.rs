@@ -244,44 +244,48 @@ fn fuzzy_filter(
     let mut matcher = NucleoMatcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
 
-    let mut scored: Vec<FileItem> = Vec::new();
+    // Score as (score, index) pairs: no path is cloned until it survives
+    // truncation, and the Utf32 scratch buffer is reused across candidates.
+    let mut buf = Vec::new();
+    let mut scored: Vec<(i64, usize)> = Vec::new();
     for (index, p) in files.iter().enumerate() {
         if index % 1024 == 0 && token.is_cancelled() {
             return None;
         }
-        if let Some(score) = {
-            let mut buf = Vec::new();
-            let haystack = Utf32Str::new(p, &mut buf);
-            pattern.score(haystack, &mut matcher)
-        } {
-            scored.push(FileItem {
-                path: p.clone(),
-                score: score as i64,
-                indices: Vec::new(),
-            });
+        let haystack = Utf32Str::new(p, &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            scored.push((score as i64, index));
         }
     }
 
     let total = scored.len();
-    scored.sort_unstable_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1])));
     scored.truncate(max);
 
-    // Only the surviving page needs highlight positions.
+    // Only the surviving page is materialized and needs highlight positions.
     let mut idx_buf: Vec<u32> = Vec::new();
-    for item in &mut scored {
+    let mut items: Vec<FileItem> = Vec::with_capacity(scored.len());
+    for (score, index) in scored {
+        let path = &files[index];
         idx_buf.clear();
-        let mut buf = Vec::new();
-        let haystack = Utf32Str::new(&item.path, &mut buf);
-        if pattern
+        let haystack = Utf32Str::new(path, &mut buf);
+        let indices = if pattern
             .indices(haystack, &mut matcher, &mut idx_buf)
             .is_some()
         {
             idx_buf.sort_unstable();
             idx_buf.dedup();
-            item.indices = idx_buf.iter().map(|&i| i as usize).collect();
-        }
+            idx_buf.iter().map(|&i| i as usize).collect()
+        } else {
+            Vec::new()
+        };
+        items.push(FileItem {
+            path: path.clone(),
+            score,
+            indices,
+        });
     }
-    Some((scored, total))
+    Some((items, total))
 }
 
 // ─────────────────── Grep ───────────────────
