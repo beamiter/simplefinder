@@ -4,10 +4,13 @@ vim9script
 # SimpleFinder — fuzzy finder & grep (Vim9 + Rust daemon)
 # =============================================================
 
-# ─────────────────── Daemon state ───────────────────
 
-var s_job: any = v:null
-var s_running: bool = false
+# ─────────────────── Daemon state ───────────────────
+#
+# Process lifecycle (start, restart, backoff, liveness, request timeouts) is
+# owned by the vendored simplecore supervisor; only the request bookkeeping
+# below is SimpleFinder's own.
+
 var s_next_id: number = 0
 
 # ─────────────────── Panel state ───────────────────
@@ -15,7 +18,7 @@ var s_next_id: number = 0
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
 var s_source_winid: number = 0
-var s_mode: string = ''          # 'files' | 'grep' | 'igrep' | 'recent' | 'buffers' | 'lines' | 'help'
+var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'recent' | 'buffers' | 'lines' | 'help'
 var s_query: string = ''
 var s_items: list<dict<any>> = []
 var s_cursor_idx: number = 0
@@ -46,86 +49,41 @@ var s_recent_files: list<string> = []
 # ─────────────────── Logging ───────────────────
 
 def Log(msg: string)
-  if get(g:, 'simplefinder_debug', 0) == 0
-    return
-  endif
-  echom '[SimpleFinder] ' .. msg
+  simplefinder#core#Log(msg)
 enddef
 
 # =============================================================
 # Daemon communication layer
+#
+# The supervisor owns the process; this file only decides what to send and
+# what to do with what comes back.
 # =============================================================
 
-def FindBackend(): string
-  # Check user-specified path first
-  var custom = get(g:, 'simplefinder_daemon_path', '')
-  if custom !=# '' && executable(custom)
-    return custom
+var s_core_ready: bool = false
+
+def SetupCore()
+  if s_core_ready
+    return
   endif
-  # Search in runtimepath
-  for dir in split(&runtimepath, ',')
-    var p = dir .. '/lib/simplefinder-daemon'
-    if executable(p)
-      return p
-    endif
-  endfor
-  return ''
+  s_core_ready = true
+  simplefinder#core#Setup({
+    name: 'SimpleFinder',
+    exe: 'simplefinder-daemon',
+    path_var: 'simplefinder_daemon_path',
+    debug_var: 'simplefinder_debug',
+    handshake: {request: {type: 'ping'}, reply_type: 'pong'},
+    OnEvent: OnDaemonEvent,
+    OnExit: OnDaemonExit,
+  })
 enddef
 
 def EnsureBackend(): bool
-  if s_running
-    return true
-  endif
-  var cmd = FindBackend()
-  if cmd ==# '' || !executable(cmd)
-    Log('Backend not found')
-    echohl ErrorMsg
-    echom '[SimpleFinder] daemon not found. Run install.sh to compile.'
-    echohl None
-    return false
-  endif
-  try
-    s_job = job_start([cmd], {
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, line) => {
-        OnDaemonEvent(line)
-      },
-      err_mode: 'nl',
-      err_cb: (ch, line) => {
-        Log('stderr: ' .. line)
-      },
-      exit_cb: (ch, code) => {
-        s_running = false
-        s_job = v:null
-        if s_current_id > 0
-          s_loading = false
-          s_error = 'Backend exited unexpectedly (code ' .. string(code) .. ')'
-          s_current_id = 0
-          PanelRender()
-        endif
-        Log('daemon exited with code ' .. string(code))
-      },
-      stoponexit: 'term'
-    })
-  catch
-    s_job = v:null
-    s_running = false
-    return false
-  endtry
-  s_running = (s_job != v:null)
-  return s_running
+  SetupCore()
+  return simplefinder#core#Ensure()
 enddef
 
-def Send(req: dict<any>)
-  if !s_running
-    return
-  endif
-  try
-    var json = json_encode(req) .. "\n"
-    ch_sendraw(s_job, json)
-  catch
-  endtry
+def Send(req: dict<any>): bool
+  return simplefinder#core#Send(req)
 enddef
 
 def NextId(): number
@@ -133,18 +91,26 @@ def NextId(): number
   return s_next_id
 enddef
 
-def OnDaemonEvent(line: string)
-  if line ==# ''
+# A daemon that dies mid-search must not leave the panel spinning forever.
+def OnDaemonExit(code: number, restarting: bool)
+  if s_current_id <= 0
     return
   endif
-  var ev: any
-  try
-    ev = json_decode(line)
-  catch
-    Log('decode error: ' .. line)
+  s_loading = false
+  s_current_id = 0
+  s_error = restarting
+    ? printf('Backend exited (code %d); restarting…', code)
+    : printf('Backend exited unexpectedly (code %d)', code)
+  PanelRender()
+enddef
+
+def OnDaemonEvent(ev: dict<any>)
+  if !has_key(ev, 'type')
     return
-  endtry
-  if type(ev) != v:t_dict || !has_key(ev, 'type')
+  endif
+
+  # The handshake reply is bookkeeping, not a search result.
+  if ev.type ==# 'pong'
     return
   endif
 
@@ -168,14 +134,37 @@ def OnDaemonEvent(line: string)
 enddef
 
 export def Stop()
-  if s_job != v:null
-    try
-      call('job_stop', [s_job])
-    catch
-    endtry
+  SetupCore()
+  simplefinder#core#Stop()
+enddef
+
+export def Restart()
+  SetupCore()
+  if simplefinder#core#Restart()
+    echom '[SimpleFinder] daemon restarted'
   endif
-  s_running = false
-  s_job = v:null
+enddef
+
+export def ShowLog()
+  simplefinder#core#ShowLog()
+enddef
+
+export def Health()
+  SetupCore()
+  var lines = ['SimpleFinder health', repeat('─', 40)]
+  extend(lines, simplefinder#core#HealthLines())
+  var caps = simplefinder#core#Caps()
+  if simplefinder#core#Ready() && empty(caps)
+    add(lines, '[WARN] daemon predates the capability handshake; rerun ./install.sh')
+  endif
+  add(lines, printf('[%s] popup preview: %s',
+    has('popupwin') ? 'OK' : 'WARN',
+    has('popupwin') ? 'available' : 'missing +popupwin — preview disabled'))
+  add(lines, printf('[INFO] project root: %s',
+    s_project_root ==# '' ? '(not resolved yet)' : s_project_root))
+  for line in lines
+    echom line
+  endfor
 enddef
 
 # =============================================================
@@ -347,7 +336,7 @@ def PanelClose()
     s_debounce_timer = 0
   endif
   # Cancel running request
-  if s_current_id > 0 && s_running
+  if s_current_id > 0
     Send({type: 'cancel', id: s_current_id})
     s_current_id = 0
   endif
@@ -406,6 +395,7 @@ def PanelRender()
     buffers: 'Buffers',
     lines: 'Buffer Lines',
     help: 'Help Tags',
+    gitfiles: 'Git Files',
   }
 
   # Title line
@@ -568,7 +558,7 @@ def FormatItemLine(idx: number, width: number): string
   var marker = ItemMarker(idx)
   var line = ''
 
-  if s_mode ==# 'files' || s_mode ==# 'recent'
+  if s_mode ==# 'files' || s_mode ==# 'recent' || s_mode ==# 'gitfiles'
     line = marker .. get(item, 'path', '')
   elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
     var path = get(item, 'path', '')
@@ -1048,6 +1038,8 @@ def DispatchSearch()
     FilterLines()
   elseif s_mode ==# 'help'
     FilterHelp()
+  elseif s_mode ==# 'gitfiles'
+    FilterGitFiles()
   endif
 enddef
 
@@ -1138,6 +1130,12 @@ enddef
 # Resolve an item's path against the project root when relative.
 def ResolvePath(item: dict<any>): string
   var path = get(item, 'path', '')
+  if s_mode ==# 'gitfiles' && s_git_root !=# ''
+    if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
+      return s_git_root .. '/' .. path
+    endif
+    return path
+  endif
   if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep') && s_project_root !=# ''
     if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
       return s_project_root .. '/' .. path
@@ -1293,6 +1291,12 @@ export def Resume()
     FilterHelp()
     return
   endif
+  if mode ==# 'gitfiles'
+    GitFiles()
+    s_query = query
+    FilterGitFiles()
+    return
+  endif
   PanelOpen(mode, query, true)
   if mode ==# 'files' || query !=# ''
     DispatchSearch()
@@ -1439,6 +1443,87 @@ def FuzzyFilterLocal(all: list<dict<any>>, query: string, key = 'path'): list<di
     add(out, extendnew(res[0][pi], {indices: res[1][pi]}))
   endfor
   return out
+enddef
+
+# =============================================================
+# Git files
+#
+# `git ls-files` is the fastest way to enumerate a large repository: it reads
+# the index instead of walking the tree, and it already honours .gitignore,
+# sparse checkouts and skip-worktree.  Untracked-but-not-ignored files are
+# included so a newly created file is findable before it is staged.
+# =============================================================
+
+var s_all_gitfiles: list<dict<any>> = []
+var s_git_root: string = ''
+
+# systemlist() is typed as taking a string in Vim9, so argv is escaped here
+# rather than passed as a list.
+def ShellJoin(argv: list<string>): string
+  return join(mapnew(argv, (_, a) => shellescape(a)), ' ')
+enddef
+
+def GitRootFor(dir: string): string
+  if !executable('git')
+    return ''
+  endif
+  var out = systemlist(ShellJoin(['git', '-C', dir, 'rev-parse', '--show-toplevel']))
+  if v:shell_error != 0 || empty(out)
+    return ''
+  endif
+  return substitute(out[0], '[\r\n]\+$', '', '')
+enddef
+
+export def GitFiles()
+  var start = expand('%:p:h')
+  if start ==# '' || !isdirectory(start)
+    start = getcwd()
+  endif
+  var root = GitRootFor(start)
+  if root ==# ''
+    echohl WarningMsg
+    echom executable('git')
+      ? '[SimpleFinder] not inside a git repository'
+      : '[SimpleFinder] git is not installed'
+    echohl None
+    return
+  endif
+  s_git_root = root
+
+  # -c core.quotepath=false keeps non-ASCII names readable instead of
+  # \303\251-style escapes.  --exclude-standard applies the usual ignore
+  # rules to the untracked half, and --deduplicate keeps merge conflicts from
+  # listing the same path three times.
+  var out = systemlist(ShellJoin([
+    'git', '-c', 'core.quotepath=false', '-C', root,
+    'ls-files', '--cached', '--others', '--exclude-standard', '--deduplicate',
+  ]))
+  if v:shell_error != 0
+    echohl ErrorMsg
+    echom '[SimpleFinder] git ls-files failed: ' .. join(out[0 : 2], ' ')
+    echohl None
+    return
+  endif
+
+  s_all_gitfiles = []
+  for f in out
+    if f !=# ''
+      add(s_all_gitfiles, {path: f})
+    endif
+  endfor
+  PanelOpen('gitfiles')
+  s_items = copy(s_all_gitfiles)
+  s_total = len(s_items)
+  PanelRender()
+enddef
+
+def FilterGitFiles()
+  s_items = FuzzyFilterLocal(s_all_gitfiles, s_query)
+  s_total = len(s_items)
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  s_marked = {}
+  PanelRender()
 enddef
 
 # =============================================================

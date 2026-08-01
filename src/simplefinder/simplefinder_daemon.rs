@@ -6,7 +6,12 @@ use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::RwLock,
@@ -49,11 +54,23 @@ enum Request {
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
+    /// Capability handshake.  The Vim side sends this once per daemon start and
+    /// gates optional features on the answer, so an older daemon paired with a
+    /// newer plugin degrades instead of misbehaving.
+    #[serde(rename = "ping")]
+    Ping {
+        #[serde(default)]
+        id: u64,
+    },
 }
 
 fn default_max() -> usize {
     200
 }
+
+/// Bumped whenever the wire format changes in a way the Vim side must know
+/// about.  v1 was the implicit, un-negotiated format.
+const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -78,6 +95,22 @@ enum Event {
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
+    #[serde(rename = "pong")]
+    Pong {
+        id: u64,
+        protocol_version: u32,
+        version: &'static str,
+        capabilities: BTreeMap<&'static str, bool>,
+    },
+}
+
+fn capabilities() -> BTreeMap<&'static str, bool> {
+    BTreeMap::from([
+        ("files", true),
+        ("grep", true),
+        ("cancel", true),
+        ("match_indices", true),
+    ])
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -467,6 +500,18 @@ async fn main() -> std::io::Result<()> {
         };
 
         match req {
+            Request::Ping { id } => {
+                send_event(
+                    &out_tx,
+                    &Event::Pong {
+                        id,
+                        protocol_version: PROTOCOL_VERSION,
+                        version: env!("CARGO_PKG_VERSION"),
+                        capabilities: capabilities(),
+                    },
+                )
+                .await;
+            }
             Request::Cancel { id } => {
                 let map = cancels.read().await;
                 if let Some(token) = map.get(&id) {

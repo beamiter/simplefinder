@@ -47,6 +47,18 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                                                          *:SimpleFinderRecent*
 :SimpleFinderRecent          Fuzzy-find recently used files.
 
+                                                       *:SimpleFinderGitFiles*
+:SimpleFinderGitFiles        Fuzzy-find files in the current git repository.
+                             Reads the index with `git ls-files` instead of
+                             walking the tree, so it stays fast in very large
+                             repositories and already honours .gitignore,
+                             sparse checkouts and skip-worktree. Untracked
+                             files that are not ignored are included, so a
+                             file you just created is findable before it is
+                             staged. Paths resolve against the repository
+                             root, which may differ from |:SimpleFinderRoot|.
+                             Reports an error outside a repository.
+
                                                           *:SimpleFinderLines*
 :SimpleFinderLines           Fuzzy-find lines in the current buffer; <CR>
                              jumps to the line (works for unnamed buffers
@@ -153,5 +165,44 @@ Override any of these with :highlight after the plugin loads.
   SFinderError        error messages
   SFinderBorder       preview popup border
   SFinderPreviewLine  highlighted match line in the preview
+
+
+==============================================================================
+DAEMON SUPERVISION                                    *simplefinder-daemon*
+
+The Rust daemon is managed by simplecore, the supervisor shared by the whole
+simple* plugin suite. It is vendored into this repository at
+autoload/simplefinder/core.vim; that file is generated, do not edit it in place.
+
+What it guarantees:
+
+- Liveness is always read from |job_status()|. job_start() returns a job
+  object even when the exec itself failed, so a daemon that cannot start is
+  never mistaken for one that is running.
+- A superseded daemon's late exit callback cannot clear the state of the
+  replacement that already took its place.
+- Output still queued when you stop the daemon is discarded, so an explicit
+  stop cannot be undone by an event that was already in flight.
+- A daemon that dies is restarted automatically with exponential backoff.
+  If it keeps crashing, the supervisor reports it once and stops trying
+  rather than respawning forever; :SimpleFinderRestart re-arms it.
+- Requests are correlated to replies by id and can time out, so a wedged
+  daemon never leaves a callback hanging.
+
+                                                      *:SimpleFinderHealth*
+:SimpleFinderHealth
+        Report daemon path, run state, negotiated protocol and capabilities,
+        uptime, crash and restart counts, and whether the crash-loop breaker
+        has tripped, alongside this plugin's own diagnostics.
+
+                                                      *:SimpleFinderRestart*
+:SimpleFinderRestart
+        Stop the daemon and start a fresh one. Clears the crash-loop breaker,
+        so this is the way back after repeated failures.
+
+                                                      *:SimpleFinderLog*
+:SimpleFinderLog
+        Open the daemon transcript in a scratch buffer: start and exit events,
+        restarts, protocol handshakes, send failures and stderr.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

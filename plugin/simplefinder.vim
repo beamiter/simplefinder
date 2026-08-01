@@ -39,6 +39,11 @@ command! -nargs=? -complete=dir SimpleFinderRoot simplefinder#ProjectRoot(<q-arg
 command! SimpleFinderResume         simplefinder#Resume()
 command! SimpleFinderLines          simplefinder#Lines()
 command! SimpleFinderHelp           simplefinder#HelpTags()
+command! SimpleFinderGitFiles       simplefinder#GitFiles()
+command! SimpleFinderHealth         simplefinder#Health()
+command! SimpleFinderRestart        simplefinder#Restart()
+command! SimpleFinderLog            simplefinder#ShowLog()
+command! SimpleFinderStop           simplefinder#Stop()
 
 # =============================================================
 # Highlights
