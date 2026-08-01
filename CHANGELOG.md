@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-08-01
 
+### 构建与 CI 修复
+
+- `ignore` 锁定回 0.4.27:0.4.30 使用了 let-chains(需要 Rust 1.88),而本 crate 声明 MSRV 为 1.85,按声明版本无法编译。新增 CI 的 MSRV 作业防止再次漂移。
+
 ### 新增
 
 - `:SimpleFinderGitFiles`:在当前 git 仓库内模糊查找文件。用 `git ls-files` 读
