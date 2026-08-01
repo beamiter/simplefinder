@@ -150,12 +150,38 @@ fn truncate_line(line: &str) -> String {
 
 const CACHE_TTL_SECS: u64 = 30;
 
+/// Upper bound on how many distinct roots stay cached.  The daemon outlives
+/// every search, and each entry retains the full path list of a project; left
+/// alone the map grew for the whole session, since the TTL only decided
+/// whether an entry was *fresh*, never whether it was still worth keeping.
+/// Four keys exist per root (hidden × no_ignore), so this holds a handful of
+/// projects with their toggles.
+const CACHE_MAX_ROOTS: usize = 16;
+
 struct CacheEntry {
     files: Arc<Vec<String>>,
     created: Instant,
 }
 
 type FileCache = Arc<RwLock<HashMap<String, CacheEntry>>>;
+
+/// Drop entries that can no longer be served from cache, then enforce the
+/// size bound by evicting the oldest.  Called while inserting, so the write
+/// lock is already held and the cost is paid on a path that just walked a
+/// whole directory tree.
+fn prune_cache(cache: &mut HashMap<String, CacheEntry>) {
+    cache.retain(|_, entry| entry.created.elapsed().as_secs() < CACHE_TTL_SECS);
+    while cache.len() > CACHE_MAX_ROOTS {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
 
 async fn get_or_walk_files(
     cache: &FileCache,
@@ -238,6 +264,7 @@ async fn get_or_walk_files(
                 created: Instant::now(),
             },
         );
+        prune_cache(&mut c);
     }
     Ok(Some(files))
 }
@@ -801,5 +828,60 @@ mod tests {
     fn invalid_root_returns_a_useful_error() {
         let error = validate_root("/path/that/does/not/exist/simplefinder").unwrap_err();
         assert!(error.contains("cannot access root"));
+    }
+
+    use std::time::Duration;
+
+    fn cache_entry(age: Duration) -> CacheEntry {
+        CacheEntry {
+            files: Arc::new(Vec::new()),
+            created: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn stale_cache_entries_are_dropped() {
+        // The TTL used to decide only whether an entry could be *served*;
+        // nothing ever removed it, so the daemon retained the full path list
+        // of every project searched for the lifetime of the session.
+        let mut cache = HashMap::new();
+        cache.insert("fresh".to_string(), cache_entry(Duration::from_secs(0)));
+        cache.insert(
+            "stale".to_string(),
+            cache_entry(Duration::from_secs(CACHE_TTL_SECS + 1)),
+        );
+
+        prune_cache(&mut cache);
+
+        assert!(cache.contains_key("fresh"));
+        assert!(
+            !cache.contains_key("stale"),
+            "an expired entry must be evicted"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_evicts_the_oldest() {
+        let mut cache = HashMap::new();
+        // All fresh, so only the size bound can evict. Ages are staggered so
+        // "oldest" is well defined.
+        for i in 0..(CACHE_MAX_ROOTS + 4) {
+            cache.insert(
+                format!("root{i}"),
+                cache_entry(Duration::from_millis(i as u64)),
+            );
+        }
+
+        prune_cache(&mut cache);
+
+        assert_eq!(cache.len(), CACHE_MAX_ROOTS);
+        // The four highest indices are the oldest, so they are the ones gone.
+        for i in (CACHE_MAX_ROOTS)..(CACHE_MAX_ROOTS + 4) {
+            assert!(
+                !cache.contains_key(&format!("root{i}")),
+                "root{i} should have been evicted"
+            );
+        }
+        assert!(cache.contains_key("root0"), "the newest entry must survive");
     }
 }
