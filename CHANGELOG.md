@@ -2,6 +2,23 @@
 
 ## Unreleased - 2026-08-01
 
+### 新增:符号搜索
+
+- `:SimpleFinderSymbols [query]`:在整个项目里搜定义(fn / struct / def / class /
+  func / interface …),按当前 buffer 的文件类型选关键字集合,再用 query 收窄,
+  边打边筛。
+- 背后没有 tags 文件、也没有语言服务器,用的就是 daemon 已有的 grep:不需要任何
+  配置,不会与磁盘上的文件脱节,大仓库里几毫秒出结果。代价是它比真正的索引粗——
+  它告诉你名字在哪里被定义,而不是它解析到什么。
+- `g:simplefinder_symbol_keywords` 可按文件类型覆盖关键字集合;
+  `g:simplefinder_symbol_all_languages` 一次搜所有语言(多语言仓库通常要的就是这个)。
+- `:SimpleFinderResume` 支持恢复该来源。
+- 新增 `tests/vim_symbols.vim`。其中两条是针对开发中真实踩到的坑:
+  关键字集合必须取自**源 buffer** 的 filetype(在面板打开之后再读 `&filetype`
+  会读到面板自己的 buffer,于是静默退化成"搜所有语言",Rust 文件因此匹配到了
+  `let`);以及用户输入里的正则元字符必须转义(`needle(`、`[unclosed` 会直接让
+  pattern 报错)。去掉任一处修复,测试都会失败。
+
 ### 修复:daemon 文件缓存无界增长
 
 - daemon 的文件缓存以 root 为键缓存整份文件路径列表,30 秒的 TTL 只决定条目

@@ -47,6 +47,28 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                                                          *:SimpleFinderRecent*
 :SimpleFinderRecent          Fuzzy-find recently used files.
 
+                                                        *:SimpleFinderSymbols*
+:SimpleFinderSymbols [query]
+                             Search the project for definitions. Matches lines
+                             that begin a definition -- fn, struct, def, class,
+                             func, interface and so on -- using the keyword set
+                             for the current buffer's filetype, then narrows by
+                             [query]. Typing continues to narrow live.
+
+                             There is no tags file or language server behind
+                             this: it runs on the same grep the daemon already
+                             provides, so it needs no setup, never goes stale
+                             against the files on disk, and searches a large
+                             repository in a few milliseconds. It is coarser
+                             than a real index -- it finds where a name is
+                             defined, not what it resolves to.
+
+                             |g:simplefinder_symbol_keywords| overrides the
+                             keyword set for a filetype;
+                             |g:simplefinder_symbol_all_languages| searches
+                             every language at once, which is usually what a
+                             polyglot repository wants.
+
                                                        *:SimpleFinderGitFiles*
 :SimpleFinderGitFiles        Fuzzy-find files in the current git repository.
                              Reads the index with `git ls-files` instead of
@@ -204,5 +226,17 @@ What it guarantees:
 :SimpleFinderLog
         Open the daemon transcript in a scratch buffer: start and exit events,
         restarts, protocol handshakes, send failures and stderr.
+
+                                              *g:simplefinder_symbol_keywords*
+g:simplefinder_symbol_keywords
+        Dictionary of filetype to the list of keywords that introduce a
+        definition, used by |:SimpleFinderSymbols|. An entry replaces the
+        built-in set for that filetype. Default {}. >
+            let g:simplefinder_symbol_keywords = {'zig': ['fn', 'const']}
+<
+                                         *g:simplefinder_symbol_all_languages*
+g:simplefinder_symbol_all_languages
+        Search every language's keywords regardless of the current filetype.
+        Default 0.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

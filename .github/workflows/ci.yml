@@ -29,6 +29,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: vim -Nu NONE -i NONE -n -es -S tests/vim_smoke.vim
+      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_symbols.vim
       - name: Install Vim
         run: sudo apt-get update && sudo apt-get install --yes vim
       - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)

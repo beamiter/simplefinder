@@ -23,6 +23,11 @@ g:simplefinder_ignore_case = get(g:, 'simplefinder_ignore_case', 0)
 g:simplefinder_smart_case = get(g:, 'simplefinder_smart_case', 1)
 g:simplefinder_preview = get(g:, 'simplefinder_preview', 1)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
+# Per-filetype keywords that introduce a definition, used by
+# :SimpleFinderSymbols. Overrides the built-in table for that filetype.
+g:simplefinder_symbol_keywords = get(g:, 'simplefinder_symbol_keywords', {})
+# Search every language's keywords regardless of the current filetype.
+g:simplefinder_symbol_all_languages = get(g:, 'simplefinder_symbol_all_languages', 0)
 g:simplefinder_root_markers = get(g:, 'simplefinder_root_markers', ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
 
 # =============================================================
@@ -40,6 +45,7 @@ command! SimpleFinderResume         simplefinder#Resume()
 command! SimpleFinderLines          simplefinder#Lines()
 command! SimpleFinderHelp           simplefinder#HelpTags()
 command! SimpleFinderGitFiles       simplefinder#GitFiles()
+command! -nargs=? SimpleFinderSymbols simplefinder#Symbols(<q-args>)
 command! SimpleFinderHealth         simplefinder#Health()
 command! SimpleFinderRestart        simplefinder#Restart()
 command! SimpleFinderLog            simplefinder#ShowLog()

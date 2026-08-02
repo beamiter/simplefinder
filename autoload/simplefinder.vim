@@ -18,7 +18,7 @@ var s_next_id: number = 0
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
 var s_source_winid: number = 0
-var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'recent' | 'buffers' | 'lines' | 'help'
+var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'symbols' | 'recent' | 'buffers' | 'lines' | 'help'
 var s_query: string = ''
 var s_items: list<dict<any>> = []
 var s_cursor_idx: number = 0
@@ -396,6 +396,7 @@ def PanelRender()
     lines: 'Buffer Lines',
     help: 'Help Tags',
     gitfiles: 'Git Files',
+    symbols: 'Symbols',
   }
 
   # Title line
@@ -560,7 +561,7 @@ def FormatItemLine(idx: number, width: number): string
 
   if s_mode ==# 'files' || s_mode ==# 'recent' || s_mode ==# 'gitfiles'
     line = marker .. get(item, 'path', '')
-  elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
+  elseif s_mode ==# 'grep' || s_mode ==# 'igrep' || s_mode ==# 'symbols'
     var path = get(item, 'path', '')
     var lnum = get(item, 'lnum', 0)
     var text = get(item, 'text', '')
@@ -587,7 +588,7 @@ def AddItemProps(idx: number)
   var line = FormatItemLine(idx, s_eff_width)
   var item = s_items[idx]
   try
-    if s_mode ==# 'grep' || s_mode ==# 'igrep'
+    if s_mode ==# 'grep' || s_mode ==# 'igrep' || s_mode ==# 'symbols'
       var col = get(item, 'col', 0)
       var col_end = get(item, 'col_end', 0)
       if col <= 0 || col_end <= col
@@ -1030,6 +1031,8 @@ def DispatchSearch()
     SendGrepRequest(s_query)
   elseif s_mode ==# 'igrep'
     SendGrepRequest(s_query)
+  elseif s_mode ==# 'symbols'
+    SendSymbolRequest(s_query)
   elseif s_mode ==# 'buffers'
     FilterBuffers()
   elseif s_mode ==# 'recent'
@@ -1136,7 +1139,8 @@ def ResolvePath(item: dict<any>): string
     endif
     return path
   endif
-  if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep') && s_project_root !=# ''
+  if (s_mode ==# 'files' || s_mode ==# 'grep' || s_mode ==# 'igrep'
+      || s_mode ==# 'symbols') && s_project_root !=# ''
     if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
       return s_project_root .. '/' .. path
     endif
@@ -1298,7 +1302,7 @@ export def Resume()
     return
   endif
   PanelOpen(mode, query, true)
-  if mode ==# 'files' || query !=# ''
+  if mode ==# 'files' || mode ==# 'symbols' || query !=# ''
     DispatchSearch()
   endif
 enddef
@@ -1443,6 +1447,138 @@ def FuzzyFilterLocal(all: list<dict<any>>, query: string, key = 'path'): list<di
     add(out, extendnew(res[0][pi], {indices: res[1][pi]}))
   endfor
   return out
+enddef
+
+# =============================================================
+# Symbols
+#
+# Project-wide definition search built on the grep the daemon already does.
+# This deliberately has no language server or tags file behind it: SimpleFinder
+# installs on its own, and a symbol search that only works once some other
+# plugin is present is worse than one that always works. Matching definition
+# lines by keyword is coarser than a real index, but it needs no setup, stays
+# current with the file on disk, and searches 19k files in single-digit
+# milliseconds.
+# =============================================================
+
+# filetype -> definition-introducing keywords. The regex is assembled from
+# these, so adding a language is one entry.
+var s_symbol_keywords: dict<list<string>> = {
+  rust:       ['fn', 'struct', 'enum', 'trait', 'impl', 'type', 'const', 'static', 'macro_rules!', 'mod'],
+  python:     ['def', 'class', 'async def'],
+  javascript: ['function', 'class', 'const', 'let', 'var'],
+  typescript: ['function', 'class', 'const', 'let', 'var', 'interface', 'type', 'enum'],
+  javascriptreact: ['function', 'class', 'const', 'let', 'var'],
+  typescriptreact: ['function', 'class', 'const', 'let', 'var', 'interface', 'type', 'enum'],
+  go:         ['func', 'type', 'var', 'const'],
+  c:          ['struct', 'enum', 'union', 'typedef', 'static', 'void', 'int', 'char', 'define'],
+  cpp:        ['class', 'struct', 'enum', 'union', 'typedef', 'namespace', 'template', 'void', 'int', 'auto'],
+  java:       ['class', 'interface', 'enum', 'void', 'public', 'private', 'protected', 'static'],
+  ruby:       ['def', 'class', 'module'],
+  lua:        ['function', 'local'],
+  vim:        ['function', 'def', 'command', 'let', 'var', 'const'],
+  sh:         ['function'],
+  bash:       ['function'],
+  zsh:        ['function'],
+  haskell:    ['data', 'newtype', 'type', 'class', 'instance'],
+  julia:      ['function', 'struct', 'macro', 'module', 'const'],
+  php:        ['function', 'class', 'interface', 'trait'],
+  cs:         ['class', 'interface', 'struct', 'enum', 'void', 'public', 'private'],
+  kotlin:     ['fun', 'class', 'object', 'interface', 'val', 'var'],
+  swift:      ['func', 'class', 'struct', 'enum', 'protocol', 'extension', 'let', 'var'],
+  scala:      ['def', 'class', 'object', 'trait', 'val', 'var', 'type'],
+}
+
+# Used when the filetype is unknown, or deliberately, to search every language
+# at once -- which is usually what you want in a polyglot repository.
+def AllSymbolKeywords(): list<string>
+  var seen: dict<bool> = {}
+  var out: list<string> = []
+  for [ft, words] in items(s_symbol_keywords)
+    for w in words
+      if !has_key(seen, w)
+        seen[w] = true
+        add(out, w)
+      endif
+    endfor
+  endfor
+  return out
+enddef
+
+# Resolved once, from the source buffer, before the panel opens. Reading
+# &filetype later would see the panel's own buffer and silently fall back to
+# every language at once.
+var s_symbol_words: list<string> = []
+
+def SymbolKeywordsFor(ft: string): list<string>
+  var custom = get(g:, 'simplefinder_symbol_keywords', {})
+  if type(custom) == v:t_dict && has_key(custom, ft) && type(custom[ft]) == v:t_list
+    return custom[ft]
+  endif
+  if get(g:, 'simplefinder_symbol_all_languages', 0) || ft ==# ''
+    return AllSymbolKeywords()
+  endif
+  return get(s_symbol_keywords, ft, AllSymbolKeywords())
+enddef
+
+# Escape the parts of a query that would otherwise be read as regex syntax.
+# The keyword alternation around it is ours, so only the user's text is quoted.
+def EscapeRegexLiteral(text: string): string
+  return substitute(text, '[\\^$.*+?()\[\]{}|/]', '\\&', 'g')
+enddef
+
+def SymbolPattern(query: string): string
+  var words = s_symbol_words
+  if empty(words)
+    return ''
+  endif
+  var alternation = join(mapnew(words, (_, w) => EscapeRegexLiteral(w)), '|')
+  # A definition line: keyword, whitespace, then a name containing the query.
+  # Leading (^|\s) keeps `fn` from matching inside another identifier.
+  var name = query ==# '' ? '[A-Za-z_]' : '[A-Za-z0-9_]*' .. EscapeRegexLiteral(query)
+  return '(^|[^A-Za-z0-9_])(' .. alternation .. ')[ \t]+[A-Za-z0-9_*&]*' .. name
+enddef
+
+def SendSymbolRequest(query: string)
+  var pattern = SymbolPattern(query)
+  if pattern ==# ''
+    s_error = 'no symbol keywords for this filetype'
+    s_loading = false
+    PanelRender()
+    return
+  endif
+  if !EnsureBackend()
+    return
+  endif
+  if s_current_id > 0
+    Send({type: 'cancel', id: s_current_id})
+  endif
+  var id = NextId()
+  s_current_id = id
+  s_loading = true
+  s_error = ''
+  PanelRender()
+  # Always a regex, and always case-sensitive on the keyword half; smart-case
+  # still applies to what the user typed.
+  var eff_ignore_case = s_case_mode ==# 'ignore'
+    || (s_case_mode ==# 'smart' && match(query, '\u') < 0 && query !=# '')
+  Send({
+    type: 'grep',
+    id: id,
+    root: s_project_root,
+    pattern: pattern,
+    regex: true,
+    ignore_case: eff_ignore_case,
+    max: get(g:, 'simplefinder_max_results', 200),
+    hidden: s_hidden,
+    no_ignore: s_no_ignore,
+  })
+enddef
+
+export def Symbols(query: string = '')
+  s_symbol_words = SymbolKeywordsFor(&filetype)
+  PanelOpen('symbols', query)
+  SendSymbolRequest(query)
 enddef
 
 # =============================================================
