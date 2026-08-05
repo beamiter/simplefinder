@@ -196,10 +196,10 @@ async fn get_or_walk_files(
     // Check cache first (with TTL)
     {
         let c = cache.read().await;
-        if let Some(entry) = c.get(&cache_key) {
-            if entry.created.elapsed().as_secs() < CACHE_TTL_SECS {
-                return Ok(Some(Arc::clone(&entry.files)));
-            }
+        if let Some(entry) = c.get(&cache_key)
+            && entry.created.elapsed().as_secs() < CACHE_TTL_SECS
+        {
+            return Ok(Some(Arc::clone(&entry.files)));
         }
     }
 
@@ -494,8 +494,88 @@ async fn send_event(tx: &EventTx, evt: &Event) {
 
 // ─────────────────── Main ───────────────────
 
+const USAGE: &str = "\
+Usage: simplefinder-daemon [OPTION]
+
+With no arguments the daemon serves newline-delimited JSON requests on stdin
+and writes replies to stdout.  That is how the Vim plugin starts it; there is
+nothing useful to do with it interactively.
+
+Options:
+  -V, --version    print the version and exit
+  -h, --help       print this help and exit
+      --self-test  check that the handshake reply serialises and that it
+                   announces this build's protocol version, then exit
+";
+
+/// Cheap coherence check for the installer.
+///
+/// The request loop lives inside `main` and cannot be driven in-process
+/// without restructuring it, so this stops short of a full round trip: it
+/// builds the handshake reply the Vim side gates its features on and confirms
+/// it serialises to the announced protocol version.  That catches a mismatched
+/// or half-linked binary, which is what the installer is actually asking about.
+fn self_test() -> Result<(), String> {
+    let pong = Event::Pong {
+        id: 0,
+        protocol_version: PROTOCOL_VERSION,
+        version: env!("CARGO_PKG_VERSION"),
+        capabilities: capabilities(),
+    };
+    let encoded =
+        serde_json::to_string(&pong).map_err(|error| format!("handshake reply: {error}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&encoded).map_err(|error| format!("handshake reply: {error}"))?;
+
+    match parsed.get("protocol_version").and_then(|v| v.as_u64()) {
+        Some(version) if version == u64::from(PROTOCOL_VERSION) => Ok(()),
+        Some(version) => Err(format!(
+            "handshake announced protocol {version}, this build is {PROTOCOL_VERSION}"
+        )),
+        None => Err(format!("handshake carried no protocol version: {encoded}")),
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::io::Result<()> {
+async fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => match serve().await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("simplefinder-daemon: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Some("--version" | "-V") => {
+            println!("simplefinder-daemon {}", env!("CARGO_PKG_VERSION"));
+            std::process::ExitCode::SUCCESS
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "simplefinder-daemon {}\n\n{USAGE}",
+                env!("CARGO_PKG_VERSION")
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Some("--self-test") => match self_test() {
+            Ok(()) => {
+                println!("ok");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("self-test failed: {message}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!("unknown argument: {other}\n\n{USAGE}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+async fn serve() -> std::io::Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 

@@ -19,7 +19,7 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 ## 要求与安装
 
 - Vim 9.0+，需包含 `+job`、`+channel`、`+timers`、`+textprop`、`+popupwin`
-- Rust 1.85+（仅编译时需要）
+- Rust 1.88+（仅编译时需要）
 
 把仓库加入 `runtimepath` 后执行：
 

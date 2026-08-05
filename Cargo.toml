@@ -2,7 +2,7 @@
 name = "simplefinder"
 version = "0.4.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Fast fuzzy file finder and project grep backend for Vim9"
 
 [[bin]]

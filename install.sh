@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
+# Builds the SimpleFinder daemon and installs it into lib/.
+#
+# The work is shared with the rest of the simple* suite; see install-common.sh,
+# which is vendored from .simplecore and must not be edited in place.
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+SIMPLECORE_BINARY="simplefinder-daemon"
+SIMPLECORE_DISPLAY="SimpleFinder"
+SIMPLECORE_MIN_RUST_MINOR=88
+SIMPLECORE_VERIFY="self-test"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: Rust/Cargo is required (https://rustup.rs)" >&2
-  exit 1
-fi
-
-cargo build --release --locked
-mkdir -p lib
-install -m 755 target/release/simplefinder-daemon lib/simplefinder-daemon
-
-echo "SimpleFinder installed: $ROOT_DIR/lib/simplefinder-daemon"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-common.sh"

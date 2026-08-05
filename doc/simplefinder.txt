@@ -4,7 +4,7 @@ Author: beamiter
 License: same terms as Vim
 
 ==============================================================================
-CONTENTS                                                *simplefinder-contents*
+CONTENTS                                               *simplefinder-contents*
 
   1. Introduction ................ |simplefinder-intro|
   2. Commands .................... |simplefinder-commands|
@@ -13,7 +13,7 @@ CONTENTS                                                *simplefinder-contents*
   5. Highlights .................. |simplefinder-highlights|
 
 ==============================================================================
-1. INTRODUCTION                                            *simplefinder-intro*
+1. INTRODUCTION                                           *simplefinder-intro*
 
 SimpleFinder is a lightweight project finder for Vim 9. Vim9 script drives a
 native side panel; a resident Rust daemon does parallel file scanning, fuzzy
@@ -21,10 +21,10 @@ ranking (nucleo) and full-text search (ripgrep libraries). They talk over
 stdin/stdout with one JSON message per line.
 
 Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
-|+popupwin|. Run ./install.sh once to compile the daemon (Rust 1.85+).
+|+popupwin|. Run ./install.sh once to compile the daemon (Rust 1.88+).
 
 ==============================================================================
-2. COMMANDS                                             *simplefinder-commands*
+2. COMMANDS                                            *simplefinder-commands*
 
                                                           *:SimpleFinderFiles*
 :SimpleFinderFiles [query]   Fuzzy-find project files.
@@ -98,7 +98,7 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 :SimpleFinderRoot [dir]      Show, or pin, the search root directory.
 
 ==============================================================================
-3. PANEL KEYS                                               *simplefinder-keys*
+3. PANEL KEYS                                              *simplefinder-keys*
 
 Navigation and opening~
   <CR>            open the selected result
@@ -134,7 +134,7 @@ Buffers mode~
   <C-d>           delete (:bdelete) the selected buffer
 
 ==============================================================================
-4. CONFIGURATION                                          *simplefinder-config*
+4. CONFIGURATION                                         *simplefinder-config*
 
 Set before the plugin loads; defaults shown. >
 
@@ -171,7 +171,7 @@ Suggested mappings: >
   xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
 <
 ==============================================================================
-5. HIGHLIGHTS                                         *simplefinder-highlights*
+5. HIGHLIGHTS                                        *simplefinder-highlights*
 
 Override any of these with :highlight after the plugin loads.
 
@@ -238,5 +238,36 @@ g:simplefinder_symbol_keywords
 g:simplefinder_symbol_all_languages
         Search every language's keywords regardless of the current filetype.
         Default 0.
+
+
+==============================================================================
+DAEMON COMMAND LINE                                  *simplefinder-daemon-cli*
+
+The daemon takes no arguments in normal use: the plugin starts it and speaks
+JSON over its stdin and stdout.  For diagnosis it also answers: >
+
+  simplefinder-daemon --version
+  simplefinder-daemon --help
+  simplefinder-daemon --self-test
+<
+--self-test checks the handshake reply serialises and prints "ok".
+install.sh runs it on the freshly built binary before replacing a working one,
+so a build that compiles but does not work never reaches lib/.
+
+Every daemon in the simple* suite answers these three the same way.
+
+VENDORED SUPERVISOR                                  *simplefinder-simplecore*
+
+The daemon supervisor in autoload/simplefinder/core.vim, and the test harness
+beside it, are vendored from the suite's shared .simplecore bundle rather
+than written here — each plugin carries its own copy so that installing
+this plugin alone is enough.  Do not edit those files in place: >
+
+  make core-verify
+<
+checks each of them against the sha256 recorded in .simplecore.manifest and
+fails the build when one has drifted.  `make check` depends on it.  To change
+the supervisor, edit .simplecore/core.vim in the suite checkout and re-run
+.simplecore/vendor.sh.
 
 vim:tw=78:ts=8:noet:ft=help:norl:
