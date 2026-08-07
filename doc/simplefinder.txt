@@ -114,11 +114,18 @@ Navigation and opening~
   <C-k> <C-p> <Up>     previous result
   <Esc> <C-c>     close the panel
 
-Multi-select and quickfix~
+Multi-select and quickfix/location lists~
   <Tab>           toggle mark on the current result, then move down
   <S-Tab>         toggle mark, then move up
   <C-q>           send marked results (or all, when none are marked) to the
                   quickfix list and open it
+  <C-l>           send the same ordered selection to the location list owned
+                  by the exact window and buffer that launched the panel
+
+                  If that source split was closed, changed buffers, or is now
+                  in another tab from the panel, the panel remains focused
+                  and reports an error; SimpleFinder never writes or opens
+                  the list in a replacement context.
 
 Query editing~
   <BS> <C-h>      delete last character

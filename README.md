@@ -72,6 +72,7 @@ xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
 | `<C-j>` / `<C-k>` | 下一个 / 上一个结果 |
 | `<Tab>` / `<S-Tab>` | 标记/取消标记当前结果并下移/上移(多选) |
 | `<C-q>` | 将标记结果(无标记时为全部)导出到 quickfix |
+| `<C-l>` | 将标记结果(无标记时为全部)导出到启动 split 的 location list |
 | `<C-e>` | 开关预览弹窗 |
 | `<C-u>` / `<C-w>` | 清空查询 / 删除上一个词 |
 | `<C-r>` | 在全文搜索中切换纯文本/正则 |
@@ -80,6 +81,12 @@ xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
 | `<C-g>` | 切换是否遵循忽略文件 |
 | `<C-d>` | 缓冲区模式:关闭选中 buffer |
 | `<Esc>` | 关闭面板 |
+
+Location-list export captures both the launching window ID and buffer. If
+that split is closed, reused, or separated from the panel into another tab,
+SimpleFinder keeps the panel focused and reports the stale target instead of
+updating another editing context. Marked entries are always exported in result
+order.
 
 ## 配置
 

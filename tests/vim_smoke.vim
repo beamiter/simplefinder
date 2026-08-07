@@ -13,6 +13,11 @@ function! s:PanelVisible() abort
   return 0
 endfunction
 
+function! s:PanelText() abort
+  let l:buf = bufnr('SimpleFinder')
+  return l:buf > 0 ? join(getbufline(l:buf, 1, '$'), "\n") : ''
+endfunction
+
 SimpleFinderBuffers
 SimpleFinderRecent
 SimpleFinderIGrep simplefinder
@@ -22,8 +27,51 @@ SimpleFinderRoot
 
 " Buffer lines source: open a file with content, panel must appear.
 edit README.md
+let s:lines_source_winid = win_getid()
+let s:lines_source_bufnr = bufnr('%')
 SimpleFinderLines
 call assert_true(s:PanelVisible(), 'lines panel opens')
+
+" <C-l> exports marked results to the exact launching split's location list.
+" Marked indices retain result order, and opening the list does not require a
+" temporary switch into the source window.
+call feedkeys("\<Tab>", 'xt')
+call feedkeys("\<C-l>", 'xt')
+let s:loc = getloclist(s:lines_source_winid, {'title': 1, 'items': 1})
+call assert_match('SimpleFinder lines', s:loc.title)
+call assert_equal(1, len(s:loc.items))
+call assert_equal(s:lines_source_bufnr, s:loc.items[0].bufnr)
+call assert_equal(1, s:loc.items[0].lnum)
+call assert_equal(1, get(getwininfo(win_getid()), 0, {})->get('loclist', 0))
+lclose
+
+" Reusing the launching window for another buffer invalidates the captured
+" target. The panel stays focused and reports the boundary instead of putting
+" a location list on the wrong editing context.
+SimpleFinderLines
+let s:panel_winid = win_getid()
+call win_execute(s:lines_source_winid, 'enew')
+call feedkeys("\<C-l>", 'xt')
+call assert_equal(s:panel_winid, win_getid())
+call assert_true(s:PanelVisible(), 'invalid source leaves the panel open')
+call assert_match('source window changed buffer', s:PanelText())
+call feedkeys("\<Esc>", 'xt')
+
+" If the panel itself is moved to a different tab, a bare :lopen would target
+" that tab's replacement window. Reject the cross-tab boundary and keep focus
+" instead of opening a list in the wrong place.
+edit README.md
+SimpleFinderLines
+wincmd T
+let s:panel_tabnr = tabpagenr()
+let s:panel_winid = win_getid()
+call assert_match('PanelHandleKey', maparg('<C-l>', 'n'))
+call feedkeys("\<C-l>", 'mtx')
+call assert_equal(s:panel_tabnr, tabpagenr())
+call assert_equal(s:panel_winid, win_getid())
+call assert_match('source window is in another tab', s:PanelText())
+call feedkeys("\<Esc>", 'xt')
+tabclose
 
 " Help tags source.
 SimpleFinderHelp

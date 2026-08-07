@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-05
 
+### Split-local 结果工作流
+
+- 面板新增 `<C-l>`:将标记结果(无标记时为全部)按原结果顺序导出到启动 split
+  自己的 location list;`<C-q>` quickfix 行为保持不变。
+- 打开面板时同时捕获稳定 winid 与 bufnr。若源 split 已关闭、换了 buffer,或
+  panel 被移到另一个 tab,导出会 fail closed、保持面板焦点并显示错误,不会把
+  结果悄悄写到复用后的错误上下文。
+- Vim 冒烟测试覆盖 marked-only 顺序、location list 归属以及源 window/buffer
+  失效边界。
+
 ### 原生路径过滤
 
 - 新增 `g:simplefinder_include_globs` / `g:simplefinder_exclude_globs`。

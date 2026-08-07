@@ -18,6 +18,7 @@ var s_next_id: number = 0
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
 var s_source_winid: number = 0
+var s_source_bufnr: number = 0
 var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'symbols' | 'recent' | 'buffers' | 'lines' | 'help'
 var s_query: string = ''
 var s_items: list<dict<any>> = []
@@ -325,10 +326,15 @@ enddef
 # =============================================================
 
 def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = false)
+  # Editing another file into the old panel window makes that window the new
+  # source just as surely as closing/reopening the panel does.
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
+      || winbufnr(s_panel_winid) != s_panel_bufnr
     s_source_winid = win_getid()
+    s_source_bufnr = bufnr('%')
   elseif win_getid() != s_panel_winid
     s_source_winid = win_getid()
+    s_source_bufnr = bufnr('%')
   endif
 
   s_mode = mode
@@ -583,11 +589,13 @@ def PanelRender()
   endwhile
 
   # Help line
-  var help = " \u23ce open  \u21e5 mark  ^q quickfix  ^e preview  esc close"
-  if s_mode ==# 'grep' || s_mode ==# 'igrep'
-    help = ' ^r regex  ^a case  ^o hidden  ^g ignores  ^q quickfix'
+  var help = " \u23ce open  \u21e5 mark  ^q qf  ^l loclist  ^e preview  esc close"
+  if s_error !=# '' && !empty(s_items)
+    help = ' ! ' .. s_error
+  elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
+    help = ' ^r regex  ^a case  ^o hidden  ^g ignores  ^q qf  ^l loc'
   elseif s_mode ==# 'buffers'
-    help = " \u23ce open  \u21e5 mark  ^d bdelete  ^q quickfix  esc close"
+    help = " \u23ce open  \u21e5 mark  ^d bdelete  ^q qf  ^l loc  esc close"
   endif
   add(lines, TruncDisplay(help, width))
 
@@ -906,6 +914,7 @@ def SetupMappings()
   nnoremap <silent><buffer> <C-g> <ScriptCmd>PanelHandleKey(0, '<lt>C-g>')<CR>
   nnoremap <silent><buffer> <C-e> <ScriptCmd>PanelHandleKey(0, '<lt>C-e>')<CR>
   nnoremap <silent><buffer> <C-q> <ScriptCmd>PanelHandleKey(0, '<lt>C-q>')<CR>
+  nnoremap <silent><buffer> <C-l> <ScriptCmd>PanelHandleKey(0, '<lt>C-l>')<CR>
   nnoremap <silent><buffer> <C-d> <ScriptCmd>PanelHandleKey(0, '<lt>C-d>')<CR>
 
   # Map the complete printable ASCII range, including regex punctuation.
@@ -917,6 +926,13 @@ enddef
 # ─────────────────── Panel key handling ───────────────────
 
 def PanelHandleKey(winid: number, key: string): bool
+  # :wincmd T recreates the window with a new ID while keeping this buffer and
+  # its mappings. Rebind before rendering/closing so follow-up keys never act
+  # through a stale panel handle.
+  var active_winid = winid > 0 ? winid : win_getid()
+  if s_panel_bufnr > 0 && winbufnr(active_winid) == s_panel_bufnr
+    s_panel_winid = active_winid
+  endif
   var k = key
   var special_keys = {
     '<Esc>': "\<Esc>",
@@ -944,6 +960,7 @@ def PanelHandleKey(winid: number, key: string): bool
     '<C-g>': "\<C-g>",
     '<C-e>': "\<C-e>",
     '<C-q>': "\<C-q>",
+    '<C-l>': "\<C-l>",
     '<C-d>': "\<C-d>",
   }
   if has_key(special_keys, key)
@@ -1010,7 +1027,11 @@ def PanelHandleKey(winid: number, key: string): bool
     return true
   endif
   if k ==# "\<C-q>"
-    SendToQuickfix()
+    SendToList(false)
+    return true
+  endif
+  if k ==# "\<C-l>"
+    SendToList(true)
     return true
   endif
   if k ==# "\<C-d>" && s_mode ==# 'buffers'
@@ -1210,7 +1231,7 @@ def SendGrepRequest(pattern: string)
 enddef
 
 # =============================================================
-# Multi-select & quickfix
+# Multi-select & quickfix/location lists
 # =============================================================
 
 def ToggleMark(idx: number)
@@ -1240,8 +1261,9 @@ def ResolvePath(item: dict<any>): string
   return path
 enddef
 
-# Send marked items (or all items when none are marked) to the quickfix list.
-def SendToQuickfix()
+# Send marked items (or all items when none are marked) to quickfix, or to the
+# location list owned by the exact window+buffer that launched the panel.
+def SendToList(location: bool)
   if empty(s_items)
     return
   endif
@@ -1274,9 +1296,32 @@ def SendToQuickfix()
   endif
 
   var title = 'SimpleFinder ' .. s_mode .. (s_query ==# '' ? '' : ': ' .. s_query)
-  setqflist([], ' ', {title: title, items: qf})
-  PanelClose()
-  copen
+  if location
+    var source_info = getwininfo(s_source_winid)
+    if len(source_info) != 1 || get(source_info[0], 'bufnr', -1) != s_source_bufnr
+      s_error = 'source window changed buffer; location list not updated'
+      PanelRender()
+      return
+    endif
+    if get(source_info[0], 'tabnr', -1) != tabpagenr()
+      s_error = 'source window is in another tab; location list not updated'
+      PanelRender()
+      return
+    endif
+    # setloclist() accepts a stable window ID, so no temporary win_gotoid()
+    # can leak events or edit the wrong split.
+    if setloclist(s_source_winid, [], ' ', {title: title, items: qf}) != 0
+      s_error = 'could not update source location list'
+      PanelRender()
+      return
+    endif
+    PanelClose()
+    lopen
+  else
+    setqflist([], ' ', {title: title, items: qf})
+    PanelClose()
+    copen
+  endif
 enddef
 
 def DeleteCurrentBuffer()
