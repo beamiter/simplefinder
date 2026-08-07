@@ -28,12 +28,16 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 
                                                           *:SimpleFinderFiles*
 :SimpleFinderFiles [query]   Fuzzy-find project files.
+                             Honours |g:simplefinder_include_globs| and
+                             |g:simplefinder_exclude_globs|.
 
                                                            *:SimpleFinderGrep*
 :SimpleFinderGrep [text]     Grep project text (prompts if no argument).
+                             Path globs are applied before files are read.
 
                                                           *:SimpleFinderIGrep*
 :SimpleFinderIGrep [text]    Live grep: results update as you type.
+                             Uses the same path globs as regular grep.
 
                                                        *:SimpleFinderGrepWord*
 :SimpleFinderGrepWord        Live grep for the word under the cursor.
@@ -68,6 +72,8 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                              |g:simplefinder_symbol_all_languages| searches
                              every language at once, which is usually what a
                              polyglot repository wants.
+                             Path include/exclude globs apply to this source
+                             because it shares the daemon grep traversal.
 
                                                        *:SimpleFinderGitFiles*
 :SimpleFinderGitFiles        Fuzzy-find files in the current git repository.
@@ -154,12 +160,35 @@ Set before the plugin loads; defaults shown. >
   g:simplefinder_root_markers = ['.git', 'Cargo.toml', 'package.json',
                                  'go.mod', 'CMakeLists.txt', 'Makefile',
                                  '.project_root']
+  g:simplefinder_include_globs = []      native include path globs
+  g:simplefinder_exclude_globs = []      native exclude path globs
   g:simplefinder_daemon_path = ''        daemon binary override
   g:simplefinder_debug = 0               log daemon chatter with :echom
 <
 The project root is found by walking up from the current file looking for a
 root marker, falling back to |getcwd()|. Scanning honours `.ignore`,
 `.gitignore`, the global git ignore and `.git/info/exclude`.
+
+					*g:simplefinder_include_globs*
+g:simplefinder_include_globs
+	List of ignore-style globs relative to the project root. When non-empty,
+	only matching files are traversed by |:SimpleFinderFiles|, grep modes, and
+	|:SimpleFinderSymbols|. Default [].
+
+					*g:simplefinder_exclude_globs*
+g:simplefinder_exclude_globs
+	List of ignore-style globs to remove from the same daemon-backed sources.
+	Default []. Keep the lists separate and do not prefix entries with !. >
+
+	  let g:simplefinder_include_globs = ['*.rs', '*.toml']
+	  let g:simplefinder_exclude_globs = ['*.generated.rs', 'fixtures/**']
+<
+	Filtering happens inside the Rust walker, before grep opens a file. At
+	most 256 patterns are accepted and each may be at most 4096 UTF-8 bytes.
+	A panel snapshots the lists when it opens; |:SimpleFinderResume| preserves
+	that snapshot. Invalid syntax is shown as a panel error. Protocol-v3 path
+	globs fail closed with an older daemon and ask you to rerun ./install.sh.
+	Pure Vim sources and |:SimpleFinderGitFiles| are intentionally unchanged.
 
 Suggested mappings: >
 

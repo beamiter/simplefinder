@@ -16,9 +16,9 @@ let s:root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(s:root)
 call delete(s:root .. '/tests/symbols-errors.log')
 
-let s:daemon = s:root . '/lib/simplefinder-daemon'
+let s:daemon = s:root . '/target/debug/simplefinder-daemon'
 if !executable(s:daemon)
-  let s:daemon = s:root . '/target/debug/simplefinder-daemon'
+  let s:daemon = s:root . '/lib/simplefinder-daemon'
 endif
 if !executable(s:daemon)
   " A checkout without a built daemon should not fail the suite.

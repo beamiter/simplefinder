@@ -41,6 +41,9 @@ var s_marked: dict<bool> = {}       # multi-select: item index -> marked
 var s_preview_on: bool = false
 var s_preview_winid: number = 0
 var s_has_session: bool = false     # a search was opened before (for Resume)
+var s_include_globs: list<string> = []
+var s_exclude_globs: list<string> = []
+var s_glob_error: string = ''
 
 # ─────────────────── Recent files ───────────────────
 
@@ -109,8 +112,20 @@ def OnDaemonEvent(ev: dict<any>)
     return
   endif
 
-  # The handshake reply is bookkeeping, not a search result.
+  # The handshake reply is bookkeeping, not a search result.  A configured
+  # filter must fail closed with an old daemon instead of silently searching
+  # paths the user explicitly excluded.
   if ev.type ==# 'pong'
+    if (!empty(s_include_globs) || !empty(s_exclude_globs))
+        && !get(get(ev, 'capabilities', {}), 'path_globs', false)
+      if s_current_id > 0
+        Send({type: 'cancel', id: s_current_id})
+      endif
+      s_current_id = 0
+      s_loading = false
+      s_error = 'backend lacks path-glob support; rerun ./install.sh'
+      PanelRender()
+    endif
     return
   endif
 
@@ -162,6 +177,14 @@ export def Health()
     has('popupwin') ? 'available' : 'missing +popupwin — preview disabled'))
   add(lines, printf('[INFO] project root: %s',
     s_project_root ==# '' ? '(not resolved yet)' : s_project_root))
+  try
+    var includes = ReadPathGlobList('simplefinder_include_globs')
+    var excludes = ReadPathGlobList('simplefinder_exclude_globs')
+    add(lines, printf('[INFO] path globs: %d include, %d exclude',
+      len(includes), len(excludes)))
+  catch
+    add(lines, '[WARN] path globs: ' .. v:exception)
+  endtry
   for line in lines
     echom line
   endfor
@@ -245,6 +268,58 @@ def FindProjectRoot(): string
   return getcwd()
 enddef
 
+def ReadPathGlobList(option: string): list<string>
+  var configured = get(g:, option, [])
+  if type(configured) != v:t_list
+    throw option .. ' must be a list of strings'
+  endif
+  var result: list<string> = []
+  for value in configured
+    if type(value) != v:t_string || value ==# ''
+      throw option .. ' must contain only non-empty strings'
+    endif
+    if value[0] ==# '!'
+      throw option .. ' entries must not start with !; use the separate exclude option'
+    endif
+    add(result, value)
+  endfor
+  return result
+enddef
+
+def SnapshotPathGlobs(mode: string)
+  s_include_globs = []
+  s_exclude_globs = []
+  s_glob_error = ''
+  if index(['files', 'grep', 'igrep', 'symbols'], mode) < 0
+    return
+  endif
+  try
+    s_include_globs = ReadPathGlobList('simplefinder_include_globs')
+    s_exclude_globs = ReadPathGlobList('simplefinder_exclude_globs')
+  catch
+    s_include_globs = []
+    s_exclude_globs = []
+    s_glob_error = v:exception
+  endtry
+enddef
+
+def PathGlobsReady(): bool
+  if s_glob_error !=# ''
+    s_loading = false
+    s_error = s_glob_error
+    PanelRender()
+    return false
+  endif
+  if (!empty(s_include_globs) || !empty(s_exclude_globs))
+      && simplefinder#core#Ready() && !simplefinder#core#HasCap('path_globs')
+    s_loading = false
+    s_error = 'backend lacks path-glob support; rerun ./install.sh'
+    PanelRender()
+    return false
+  endif
+  return true
+enddef
+
 # =============================================================
 # Panel UI
 # =============================================================
@@ -280,6 +355,10 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
     endif
     s_hidden = get(g:, 'simplefinder_hidden', 0) != 0
     s_no_ignore = get(g:, 'simplefinder_no_ignore', 0) != 0
+    SnapshotPathGlobs(mode)
+  endif
+  if s_glob_error !=# ''
+    s_error = s_glob_error
   endif
   s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
   s_project_root = FindProjectRoot()
@@ -444,6 +523,9 @@ def PanelRender()
   endif
   if s_no_ignore
     flags ..= ' [all]'
+  endif
+  if !empty(s_include_globs) || !empty(s_exclude_globs)
+    flags ..= printf(' [glob +%d/-%d]', len(s_include_globs), len(s_exclude_globs))
   endif
   add(lines, TruncDisplay(' > ' .. s_query .. "\u2581" .. flags, width))
 
@@ -1051,6 +1133,9 @@ enddef
 # =============================================================
 
 def SendFilesRequest(query: string)
+  if !PathGlobsReady()
+    return
+  endif
   if !EnsureBackend()
     return
   endif
@@ -1071,10 +1156,15 @@ def SendFilesRequest(query: string)
     max: get(g:, 'simplefinder_max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
+    include_globs: s_include_globs,
+    exclude_globs: s_exclude_globs,
   })
 enddef
 
 def SendGrepRequest(pattern: string)
+  if !PathGlobsReady()
+    return
+  endif
   if pattern ==# ''
     if s_current_id > 0
       Send({type: 'cancel', id: s_current_id})
@@ -1114,6 +1204,8 @@ def SendGrepRequest(pattern: string)
     max: get(g:, 'simplefinder_max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
+    include_globs: s_include_globs,
+    exclude_globs: s_exclude_globs,
   })
 enddef
 
@@ -1540,6 +1632,9 @@ def SymbolPattern(query: string): string
 enddef
 
 def SendSymbolRequest(query: string)
+  if !PathGlobsReady()
+    return
+  endif
   var pattern = SymbolPattern(query)
   if pattern ==# ''
     s_error = 'no symbol keywords for this filetype'
@@ -1572,6 +1667,8 @@ def SendSymbolRequest(query: string)
     max: get(g:, 'simplefinder_max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
+    include_globs: s_include_globs,
+    exclude_globs: s_exclude_globs,
   })
 enddef
 

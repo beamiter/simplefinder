@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
   test:
@@ -30,6 +30,7 @@ jobs:
       - run: cargo build --locked
       - run: vim -Nu NONE -i NONE -n -es -S tests/vim_smoke.vim
       - run: vim -Nu NONE -i NONE -n -es -S tests/vim_symbols.vim
+      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_globs.vim
       - name: Install Vim
         run: sudo apt-get update && sudo apt-get install --yes vim
       - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
@@ -40,4 +41,5 @@ jobs:
         run: |
           response="$(printf '%s\n' '{"type":"ping","id":1}' | ./target/debug/simplefinder-daemon)"
           grep -F '"type":"pong"' <<<"$response"
-          grep -F '"protocol_version":2' <<<"$response"
+          grep -F '"protocol_version":3' <<<"$response"
+          grep -F '"path_globs":true' <<<"$response"

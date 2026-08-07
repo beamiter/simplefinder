@@ -1,6 +1,6 @@
 use grep_matcher::Matcher;
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::UTF8};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use nucleo_matcher::{
     Config, Matcher as NucleoMatcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -35,6 +35,10 @@ enum Request {
         hidden: bool,
         #[serde(default)]
         no_ignore: bool,
+        #[serde(default)]
+        include_globs: Vec<String>,
+        #[serde(default)]
+        exclude_globs: Vec<String>,
     },
     #[serde(rename = "grep")]
     Grep {
@@ -51,6 +55,10 @@ enum Request {
         hidden: bool,
         #[serde(default)]
         no_ignore: bool,
+        #[serde(default)]
+        include_globs: Vec<String>,
+        #[serde(default)]
+        exclude_globs: Vec<String>,
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
@@ -70,7 +78,7 @@ fn default_max() -> usize {
 
 /// Bumped whenever the wire format changes in a way the Vim side must know
 /// about.  v1 was the implicit, un-negotiated format.
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -110,6 +118,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("grep", true),
         ("cancel", true),
         ("match_indices", true),
+        ("path_globs", true),
     ])
 }
 
@@ -188,10 +197,20 @@ async fn get_or_walk_files(
     root: &str,
     hidden: bool,
     no_ignore: bool,
+    include_globs: &[String],
+    exclude_globs: &[String],
     token: &CancellationToken,
 ) -> Result<Option<Arc<Vec<String>>>, String> {
     let root_path = validate_root(root)?;
-    let cache_key = format!("{}\0{hidden}\0{no_ignore}", root_path.to_string_lossy());
+    let cache_key = serde_json::to_string(&(
+        root_path.to_string_lossy(),
+        hidden,
+        no_ignore,
+        include_globs,
+        exclude_globs,
+    ))
+    .map_err(|error| format!("could not build file-cache key: {error}"))?;
+    let overrides = build_path_overrides(&root_path, include_globs, exclude_globs)?;
 
     // Check cache first (with TTL)
     {
@@ -207,7 +226,10 @@ async fn get_or_walk_files(
     let token_clone = token.clone();
     let files = tokio::task::spawn_blocking(move || {
         let mut builder = WalkBuilder::new(&root_path);
-        builder.hidden(!hidden).threads(num_cpus::get().min(8));
+        builder
+            .hidden(!hidden)
+            .threads(num_cpus::get().min(8))
+            .overrides(overrides);
         if no_ignore {
             builder
                 .ignore(false)
@@ -280,6 +302,51 @@ fn validate_root(root: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+const MAX_PATH_GLOBS: usize = 256;
+const MAX_PATH_GLOB_BYTES: usize = 4096;
+
+/// Build one native `ignore` override set for both file finding and grep.
+/// Positive overrides are includes; a leading `!` turns a pattern into an
+/// exclusion.  The Vim API keeps those in separate lists so a typo cannot
+/// silently invert a filter.
+fn build_path_overrides(
+    root: &std::path::Path,
+    include_globs: &[String],
+    exclude_globs: &[String],
+) -> Result<ignore::overrides::Override, String> {
+    if include_globs.len() + exclude_globs.len() > MAX_PATH_GLOBS {
+        return Err(format!("too many path globs (maximum {MAX_PATH_GLOBS})"));
+    }
+
+    let mut builder = OverrideBuilder::new(root);
+    for (kind, patterns) in [("include", include_globs), ("exclude", exclude_globs)] {
+        for pattern in patterns {
+            if pattern.is_empty() {
+                return Err(format!("{kind} glob must not be empty"));
+            }
+            if pattern.len() > MAX_PATH_GLOB_BYTES {
+                return Err(format!("{kind} glob exceeds {MAX_PATH_GLOB_BYTES} bytes"));
+            }
+            if pattern.starts_with('!') {
+                return Err(format!(
+                    "{kind} glob {pattern:?} must not start with !; use the separate exclude list"
+                ));
+            }
+            let override_pattern = if kind == "exclude" {
+                format!("!{pattern}")
+            } else {
+                pattern.clone()
+            };
+            builder
+                .add(&override_pattern)
+                .map_err(|error| format!("invalid {kind} glob {pattern:?}: {error}"))?;
+        }
+    }
+    builder
+        .build()
+        .map_err(|error| format!("could not build path globs: {error}"))
+}
+
 // ─────────────────── Fuzzy matching ───────────────────
 
 fn fuzzy_filter(
@@ -350,13 +417,15 @@ fn fuzzy_filter(
 
 // ─────────────────── Grep ───────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GrepOptions {
     is_regex: bool,
     ignore_case: bool,
     max: usize,
     hidden: bool,
     no_ignore: bool,
+    include_globs: Vec<String>,
+    exclude_globs: Vec<String>,
 }
 
 fn handle_grep_sync(
@@ -376,13 +445,16 @@ fn handle_grep_sync(
         .map_err(|e| e.to_string())?;
 
     let root_path = validate_root(root)?;
+    let overrides =
+        build_path_overrides(&root_path, &options.include_globs, &options.exclude_globs)?;
     let results: Arc<std::sync::Mutex<Vec<GrepItem>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut builder = WalkBuilder::new(&root_path);
     builder
         .hidden(!options.hidden)
-        .threads(num_cpus::get().min(8));
+        .threads(num_cpus::get().min(8))
+        .overrides(overrides);
     if options.no_ignore {
         builder
             .ignore(false)
@@ -391,6 +463,7 @@ fn handle_grep_sync(
             .git_exclude(false);
     }
     let walker = builder.build_parallel();
+    let max_results = options.max;
 
     walker.run(|| {
         let matcher = matcher.clone();
@@ -440,14 +513,14 @@ fn handle_grep_sync(
                         col_end,
                         text: truncate_line(line),
                     });
-                    Ok(!token.is_cancelled() && local_items.len() <= options.max)
+                    Ok(!token.is_cancelled() && local_items.len() <= max_results)
                 }),
             );
 
             if !local_items.is_empty() {
                 let mut r = results.lock().unwrap();
                 r.extend(local_items);
-                if r.len() > options.max {
+                if r.len() > max_results {
                     done.store(true, std::sync::atomic::Ordering::Relaxed);
                     return ignore::WalkState::Quit;
                 }
@@ -458,8 +531,8 @@ fn handle_grep_sync(
     });
 
     let mut results = results.lock().unwrap();
-    let capped = results.len() > options.max;
-    results.truncate(options.max);
+    let capped = results.len() > max_results;
+    results.truncate(max_results);
     results.sort_unstable_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -632,6 +705,8 @@ async fn serve() -> std::io::Result<()> {
                 max,
                 hidden,
                 no_ignore,
+                include_globs,
+                exclude_globs,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -644,22 +719,31 @@ async fn serve() -> std::io::Result<()> {
 
                 tokio::spawn(async move {
                     let started = Instant::now();
-                    let files =
-                        match get_or_walk_files(&cache, &root, hidden, no_ignore, &token).await {
-                            Ok(Some(f)) => f,
-                            Ok(None) => {
-                                // Cancelled during walk
-                                let mut map = cancels.write().await;
-                                map.remove(&id);
-                                return;
-                            }
-                            Err(message) => {
-                                send_event(&tx, &Event::Error { id, message }).await;
-                                let mut map = cancels.write().await;
-                                map.remove(&id);
-                                return;
-                            }
-                        };
+                    let files = match get_or_walk_files(
+                        &cache,
+                        &root,
+                        hidden,
+                        no_ignore,
+                        &include_globs,
+                        &exclude_globs,
+                        &token,
+                    )
+                    .await
+                    {
+                        Ok(Some(f)) => f,
+                        Ok(None) => {
+                            // Cancelled during walk
+                            let mut map = cancels.write().await;
+                            map.remove(&id);
+                            return;
+                        }
+                        Err(message) => {
+                            send_event(&tx, &Event::Error { id, message }).await;
+                            let mut map = cancels.write().await;
+                            map.remove(&id);
+                            return;
+                        }
+                    };
 
                     if token.is_cancelled() {
                         let mut map = cancels.write().await;
@@ -721,6 +805,8 @@ async fn serve() -> std::io::Result<()> {
                 max,
                 hidden,
                 no_ignore,
+                include_globs,
+                exclude_globs,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -744,6 +830,8 @@ async fn serve() -> std::io::Result<()> {
                                 max,
                                 hidden,
                                 no_ignore,
+                                include_globs,
+                                exclude_globs,
                             },
                             &token_clone,
                         )
@@ -851,6 +939,8 @@ mod tests {
                 max: 20,
                 hidden: false,
                 no_ignore: false,
+                include_globs: Vec::new(),
+                exclude_globs: Vec::new(),
             },
             &CancellationToken::new(),
         )
@@ -864,6 +954,8 @@ mod tests {
                 max: 20,
                 hidden: false,
                 no_ignore: false,
+                include_globs: Vec::new(),
+                exclude_globs: Vec::new(),
             },
             &CancellationToken::new(),
         )
@@ -892,6 +984,8 @@ mod tests {
                 max: 20,
                 hidden: false,
                 no_ignore: false,
+                include_globs: Vec::new(),
+                exclude_globs: Vec::new(),
             },
             &CancellationToken::new(),
         )
@@ -908,6 +1002,85 @@ mod tests {
     fn invalid_root_returns_a_useful_error() {
         let error = validate_root("/path/that/does/not/exist/simplefinder").unwrap_err();
         assert!(error.contains("cannot access root"));
+    }
+
+    #[tokio::test]
+    async fn path_globs_limit_file_walk_and_grep() {
+        let root = temp_project();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("src/keep.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.join("src/skip.generated.rs"), "fn needle() {}\n").unwrap();
+        fs::write(root.join("docs/readme.md"), "needle\n").unwrap();
+
+        let include = vec!["*.rs".to_owned()];
+        let exclude = vec!["*.generated.rs".to_owned()];
+        let cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
+        let token = CancellationToken::new();
+        let files = get_or_walk_files(
+            &cache,
+            root.to_str().unwrap(),
+            false,
+            false,
+            &include,
+            &exclude,
+            &token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(files.as_ref(), &["src/keep.rs"]);
+
+        // The cache key includes the complete filter snapshot. Reusing this
+        // root with another include set must walk/cache a distinct path list.
+        let markdown = get_or_walk_files(
+            &cache,
+            root.to_str().unwrap(),
+            false,
+            false,
+            &["*.md".to_owned()],
+            &[],
+            &token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(markdown.as_ref(), &["docs/readme.md"]);
+        assert_eq!(cache.read().await.len(), 2);
+
+        let (matches, capped) = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: false,
+                max: 20,
+                hidden: false,
+                no_ignore: false,
+                include_globs: include,
+                exclude_globs: exclude,
+            },
+            &token,
+        )
+        .unwrap();
+        assert!(!capped);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "src/keep.rs");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_inverted_path_globs_are_rejected() {
+        let root = temp_project();
+        let malformed = build_path_overrides(&root, &["[unclosed".to_owned()], &[])
+            .expect_err("an invalid glob must not silently match the wrong files");
+        assert!(malformed.contains("invalid include glob"));
+
+        let inverted = build_path_overrides(&root, &["!*.rs".to_owned()], &[])
+            .expect_err("the separate include/exclude API must not be inverted with !");
+        assert!(inverted.contains("must not start with !"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     use std::time::Duration;

@@ -23,6 +23,11 @@ g:simplefinder_ignore_case = get(g:, 'simplefinder_ignore_case', 0)
 g:simplefinder_smart_case = get(g:, 'simplefinder_smart_case', 1)
 g:simplefinder_preview = get(g:, 'simplefinder_preview', 1)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
+# Native path filters for daemon-backed files, grep, and symbol searches.
+# Includes are positive ignore-style globs; excludes are kept separate so a
+# leading `!` cannot accidentally invert user intent.
+g:simplefinder_include_globs = get(g:, 'simplefinder_include_globs', [])
+g:simplefinder_exclude_globs = get(g:, 'simplefinder_exclude_globs', [])
 # Per-filetype keywords that introduce a definition, used by
 # :SimpleFinderSymbols. Overrides the built-in table for that filetype.
 g:simplefinder_symbol_keywords = get(g:, 'simplefinder_symbol_keywords', {})

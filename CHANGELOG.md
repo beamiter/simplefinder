@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-08-05
 
+### 原生路径过滤
+
+- 新增 `g:simplefinder_include_globs` / `g:simplefinder_exclude_globs`。
+  两组 ignore 风格 glob 由 Rust walker 原生执行,统一作用于文件查找、普通/实时
+  grep 与符号搜索;被排除的文件不会再被打开做全文扫描。面板标题显示 include /
+  exclude 数量,`:SimpleFinderResume` 保留打开面板时的过滤快照。
+- 文件缓存 key 纳入完整 glob 配置,切换过滤器不会误复用另一组路径列表;grep 与
+  files 共用同一套 matcher 构建和错误语义。最多 256 条、单条最多 4096 字节,
+  空值、前导 `!` 与非法语法都会返回明确错误。
+- 协议升到 v3 并声明 `path_globs` capability。新 Vim 端遇到旧 daemon 时 fail
+  closed 并提示重跑 `./install.sh`,不会静默搜索用户明确排除的路径。
+- 新增 Rust 回归测试与 `tests/vim_globs.vim` 端到端测试,覆盖 include + exclude
+  组合在 files/grep/symbols 三条路径的一致性、错误配置与非法 glob;CI 同步验证
+  v3 握手、capability 和声明的 Rust 1.88 MSRV。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

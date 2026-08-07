@@ -11,6 +11,7 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 - 多选标记 + 一键导出 quickfix 列表
 - `:SimpleFinderResume` 恢复上次搜索（模式、查询、选项）
 - 遵循 `.gitignore`，并可即时切换隐藏文件和忽略规则
+- 原生 include/exclude 路径 glob，同时约束文件、全文和符号搜索
 - 文件列表缓存、请求防抖和旧请求取消
 - 文件、最近文件、缓冲区、光标词和可视选择搜索
 - 编辑、水平/垂直分屏和新标签页打开；缓冲区模式可直接关闭 buffer
@@ -46,6 +47,8 @@ Plug 'your-name/simplefinder', { 'do': './install.sh' }
 | `:SimpleFinderRecent` | 查找最近文件 |
 | `:SimpleFinderLines` | 模糊搜索当前缓冲区的行 |
 | `:SimpleFinderHelp` | 模糊搜索帮助标签并打开 `:help` |
+| `:SimpleFinderSymbols [query]` | 无需 tags/LSP 搜索项目定义 |
+| `:SimpleFinderGitFiles` | 基于 Git 索引查找 tracked/untracked 文件 |
 | `:SimpleFinderResume` | 恢复上次搜索（模式、查询、选项） |
 | `:SimpleFinderRoot [dir]` | 查看或设置固定搜索根目录 |
 
@@ -97,11 +100,27 @@ let g:simplefinder_ignore_case = 0
 let g:simplefinder_recent_files_max = 100
 let g:simplefinder_root = ''                " 留空时自动识别
 let g:simplefinder_root_markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod']
+let g:simplefinder_include_globs = []        " 如 ['*.rs', '*.toml']
+let g:simplefinder_exclude_globs = []        " 如 ['vendor/**', '*.generated.rs']
 let g:simplefinder_daemon_path = ''         " 通常无需设置
 let g:simplefinder_debug = 0
 ```
 
 项目根会从当前文件目录向上查找标记；没有匹配时使用当前工作目录。扫描默认遵循 `.ignore`、`.gitignore`、全局 Git ignore 和 `.git/info/exclude`。
+
+`g:simplefinder_include_globs` 和 `g:simplefinder_exclude_globs` 使用相对项目根的
+ignore 风格 glob。include 列表非空时只遍历匹配文件，exclude 随后排除匹配项；
+例如只查 Rust/TOML 且跳过生成文件：
+
+```vim
+let g:simplefinder_include_globs = ['*.rs', '*.toml']
+let g:simplefinder_exclude_globs = ['*.generated.rs', 'fixtures/**']
+```
+
+过滤在 Rust 遍历层完成，统一作用于 `Files`、`Grep`/`IGrep` 和 `Symbols`，所以
+被排除的文件不会再被全文读取。配置会在面板打开时快照，`Resume` 保留该快照；
+无效 glob 会成为可见错误。此能力使用协议 v3，旧 daemon 会 fail closed 并提示
+重新运行 `./install.sh`，不会静默忽略排除规则。
 
 ## 开发与验证
 
@@ -110,6 +129,8 @@ cargo fmt --check
 cargo test --locked
 cargo build
 vim -Nu NONE -i NONE -n -es -S tests/vim_smoke.vim
+vim -Nu NONE -i NONE -n -es -S tests/vim_symbols.vim
+vim -Nu NONE -i NONE -n -es -S tests/vim_globs.vim
 ```
 
 Vim 与后端通过标准输入/输出上的一行一个 JSON 消息通信。每次查询都有独立 ID；新查询会取消旧任务，过期结果不会写入当前面板。
