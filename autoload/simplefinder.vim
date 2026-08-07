@@ -38,7 +38,9 @@ var s_regex: bool = false
 var s_case_mode: string = 'smart'   # 'smart' | 'ignore' | 'sensitive'
 var s_hidden: bool = false
 var s_no_ignore: bool = false
-var s_marked: dict<bool> = {}       # multi-select: item index -> marked
+var s_marked: dict<bool> = {}       # stable item identity -> marked
+var s_marked_items: dict<dict<any>> = {} # complete snapshots, including hidden marks
+var s_mark_order: list<string> = [] # first-mark order, independent of result sorting
 var s_preview_on: bool = false
 var s_preview_winid: number = 0
 var s_has_session: bool = false     # a search was opened before (for Resume)
@@ -212,7 +214,6 @@ def OnFilesResult(ev: dict<any>)
   s_current_id = 0
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -235,7 +236,6 @@ def OnGrepResult(ev: dict<any>)
   s_current_id = 0
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -349,6 +349,8 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   s_elapsed_ms = 0
   s_capped = false
   s_marked = {}
+  s_marked_items = {}
+  s_mark_order = []
   s_has_session = true
   if !keep_options
     s_regex = get(g:, 'simplefinder_regex', 0) != 0
@@ -439,6 +441,50 @@ def PanelClose()
     endif
   endif
   s_panel_winid = 0
+  # A closed panel owns no selectable state. Resume restores the search, not a
+  # hidden selection that can unexpectedly populate a later quickfix list.
+  s_marked = {}
+  s_marked_items = {}
+  s_mark_order = []
+enddef
+
+def ItemIdentityBase(item: dict<any>): string
+  # Include every field that makes a result independently actionable. The
+  # display score/highlight indices are intentionally excluded so a new query
+  # can reorder/re-score an otherwise identical result without losing marks.
+  return string([
+    get(item, 'path', ''),
+    get(item, 'bufnr', -1),
+    get(item, 'lnum', 0),
+    get(item, 'col', 0),
+    get(item, 'col_end', 0),
+    get(item, 'text', ''),
+  ])
+enddef
+
+def AssignItemIdentities(items: list<dict<any>>)
+  var needs_ids = false
+  for item in items
+    if type(get(item, '_simplefinder_mark_id', v:null)) != v:t_string
+      needs_ids = true
+      break
+    endif
+  endfor
+  if !needs_ids
+    return
+  endif
+  var occurrences: dict<number> = {}
+  for item in items
+    var base = ItemIdentityBase(item)
+    var occurrence = get(occurrences, base, 0) + 1
+    occurrences[base] = occurrence
+    item._simplefinder_mark_id = base .. '#' .. string(occurrence)
+  endfor
+enddef
+
+def ItemIdentity(item: dict<any>): string
+  var identity = get(item, '_simplefinder_mark_id', '')
+  return type(identity) == v:t_string ? identity : ''
 enddef
 
 # Truncate a string to a maximum display width (handles wide/ambiguous glyphs),
@@ -466,6 +512,7 @@ def PanelRender()
   if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0 || s_panel_bufnr < 0
     return
   endif
+  AssignItemIdentities(s_items)
 
   s_eff_width = winwidth(win_id2win(s_panel_winid))
   s_eff_height = winheight(win_id2win(s_panel_winid))
@@ -501,8 +548,8 @@ def PanelRender()
   if !s_loading && s_error ==# '' && s_elapsed_ms > 0
     count_str ..= ' · ' .. string(s_elapsed_ms) .. 'ms'
   endif
-  if !empty(s_marked)
-    count_str = string(len(s_marked)) .. ' marked · ' .. count_str
+  if !empty(s_mark_order)
+    count_str = string(len(s_mark_order)) .. ' marked · ' .. count_str
   endif
   var title_line = ' ' .. title
   var pad = width - strdisplaywidth(title_line) - strdisplaywidth(count_str)
@@ -640,7 +687,8 @@ enddef
 # 3-char row prefix: cursor indicator, multi-select mark, space.
 def ItemMarker(idx: number): string
   var cursor_ch = idx == s_cursor_idx ? "\u25b8" : ' '
-  var mark_ch = has_key(s_marked, string(idx)) ? '*' : ' '
+  var identity = idx >= 0 && idx < len(s_items) ? ItemIdentity(s_items[idx]) : ''
+  var mark_ch = identity !=# '' && has_key(s_marked, identity) ? '*' : ' '
   return cursor_ch .. mark_ch .. ' '
 enddef
 
@@ -1235,11 +1283,25 @@ enddef
 # =============================================================
 
 def ToggleMark(idx: number)
-  var key = string(idx)
+  if idx < 0 || idx >= len(s_items)
+    return
+  endif
+  AssignItemIdentities(s_items)
+  var item = s_items[idx]
+  var key = ItemIdentity(item)
+  if key ==# ''
+    return
+  endif
   if has_key(s_marked, key)
     remove(s_marked, key)
+    if has_key(s_marked_items, key)
+      remove(s_marked_items, key)
+    endif
+    filter(s_mark_order, (_, identity) => identity !=# key)
   else
     s_marked[key] = true
+    s_marked_items[key] = deepcopy(item)
+    add(s_mark_order, key)
   endif
 enddef
 
@@ -1264,25 +1326,22 @@ enddef
 # Send marked items (or all items when none are marked) to quickfix, or to the
 # location list owned by the exact window+buffer that launched the panel.
 def SendToList(location: bool)
-  if empty(s_items)
+  if empty(s_items) && empty(s_mark_order)
     return
   endif
-  var idxs: list<number> = []
-  if !empty(s_marked)
-    for key in keys(s_marked)
-      var i = str2nr(key)
-      if i >= 0 && i < len(s_items)
-        add(idxs, i)
+  var selected: list<dict<any>> = []
+  if !empty(s_mark_order)
+    for key in s_mark_order
+      if has_key(s_marked_items, key)
+        add(selected, s_marked_items[key])
       endif
     endfor
-    sort(idxs, 'n')
   else
-    idxs = range(len(s_items))
+    selected = s_items
   endif
 
   var qf: list<dict<any>> = []
-  for i in idxs
-    var item = s_items[i]
+  for item in selected
     var entry: dict<any> = {filename: ResolvePath(item)}
     if get(item, 'lnum', 0) > 0
       entry.lnum = item.lnum
@@ -1480,6 +1539,7 @@ export def Buffers()
     })
   endfor
   sort(s_all_buffers, (a, b) => b.lastused - a.lastused)
+  AssignItemIdentities(s_all_buffers)
   PanelOpen('buffers')
   s_items = copy(s_all_buffers)
   s_total = len(s_items)
@@ -1491,7 +1551,6 @@ def FilterBuffers()
   s_total = len(s_items)
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -1517,6 +1576,7 @@ export def Lines()
       break
     endif
   endfor
+  AssignItemIdentities(s_all_lines)
   PanelOpen('lines')
   s_items = copy(s_all_lines)
   s_total = len(s_items)
@@ -1528,7 +1588,6 @@ def FilterLines()
   s_total = len(s_items)
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -1557,6 +1616,7 @@ export def HelpTags()
     endfor
   endfor
   sort(s_all_help, (a, b) => a.path <# b.path ? -1 : a.path ==# b.path ? 0 : 1)
+  AssignItemIdentities(s_all_help)
   PanelOpen('help')
   s_items = copy(s_all_help)
   s_total = len(s_items)
@@ -1568,7 +1628,6 @@ def FilterHelp()
   s_total = len(s_items)
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -1789,6 +1848,7 @@ export def GitFiles()
       add(s_all_gitfiles, {path: f})
     endif
   endfor
+  AssignItemIdentities(s_all_gitfiles)
   PanelOpen('gitfiles')
   s_items = copy(s_all_gitfiles)
   s_total = len(s_items)
@@ -1800,7 +1860,6 @@ def FilterGitFiles()
   s_total = len(s_items)
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 
@@ -1823,6 +1882,7 @@ export def RecentFiles()
     combined = combined[: mx - 1]
   endif
   s_all_recent = mapnew(combined, (_, f) => ({path: fnamemodify(f, ':~:.')}))
+  AssignItemIdentities(s_all_recent)
   PanelOpen('recent')
   s_items = copy(s_all_recent)
   s_total = len(s_items)
@@ -1834,7 +1894,6 @@ def FilterRecentFiles()
   s_total = len(s_items)
   s_cursor_idx = 0
   s_scroll_off = 0
-  s_marked = {}
   PanelRender()
 enddef
 

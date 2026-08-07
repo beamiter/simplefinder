@@ -85,8 +85,14 @@ xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
 Location-list export captures both the launching window ID and buffer. If
 that split is closed, reused, or separated from the panel into another tab,
 SimpleFinder keeps the panel focused and reports the stale target instead of
-updating another editing context. Marked entries are always exported in result
-order.
+updating another editing context.
+
+Marks follow stable result identities rather than screen indices. Continuing
+to type, toggling search options, or receiving reordered asynchronous results
+cannot move a mark onto an unrelated row. A row hidden by the current query
+keeps its complete snapshot and is exported in first-mark order. Unmarking
+releases that snapshot; closing the panel clears the entire selection, so
+`:SimpleFinderResume` never revives invisible old marks.
 
 ## 配置
 

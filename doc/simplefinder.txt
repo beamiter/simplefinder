@@ -127,6 +127,13 @@ Multi-select and quickfix/location lists~
                   and reports an error; SimpleFinder never writes or opens
                   the list in a replacement context.
 
+Marks use stable result identities, not screen indices. Query refinement,
+option changes, and asynchronous result reordering therefore cannot move a
+mark onto an unrelated row. A marked row hidden by the current query keeps a
+complete snapshot and is exported in first-mark order. Unmarking discards that
+snapshot; closing the panel clears the selection, so |:SimpleFinderResume|
+never restores invisible old marks.
+
 Query editing~
   <BS> <C-h>      delete last character
   <C-u>           clear the query

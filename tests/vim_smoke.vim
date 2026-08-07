@@ -18,6 +18,17 @@ function! s:PanelText() abort
   return l:buf > 0 ? join(getbufline(l:buf, 1, '$'), "\n") : ''
 endfunction
 
+function! s:WaitFor(Condition, label) abort
+  for l:attempt in range(100)
+    if call(a:Condition, [])
+      return 1
+    endif
+    sleep 10m
+  endfor
+  call assert_true(0, 'timeout: ' .. a:label)
+  return 0
+endfunction
+
 SimpleFinderBuffers
 SimpleFinderRecent
 SimpleFinderIGrep simplefinder
@@ -44,6 +55,50 @@ call assert_equal(s:lines_source_bufnr, s:loc.items[0].bufnr)
 call assert_equal(1, s:loc.items[0].lnum)
 call assert_equal(1, get(getwininfo(win_getid()), 0, {})->get('loclist', 0))
 lclose
+
+" Marks are stable item identities, not volatile result indices. A query may
+" hide a marked row; quickfix still receives its complete snapshot in the
+" order rows were first marked. Closing/exporting releases the selection.
+let s:marked_file = tempname()
+call writefile(['first keep', 'second hidden', 'third keep', 'third keep'],
+      \ s:marked_file)
+execute 'edit! ' .. fnameescape(s:marked_file)
+let s:marked_source_winid = win_getid()
+SimpleFinderLines
+call feedkeys("\<C-j>\<Tab>\<C-p>\<C-p>\<Tab>zzzz", 'xt')
+call s:WaitFor({-> s:PanelText() =~# '0 results'}, 'marked query reaches zero results')
+call assert_match('2 marked', s:PanelText())
+call feedkeys("\<C-l>", 'xt')
+let s:hidden_loc = getloclist(s:marked_source_winid, {'title': 1, 'items': 1})
+call assert_match('SimpleFinder lines: zzzz', s:hidden_loc.title)
+call assert_equal([2, 1], map(copy(s:hidden_loc.items), {_, item -> item.lnum}),
+      \ 'location list includes fully hidden marks in first-mark order')
+lclose
+
+" The global quickfix export follows the same all-hidden snapshot path.
+SimpleFinderLines
+call feedkeys("\<C-j>\<Tab>\<C-p>\<C-p>\<Tab>zzzz", 'xt')
+call s:WaitFor({-> s:PanelText() =~# '0 results'}, 'quickfix marked query reaches zero')
+call feedkeys("\<C-q>", 'xt')
+let s:marked_qf = getqflist({'title': 1, 'items': 1})
+call assert_match('SimpleFinder lines: zzzz', s:marked_qf.title)
+call assert_equal([2, 1], map(copy(s:marked_qf.items), {_, item -> item.lnum}),
+      \ 'hidden marks export in first-mark order')
+cclose
+
+" Duplicate-looking results remain independently markable through their
+" occurrence identity.
+SimpleFinderLines
+call feedkeys("\<C-j>\<C-j>\<Tab>\<Tab>\<C-q>", 'xt')
+call assert_equal([3, 4], map(getqflist(), {_, item -> item.lnum}))
+cclose
+
+" A fresh panel must not inherit an invisible selection from the old ones.
+SimpleFinderLines
+call feedkeys("\<C-q>", 'xt')
+call assert_equal([1, 2, 3, 4], map(getqflist(), {_, item -> item.lnum}))
+cclose
+call delete(s:marked_file)
 
 " Reusing the launching window for another buffer invalidates the captured
 " target. The panel stays focused and reports the boundary instead of putting
