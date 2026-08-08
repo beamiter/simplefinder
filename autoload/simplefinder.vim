@@ -659,7 +659,7 @@ def PanelRender()
   }
 
   # Title line
-  var title = get(mode_names, s_mode, s_mode)
+  var title = s_mode ==# 'list' ? s_list_title : get(mode_names, s_mode, s_mode)
   var count_str = ''
   if s_loading
     # A streamed search paints partial results while the walk is still going,
@@ -855,6 +855,11 @@ def FormatItemLine(idx: number, width: number): string
     line = marker .. string(get(item, 'lnum', 0)) .. ': ' .. get(item, 'text', '')
   elseif s_mode ==# 'help'
     line = marker .. get(item, 'path', '')
+  elseif s_mode ==# 'list'
+    # A picker source renders itself: the row is whatever the source put in
+    # `display`, which is also the field the fuzzy filter matches, so the
+    # highlight offsets below line up with no per-source arithmetic.
+    line = marker .. get(item, 'display', '')
   endif
 
   return TruncDisplay(line, width)
@@ -1747,6 +1752,8 @@ def DispatchSearch()
     FilterHelp()
   elseif s_mode ==# 'gitfiles'
     FilterGitFiles()
+  elseif s_mode ==# 'list'
+    FilterList()
   endif
 enddef
 
@@ -2124,6 +2131,15 @@ export def Resume()
     GitFiles()
     SetQuery(query)
     FilterGitFiles()
+    return
+  endif
+  if mode ==# 'list'
+    # A picker's rows were collected once by whoever called Pick(); resuming
+    # re-opens that same collection rather than guessing how to gather it again.
+    Pick(extendnew({title: s_list_title, items: s_list_all, key: s_list_key},
+      s_list_hooks))
+    SetQuery(query)
+    FilterList()
     return
   endif
   PanelOpen(mode, query, true)
@@ -2549,6 +2565,225 @@ export def TrackRecentFile()
 enddef
 
 # =============================================================
+# Picker API and list sources
+#
+# Nine sources hardcoded into a nine-way switch is a plugin; one entry point
+# that any of them could have been written against is something other people
+# can build on.  A list source is a list of dicts: `display` is the row, and
+# the field the fuzzy filter matches; the usual `path` / `bufnr` / `lnum` /
+# `col` / `text` fields make that row a *location*, which is all that <CR>,
+# the preview popup and the quickfix export need in order to work with no
+# per-source code at all.  A source whose rows are not locations supplies its
+# own Accept instead.
+#
+# The built-in marks, jumplist and quickfix sources below are written against
+# this API rather than beside it, so it cannot quietly rot: they are as much a
+# test of it as the tests are.
+# =============================================================
+
+var s_list_all: list<dict<any>> = []
+var s_list_title: string = 'List'
+var s_list_key: string = 'display'
+# Vim reserves capital-initial names for funcref variables, which no `s_`
+# prefix can satisfy, so the picker's callbacks live in a dict instead.
+var s_list_hooks: dict<any> = {}
+
+def AsString(value: any): string
+  return type(value) == v:t_string ? value : ''
+enddef
+
+# spec:
+#   title   string                 panel title                (default 'List')
+#   items   list<dict<any>>        rows; see above
+#   key     string                 which field to match on    (default 'display')
+#   Accept  func(item, openmode)   what <CR> and friends do   (default: jump to
+#                                  the item's location)
+export def Pick(spec: dict<any>)
+  var raw = get(spec, 'items', [])
+  if type(raw) != v:t_list
+    echohl ErrorMsg
+    echom '[SimpleFinder] Pick(): items must be a list of dictionaries'
+    echohl None
+    return
+  endif
+  var items: list<dict<any>> = []
+  for entry in raw
+    if type(entry) != v:t_dict
+      continue
+    endif
+    var item: dict<any> = copy(entry)
+    # `display` is optional for the common case where the row is a path or a
+    # line of text and repeating it would be noise.
+    var display = AsString(get(item, 'display', ''))
+    if display ==# ''
+      display = AsString(get(item, 'text', ''))
+    endif
+    if display ==# ''
+      display = AsString(get(item, 'path', ''))
+    endif
+    item.display = display
+    add(items, item)
+  endfor
+
+  var title = AsString(get(spec, 'title', ''))
+  s_list_title = title ==# '' ? 'List' : title
+  var key = AsString(get(spec, 'key', ''))
+  s_list_key = key ==# '' ? 'display' : key
+  s_list_hooks = {}
+  var Accept = get(spec, 'Accept', null_function)
+  if type(Accept) == v:t_func && Accept != null_function
+    s_list_hooks.Accept = Accept
+  endif
+  s_list_all = items
+
+  AssignItemIdentities(s_list_all)
+  PanelOpen('list')
+  s_items = copy(s_list_all)
+  s_total = len(s_items)
+  PanelRender()
+enddef
+
+def FilterList()
+  s_items = FuzzyFilterLocal(s_list_all, s_query, s_list_key)
+  s_total = len(s_items)
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  PanelRender()
+enddef
+
+# The line a location points at, when it is cheap to know: only a loaded
+# buffer is read, because a mark list spanning fifty files would otherwise
+# open fifty files to draw one panel.
+def LocationText(buf: number, lnum: number): string
+  if buf <= 0 || lnum <= 0 || !bufloaded(buf)
+    return ''
+  endif
+  return trim(get(getbufline(buf, lnum), 0, ''))
+enddef
+
+def LocationLabel(buf: number, path: string): string
+  if path !=# ''
+    return fnamemodify(path, ':~:.')
+  endif
+  if buf > 0 && bufname(buf) !=# ''
+    return fnamemodify(bufname(buf), ':~:.')
+  endif
+  return buf > 0 ? printf('[buffer %d]', buf) : '[no file]'
+enddef
+
+# ─────────────────── Marks ───────────────────
+
+export def Marks()
+  if !exists('*getmarklist')
+    echohl WarningMsg
+    echom '[SimpleFinder] this Vim has no getmarklist()'
+    echohl None
+    return
+  endif
+  var src = bufnr('%')
+  var items: list<dict<any>> = []
+  # Buffer-local marks first: they are about where you are, and the file-wide
+  # ones are a different kind of answer to the same question.
+  for entry in getmarklist(src) + getmarklist()
+    var name = substitute(AsString(get(entry, 'mark', '')), "^'", '', '')
+    # '. '^ '" '[ '] '< '> are cursor bookkeeping, not places anyone set.
+    if name !~# '^[A-Za-z0-9]$'
+      continue
+    endif
+    var pos = get(entry, 'pos', [0, 0, 0, 0])
+    if type(pos) != v:t_list || len(pos) < 3 || pos[1] <= 0
+      continue
+    endif
+    var buf = pos[0]
+    var file = AsString(get(entry, 'file', ''))
+    var path = file ==# '' ? '' : fnamemodify(expand(file), ':p')
+    if buf <= 0 && path !=# ''
+      buf = bufnr(path)
+    endif
+    var item: dict<any> = {lnum: pos[1], col: max([1, pos[2]])}
+    if buf > 0 && bufexists(buf)
+      item.bufnr = buf
+    endif
+    if path !=# ''
+      item.path = path
+    elseif buf > 0
+      item.path = fnamemodify(bufname(buf), ':p')
+    endif
+    var text = LocationText(buf, pos[1])
+    item.text = text
+    item.display = printf('%-2s %s:%d  %s', name,
+      LocationLabel(buf, AsString(get(item, 'path', ''))), pos[1], text)
+    add(items, item)
+  endfor
+  Pick({title: 'Marks', items: items})
+enddef
+
+# ─────────────────── Jump list ───────────────────
+
+export def Jumps()
+  var jumps = getjumplist()[0]
+  var items: list<dict<any>> = []
+  # Newest first: the jump you want back to is nearly always a recent one.
+  for entry in reverse(copy(jumps))
+    var buf = get(entry, 'bufnr', 0)
+    if buf <= 0 || !bufexists(buf)
+      continue
+    endif
+    var lnum = get(entry, 'lnum', 0)
+    var text = LocationText(buf, lnum)
+    var name = bufname(buf)
+    add(items, {
+      bufnr: buf,
+      path: name ==# '' ? '' : fnamemodify(name, ':p'),
+      lnum: lnum,
+      col: max([1, get(entry, 'col', 0) + 1]),
+      text: text,
+      display: printf('%s:%d  %s', LocationLabel(buf, ''), lnum, text),
+    })
+  endfor
+  Pick({title: 'Jumps', items: items})
+enddef
+
+# ─────────────────── Quickfix and location lists ───────────────────
+
+# Fuzzy-find inside a list you already have.  A 400-entry quickfix list from a
+# project-wide grep is exactly the thing :cnext is bad at.
+export def QuickfixList(location: bool = false)
+  var win = win_getid()
+  var raw = location ? getloclist(win) : getqflist()
+  var what = location
+    ? getloclist(win, {title: 1})
+    : getqflist({title: 1})
+  var items: list<dict<any>> = []
+  for entry in raw
+    var buf = get(entry, 'bufnr', 0)
+    var lnum = get(entry, 'lnum', 0)
+    var text = trim(AsString(get(entry, 'text', '')))
+    var name = buf > 0 && bufexists(buf) ? bufname(buf) : ''
+    var item: dict<any> = {
+      lnum: lnum,
+      col: max([1, get(entry, 'col', 0)]),
+      text: text,
+      display: lnum > 0
+        ? printf('%s:%d  %s', LocationLabel(buf, ''), lnum, text)
+        : text,
+    }
+    if buf > 0 && bufexists(buf)
+      item.bufnr = buf
+    endif
+    if name !=# ''
+      item.path = fnamemodify(name, ':p')
+    endif
+    add(items, item)
+  endfor
+  var title = AsString(get(what, 'title', ''))
+  Pick({
+    title: (location ? 'Location list' : 'Quickfix') .. (title ==# '' ? '' : ': ' .. title),
+    items: items,
+  })
+enddef
+
+# =============================================================
 # Open item
 # =============================================================
 
@@ -2582,6 +2817,23 @@ def AcceptItem(mode: string)
     PanelClose()
   elseif s_source_winid > 0 && win_id2win(s_source_winid) > 0
     win_gotoid(s_source_winid)
+  endif
+
+  # A picker source may act on its own items -- that is what makes the API
+  # worth having.  It runs after the panel has closed and focus is back in the
+  # source window, so the callback sees the editing context the user chose from.
+  if s_mode ==# 'list' && has_key(s_list_hooks, 'Accept')
+    var Accept = s_list_hooks.Accept
+    try
+      Accept(item, mode)
+    catch
+      echohl WarningMsg | echomsg 'simplefinder: ' .. v:exception | echohl None
+    endtry
+    return
+  endif
+  if s_mode ==# 'list' && path ==# '' && get(item, 'bufnr', 0) <= 0
+    # Nothing to open and nobody to tell: a display-only picker.
+    return
   endif
 
   # For buffers and buffer lines, prefer bufnr so unnamed buffers work too.

@@ -2,6 +2,26 @@
 
 ## Unreleased - 2026-08-05
 
+### 公开的 picker API、`<Plug>` 目标,以及基于它们的新来源
+
+- 新增 `simplefinder#Pick({spec})`:传一份行列表就能打开面板。这是唯一的扩展面,
+  `spec` 支持 `items` / `title` / `key` / `Accept`。每一行是一个字典,`display`
+  是行文本兼模糊匹配字段(缺省回退 `text`、`path`);带上 `path` / `bufnr` /
+  `lnum` / `col` / `text` 就是一个"地点",`<CR>` 打开、预览显示、`<C-q>` / `<C-l>`
+  导出全部照常工作,不需要任何来源相关代码。多选身份、`:SimpleFinderResume`
+  也一并适用。
+- 新增三个内建来源,而且是**基于**这套 API 写的(不是写在旁边,所以 API 烂了
+  它们会一起烂):`:SimpleFinderMarks`(当前 buffer 的 a-z 在前,再是 A-Z / 0-9,
+  跳过 `'.` `'^` `'"` `'<` `'>` 这些没人设过的自动标记)、`:SimpleFinderJumps`
+  (跳转表,最近的在前)、`:SimpleFinderQuickfix` / `:SimpleFinderLoclist`
+  (在一个 400 条的 quickfix 列表里模糊查找,正是 `:cnext` 最不擅长的事)。
+- 每个命令都补上了 `<Plug>` 目标(`<Plug>(simplefinder-files)` 等 15 个,加上
+  原有的 `-grep-visual`),文档改为推荐绑定 `<Plug>` 而不是命令名:命令以后要加
+  参数或包一层,别人 vimrc 里的映射不会因此断掉。
+- 新增 `tests/vim_pick.vim`:`<Plug>` 目标齐全、`Pick()` 的窄化与 `Accept` 回调、
+  没有 `Accept` 时按位置跳转、`display` 的两级回退、坏 spec 只报错不抛异常,以及
+  marks / jumps / quickfix / loclist 四个来源的行内容与跳转。
+
 ### 预览弹窗:语法高亮、滚动、读 buffer、带缓存
 
 - 预览此前每次移动光标都 `readfile(path, '', start + height - 1)`,而这是从

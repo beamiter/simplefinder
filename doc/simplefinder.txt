@@ -12,6 +12,7 @@ CONTENTS                                               *simplefinder-contents*
   4. Configuration ............... |simplefinder-config|
   5. Mappings .................... |simplefinder-mappings|
   6. Highlights .................. |simplefinder-highlights|
+  7. Extending ................... |simplefinder-extending|
 
 ==============================================================================
 1. INTRODUCTION                                           *simplefinder-intro*
@@ -128,6 +129,24 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                                                          *:SimpleFinderResume*
 :SimpleFinderResume          Re-open the last search: same mode, query and
                              option toggles.
+
+                                                          *:SimpleFinderMarks*
+:SimpleFinderMarks           Fuzzy-find marks: this buffer's a-z first, then
+                             the file marks A-Z and 0-9. Rows show the mark,
+                             the file, the line number and, when the file is
+                             already loaded, the line itself. Automatic marks
+                             ('. '^ '" '< '>) are left out -- nobody set them.
+
+                                                          *:SimpleFinderJumps*
+:SimpleFinderJumps           Fuzzy-find the jump list, most recent first.
+
+                                                       *:SimpleFinderQuickfix*
+:SimpleFinderQuickfix        Fuzzy-find inside the current quickfix list. A
+                             400-entry list from a project-wide grep is what
+                             |:cnext| is worst at.
+
+                                                        *:SimpleFinderLoclist*
+:SimpleFinderLoclist         The same for the current window's location list.
 
                                                            *:SimpleFinderRoot*
 :SimpleFinderRoot [dir]      Show, or pin, the search root directory.
@@ -310,14 +329,26 @@ g:simplefinder_exclude_globs
 ==============================================================================
 5. MAPPINGS                                            *simplefinder-mappings*
 
-Nothing is mapped by default. Every command can simply be mapped by name: >
+Nothing is mapped by default. Every command has a <Plug> target; map those
+rather than the command names, so a command can grow an argument or a wrapper
+without breaking your vimrc: >
 
-  nnoremap <leader>ff <Cmd>SimpleFinderFiles<CR>
-  nnoremap <leader>fg <Cmd>SimpleFinderIGrep<CR>
-  nnoremap <leader>fb <Cmd>SimpleFinderBuffers<CR>
-  nnoremap <leader>fw <Cmd>SimpleFinderGrepWord<CR>
-  nnoremap <leader>fr <Cmd>SimpleFinderResume<CR>
+  nmap <leader>ff <Plug>(simplefinder-files)
+  nmap <leader>fg <Plug>(simplefinder-igrep)
+  nmap <leader>fb <Plug>(simplefinder-buffers)
+  nmap <leader>fw <Plug>(simplefinder-grep-word)
+  nmap <leader>fr <Plug>(simplefinder-resume)
 <
+The full set: *simplefinder-plugs*
+  <Plug>(simplefinder-files)       <Plug>(simplefinder-gitfiles)
+  <Plug>(simplefinder-grep)        <Plug>(simplefinder-igrep)
+  <Plug>(simplefinder-grep-word)   <Plug>(simplefinder-grep-visual)
+  <Plug>(simplefinder-buffers)     <Plug>(simplefinder-recent)
+  <Plug>(simplefinder-lines)       <Plug>(simplefinder-help)
+  <Plug>(simplefinder-symbols)     <Plug>(simplefinder-marks)
+  <Plug>(simplefinder-jumps)       <Plug>(simplefinder-quickfix)
+  <Plug>(simplefinder-loclist)     <Plug>(simplefinder-resume)
+
                                         *<Plug>(simplefinder-grep-visual)*
 Visual-mode grep is the exception, and the plugin ships the mapping: >
 
@@ -349,6 +380,49 @@ Override any of these with :highlight after the plugin loads.
   SFinderBorder       preview popup border
   SFinderPreviewLine  highlighted match line in the preview
 
+
+==============================================================================
+7. EXTENDING                                          *simplefinder-extending*
+
+                                                          *simplefinder#Pick()*
+simplefinder#Pick({spec})
+        Open the panel on a list you supply. This is the whole extension
+        surface: |:SimpleFinderMarks|, |:SimpleFinderJumps| and
+        |:SimpleFinderQuickfix| are written against it, not beside it.
+
+        {spec} keys:
+          items   list of dictionaries, one per row (required)
+          title   panel title (default "List")
+          key     which field the fuzzy filter matches (default "display")
+          Accept  Funcref called as Accept({item}, {openmode}) when a row is
+                  chosen, where {openmode} is "edit", "split", "vsplit" or
+                  "tabedit". It runs after the panel has closed and focus is
+                  back in the window the panel was opened from.
+
+        An item is a dictionary. `display` is the row text and the field the
+        filter matches; when it is absent, `text` and then `path` are used, so
+        a list of paths or of lines needs nothing else. The location fields
+        `path`, `bufnr`, `lnum`, `col` and `text` are what make a row a place:
+        with them and no Accept, <CR> opens it, the preview popup shows it,
+        and <C-q>/<C-l> export it to the quickfix or location list -- all
+        without a line of source-specific code.
+
+        A colour-scheme picker, in full: >
+
+          def ColorPicker()
+            var items = mapnew(getcompletion('', 'color'),
+              (_, name) => ({display: name}))
+            simplefinder#Pick({
+              title: 'Colorschemes',
+              items: items,
+              Accept: (item, _) => execute('colorscheme ' .. item.display),
+            })
+          enddef
+<
+        Rows keep their identity across filtering, so <Tab> multi-select and
+        the quickfix export behave exactly as they do for the built-in
+        sources. |:SimpleFinderResume| re-opens the same collection; it does
+        not re-run whatever gathered it.
 
 ==============================================================================
 DAEMON SUPERVISION                                    *simplefinder-daemon*

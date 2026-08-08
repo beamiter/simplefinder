@@ -53,18 +53,24 @@ Plug 'your-name/simplefinder', { 'do': './install.sh' }
 | `:SimpleFinderSymbols [query]` | 无需 tags/LSP 搜索项目定义 |
 | `:SimpleFinderGitFiles` | 基于 Git 索引查找 tracked/untracked 文件 |
 | `:SimpleFinderResume` | 恢复上次搜索（模式、查询、选项） |
+| `:SimpleFinderMarks` | 模糊搜索标记(当前 buffer 的 a-z,以及 A-Z / 0-9) |
+| `:SimpleFinderJumps` | 模糊搜索跳转表 |
+| `:SimpleFinderQuickfix` / `:SimpleFinderLoclist` | 在 quickfix / location list 里模糊查找 |
 | `:SimpleFinderRoot [dir]` | 查看或设置固定搜索根目录 |
 
-推荐自行绑定常用快捷键：
+每个命令都有对应的 `<Plug>` 目标,推荐绑定 `<Plug>` 而不是命令名:
 
 ```vim
-nnoremap <leader>ff <Cmd>SimpleFinderFiles<CR>
-nnoremap <leader>fg <Cmd>SimpleFinderIGrep<CR>
-nnoremap <leader>fb <Cmd>SimpleFinderBuffers<CR>
-nnoremap <leader>fw <Cmd>SimpleFinderGrepWord<CR>
-nnoremap <leader>fr <Cmd>SimpleFinderResume<CR>
-xmap      <leader>fg <Plug>(simplefinder-grep-visual)
+nmap <leader>ff <Plug>(simplefinder-files)
+nmap <leader>fg <Plug>(simplefinder-igrep)
+nmap <leader>fb <Plug>(simplefinder-buffers)
+nmap <leader>fw <Plug>(simplefinder-grep-word)
+nmap <leader>fr <Plug>(simplefinder-resume)
+xmap <leader>fg <Plug>(simplefinder-grep-visual)
 ```
+
+其余可用目标:`-gitfiles`、`-grep`、`-recent`、`-lines`、`-help`、`-symbols`、
+`-marks`、`-jumps`、`-quickfix`、`-loclist`。
 
 可视模式请用 `<Plug>(simplefinder-grep-visual)`,不要自行绑定。它必须在可视模式
 仍然生效时运行才能读到当前选区：`'<` / `'>` 标记要等选区结束才写入,自己写的
@@ -163,6 +169,27 @@ let g:simplefinder_exclude_globs = ['*.generated.rs', 'fixtures/**']
 被排除的文件不会再被全文读取。配置会在面板打开时快照，`Resume` 保留该快照；
 无效 glob 会成为可见错误。此能力使用协议 v3，旧 daemon 会 fail closed 并提示
 重新运行 `./install.sh`，不会静默忽略排除规则。
+
+## 自定义来源
+
+`simplefinder#Pick()` 就是全部扩展面:`:SimpleFinderMarks`、`:SimpleFinderJumps`、
+`:SimpleFinderQuickfix` 都是基于它写的,而不是写在它旁边。
+
+```vim
+def ColorPicker()
+  var items = mapnew(getcompletion('', 'color'), (_, name) => ({display: name}))
+  simplefinder#Pick({
+    title: 'Colorschemes',
+    items: items,
+    Accept: (item, _) => execute('colorscheme ' .. item.display),
+  })
+enddef
+```
+
+每一行是一个字典:`display` 是行文本、也是模糊匹配的字段(缺省时回退到 `text`、
+`path`)。带上 `path` / `bufnr` / `lnum` / `col` / `text` 这些位置字段,这一行就是
+一个"地点":`<CR>` 打开它、预览弹窗显示它、`<C-q>` / `<C-l>` 导出它,全都不需要
+任何来源相关的代码。不是地点的来源就自己给 `Accept`。
 
 ## 开发与验证
 

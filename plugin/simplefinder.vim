@@ -59,6 +59,10 @@ command! SimpleFinderLines          simplefinder#Lines()
 command! SimpleFinderHelp           simplefinder#HelpTags()
 command! SimpleFinderGitFiles       simplefinder#GitFiles()
 command! -nargs=? SimpleFinderSymbols simplefinder#Symbols(<q-args>)
+command! SimpleFinderMarks          simplefinder#Marks()
+command! SimpleFinderJumps          simplefinder#Jumps()
+command! SimpleFinderQuickfix       simplefinder#QuickfixList()
+command! SimpleFinderLoclist        simplefinder#QuickfixList(true)
 command! SimpleFinderHealth         simplefinder#Health()
 command! SimpleFinderRestart        simplefinder#Restart()
 command! SimpleFinderLog            simplefinder#ShowLog()
@@ -67,6 +71,25 @@ command! SimpleFinderStop           simplefinder#Stop()
 # =============================================================
 # Mappings
 # =============================================================
+# Nothing is mapped by default; these are the targets to map to.  A <Plug>
+# name is what lets the command it stands for change — arguments, a wrapper, a
+# different mode — without breaking the mapping in someone's vimrc.
+nnoremap <silent> <Plug>(simplefinder-files)      <Cmd>SimpleFinderFiles<CR>
+nnoremap <silent> <Plug>(simplefinder-gitfiles)   <Cmd>SimpleFinderGitFiles<CR>
+nnoremap <silent> <Plug>(simplefinder-grep)       <Cmd>SimpleFinderGrep<CR>
+nnoremap <silent> <Plug>(simplefinder-igrep)      <Cmd>SimpleFinderIGrep<CR>
+nnoremap <silent> <Plug>(simplefinder-grep-word)  <Cmd>SimpleFinderGrepWord<CR>
+nnoremap <silent> <Plug>(simplefinder-buffers)    <Cmd>SimpleFinderBuffers<CR>
+nnoremap <silent> <Plug>(simplefinder-recent)     <Cmd>SimpleFinderRecent<CR>
+nnoremap <silent> <Plug>(simplefinder-lines)      <Cmd>SimpleFinderLines<CR>
+nnoremap <silent> <Plug>(simplefinder-help)       <Cmd>SimpleFinderHelp<CR>
+nnoremap <silent> <Plug>(simplefinder-symbols)    <Cmd>SimpleFinderSymbols<CR>
+nnoremap <silent> <Plug>(simplefinder-marks)      <Cmd>SimpleFinderMarks<CR>
+nnoremap <silent> <Plug>(simplefinder-jumps)      <Cmd>SimpleFinderJumps<CR>
+nnoremap <silent> <Plug>(simplefinder-quickfix)   <Cmd>SimpleFinderQuickfix<CR>
+nnoremap <silent> <Plug>(simplefinder-loclist)    <Cmd>SimpleFinderLoclist<CR>
+nnoremap <silent> <Plug>(simplefinder-resume)     <Cmd>SimpleFinderResume<CR>
+
 # Grepping a Visual selection is the one entry point a user cannot map
 # correctly by hand: it has to run *while* Visual mode is still active, since
 # the '< and '> marks still describe the previous selection until the current
