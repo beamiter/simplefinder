@@ -227,8 +227,14 @@ def OnGrepResult(ev: dict<any>)
   # viewport, so the row under the cursor is followed by its stable identity —
   # a match found late can sort in above it and shift every index below.
   var anchor = ''
+  var anchor_row = 0
   if id != 0 && id == s_stream_id && s_cursor_idx < len(s_items)
     anchor = ItemIdentity(s_items[s_cursor_idx])
+    # Following the identity restores the *selection*; the viewport is a second,
+    # independent thing.  Zeroing the scroll offset and letting PanelRender pull
+    # it back just far enough to expose the cursor scrolls the whole panel to the
+    # top on every batch, so keep the anchored row where the eye left it instead.
+    anchor_row = s_cursor_idx - s_scroll_off
   endif
 
   s_items = []
@@ -264,6 +270,8 @@ def OnGrepResult(ev: dict<any>)
     var found = indexof(s_items, (_, item) => ItemIdentity(item) ==# anchor)
     if found >= 0
       s_cursor_idx = found
+      # PanelRender clamps this against the item count and the viewport height.
+      s_scroll_off = max([0, found - anchor_row])
     endif
   endif
   PanelRender()

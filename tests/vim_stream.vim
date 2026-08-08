@@ -6,7 +6,10 @@
 " the last file had been read.  Results now arrive in batches, and the panel
 " has to handle that without lying about its state or moving rows out from
 " under the cursor: a batch is a refined *snapshot*, so a match found late can
-" sort in above the row the user is on and shift every index below it.
+" sort in above the row the user is on and shift every index below it.  The
+" viewport is a second thing to hold still — restoring the selected index while
+" scrolling back to the top repaints the whole panel somewhere else, which on a
+" real walk happens every 80ms while the user is reading.
 "
 " tests/fake_stream_daemon.py plays out a fixed batch sequence one batch at a
 " time, gated on files this script creates, so each assertion runs against a
@@ -16,6 +19,10 @@
 
 set nocompatible
 set nomore
+" The viewport assertions below count result rows, so pin the geometry rather
+" than inherit whatever the terminal happens to be: 24 lines leaves the panel
+" 22 rows, 18 of which show results (title, input, separator, help take four).
+set lines=24
 
 let s:root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(s:root)
@@ -49,6 +56,23 @@ function! s:CursorRow() abort
     endif
   endfor
   return ''
+endfunction
+
+" Which panel line the marked row sits on, i.e. where the eye finds it.
+function! s:CursorBufline() abort
+  let l:lnum = 3
+  for l:line in getbufline(bufnr('SimpleFinder'), 4, '$')
+    let l:lnum += 1
+    if l:line =~# '^▸'
+      return l:lnum
+    endif
+  endfor
+  return -1
+endfunction
+
+" The file named on the first result row: the top of the viewport.
+function! s:TopFile() abort
+  return matchstr(get(getbufline(bufnr('SimpleFinder'), 4, 4), 0, ''), '\f\+\.txt')
 endfunction
 
 function! s:WaitFor(Cond, label) abort
@@ -101,8 +125,37 @@ call assert_match('4/12+ results', s:Panel(),
 call assert_match('d\.txt', s:Panel(), 'the final batch is applied in full')
 call assert_match('c\.txt', s:CursorRow(), 'the cursor survives the final batch')
 
+" A result set taller than the panel: following the cursor by identity keeps the
+" right row selected, but the viewport must stay put too, or every batch drags
+" the panel back to the top while the user is reading it.
+SimpleFinderIGrep viewport
+call s:Release(4, {-> s:Panel() =~# 'f00\.txt'}, 'the first viewport batch paints')
+call assert_equal('f00.txt', s:TopFile(), 'a new result set starts at the top')
+
+" Scroll past the bottom edge, then back up, so the selection ends up in the
+" middle of the viewport rather than pinned to either edge -- 18 result rows,
+" so item 25 leaves the viewport at offset 8 and item 15 sits on panel line 11.
+for s:n in range(25)
+  call feedkeys("\<C-j>", 'xt')
+endfor
+for s:n in range(10)
+  call feedkeys("\<C-k>", 'xt')
+endfor
+call assert_match('f15\.txt', s:CursorRow(), 'the cursor is on the 16th result')
+call assert_equal('f08.txt', s:TopFile(), 'the viewport is scrolled off the top')
+call assert_equal(11, s:CursorBufline(), 'the selection sits mid-viewport')
+
+" Batch 2 inserts a00.txt above everything, so every index shifts by one.
+call s:Release(5, {-> s:Panel() !~# 'searching'}, 'the refining viewport batch paints')
+call assert_match('f15\.txt', s:CursorRow(), 'the selection survives the batch')
+call assert_equal('f08.txt', s:TopFile(),
+      \ 'a partial repaint must not scroll the panel back to the top')
+call assert_equal(11, s:CursorBufline(),
+      \ 'the selected row keeps its place in the viewport')
+call assert_match('41 results', s:Panel(), 'the final viewport batch is applied in full')
+
 call simplefinder#Stop()
-for s:n in range(1, 3)
+for s:n in range(1, 5)
   call delete(printf('%s.%d', s:gate, s:n))
 endfor
 

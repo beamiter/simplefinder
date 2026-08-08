@@ -25,8 +25,9 @@ Grep results stream: the panel paints the first matches while the walk is
 still running and says `12 results · searching…` until it ends, rather than
 showing nothing until the last file has been read. Each batch is a complete,
 correctly ordered snapshot rather than an append, so rows never reshuffle at
-the end; a match found late can still sort in above the row you are on, and
-the cursor follows the row it was on rather than its position. Streaming is
+the end; a match found late can still sort in above the row you are on, so the
+cursor follows the row it was on rather than its position, and that row keeps
+its place on screen instead of the panel scrolling back to the top. Streaming is
 negotiated (protocol v4, `stream` capability), so a daemon built before this
 version keeps replying once per search. |:SimpleFinderFiles| does not stream:
 its ranking needs the whole file list before anything can be ordered.

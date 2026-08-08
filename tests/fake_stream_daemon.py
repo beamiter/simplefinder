@@ -13,13 +13,22 @@ Requests
                                          with no results, which is how a
                                          daemon that cannot stream behaves;
                                          otherwise the gated batch sequence
-                                         below.
+                                         picked by the request's pattern.
 
-Batches (streaming)
+Batches for pattern `needle` (gates 1..3)
   1. b.txt, c.txt                      done:false   -- first paint
   2. a.txt, b.txt, c.txt               done:false   -- a match found late that
                                                       sorts *above* the others
   3. a.txt, b.txt, c.txt, d.txt        done:true    -- 4 of 12, count inexact
+
+Batches for pattern `viewport` (gates 4..5)
+  4. f00.txt .. f39.txt                done:false   -- more results than the
+                                                      panel can show at once
+  5. a00.txt + f00.txt .. f39.txt      done:true    -- one row inserted above
+                                                      a scrolled viewport
+
+Any other pattern answers once with no results, so a stray request cannot hang
+the test waiting for a gate that will never open.
 
 Environment
   FAKE_GATE  path prefix; batch K waits for <prefix>.K before it is sent
@@ -45,12 +54,28 @@ B = item("b.txt", "bbb needle")
 C = item("c.txt", "ccc needle")
 D = item("d.txt", "ddd needle")
 
+# A result set taller than the panel, so the viewport can be scrolled away from
+# the top before the next batch lands.
+MANY = [item("f%02d.txt" % n, "fff viewport") for n in range(40)]
+FIRST = item("a00.txt", "aaa viewport")
+
 # (items, done, total, capped, total_exact)
 BATCHES = [
     ([B, C], False, 2, False, True),
     ([A, B, C], False, 3, False, True),
     ([A, B, C, D], True, 12, True, False),
 ]
+
+VIEWPORT_BATCHES = [
+    (MANY, False, len(MANY), False, True),
+    ([FIRST] + MANY, True, len(MANY) + 1, False, True),
+]
+
+# pattern -> (gate index of the first batch, batches)
+SEQUENCES = {
+    "needle": (1, BATCHES),
+    "viewport": (4, VIEWPORT_BATCHES),
+}
 
 
 def wait_for_gate(index):
@@ -95,7 +120,8 @@ def main():
             )
         elif kind == "grep":
             ident = req.get("id", 0)
-            if not req.get("stream"):
+            first_gate, batches = SEQUENCES.get(req.get("pattern", ""), (0, None))
+            if not req.get("stream") or batches is None:
                 emit(
                     {
                         "type": "grep_result",
@@ -109,7 +135,9 @@ def main():
                     }
                 )
                 continue
-            for index, (items, done, total, capped, exact) in enumerate(BATCHES, 1):
+            for index, (items, done, total, capped, exact) in enumerate(
+                batches, first_gate
+            ):
                 wait_for_gate(index)
                 emit(
                     {
