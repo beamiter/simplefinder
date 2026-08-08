@@ -2,6 +2,20 @@
 
 ## Unreleased - 2026-08-05
 
+### 截断的 grep 结果变得确定且诚实
+
+- 超出 `g:simplefinder_max_results` 的 grep 现在保留 (path, lnum, col) 排序中
+  最靠前的一批。此前 worker 线程按遍历完成顺序追加到共享 Vec,而 drain 是先
+  截断再排序,同一查询两次会返回两个不同的子集,`<C-q>` 导出的 quickfix 也随
+  线程调度变化——"grep 之后修完 quickfix 里所有匹配"的工作流会静默漏掉匹配。
+- daemon 改用按 (path, lnum, col) 定序的有界堆加 `AtomicUsize` 计数,内存不再
+  随命中数增长,并回报真实总数:面板显示 `200/5312 results`,不再是无从证伪的
+  `200+ results`。
+- 为了不让 `.` 这类正则拖垮整棵树,统计有上限(`max` 的 50 倍,至少 10000)。
+  触顶时总数是下界,面板明确标记为 `200/10000+ results`。
+- 新增 Rust 回归测试(同一截断查询多次运行必须字节一致)与
+  `tests/vim_grep.vim`(`<C-q>` 导出的 quickfix 必须每次相同)。
+
 ### 可视模式 grep 搜的是当前选区
 
 - `:SimpleFinderGrepVisual` 在可视模式下改读 `v` / `.` 的实时选区。此前它读

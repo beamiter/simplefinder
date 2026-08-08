@@ -126,6 +126,12 @@ let g:simplefinder_debug = 0
 
 项目根会从当前文件目录向上查找标记；没有匹配时使用当前工作目录。扫描默认遵循 `.ignore`、`.gitignore`、全局 Git ignore 和 `.git/info/exclude`。
 
+匹配数超过 `g:simplefinder_max_results` 时，grep 保留 (path, lnum, col) 排序中最靠前
+的那一批——与完整排序后截断的结果集相同——所以同一查询每次返回同一批结果，`<C-q>`
+导出的 quickfix 也是确定的。面板同时显示两个数字，如 `200/5312 results`。为了让总数
+可信，daemon 会继续统计到 `g:simplefinder_max_results` 的 50 倍(至少 10000)为止；
+`.` 这类正则会立刻触顶，此时总数是下界，面板显示为 `200/10000+ results`。
+
 `g:simplefinder_include_globs` 和 `g:simplefinder_exclude_globs` 使用相对项目根的
 ignore 风格 glob。include 列表非空时只遍历匹配文件，exclude 随后排除匹配项；
 例如只查 Rust/TOML 且跳过生成文件：

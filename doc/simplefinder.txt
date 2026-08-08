@@ -193,6 +193,22 @@ The project root is found by walking up from the current file looking for a
 root marker, falling back to |getcwd()|. Scanning honours `.ignore`,
 `.gitignore`, the global git ignore and `.git/info/exclude`.
 
+					*g:simplefinder_max_results*
+g:simplefinder_max_results
+	How many results one query returns. Default 200.
+
+	A grep that finds more keeps the first g:simplefinder_max_results of
+	the (path, line, column) order -- the same results a full sort would
+	have put first -- so the same query always returns the same set and
+	<C-q> always exports the same quickfix list. The panel then reports
+	both numbers, e.g. `200/5312 results`, rather than only how many fit.
+
+	Counting is what makes that total honest, so the daemon keeps scanning
+	past the cap. It stops at 50x g:simplefinder_max_results matches (at
+	least 10000), which a normal search is nowhere near but `.` as a regex
+	over a monorepo reaches immediately. Past that point the total is a
+	lower bound and the panel marks it: `200/10000+ results`.
+
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs
 	List of ignore-style globs relative to the project root. When non-empty,

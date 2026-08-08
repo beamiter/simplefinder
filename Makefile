@@ -17,6 +17,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_symbols.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_globs.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_visual.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_grep.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

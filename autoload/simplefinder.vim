@@ -34,6 +34,7 @@ var s_loading: bool = false
 var s_error: string = ''
 var s_elapsed_ms: number = 0
 var s_capped: bool = false
+var s_total_exact: bool = true  # false once the daemon stopped counting matches
 var s_regex: bool = false
 var s_case_mode: string = 'smart'   # 'smart' | 'ignore' | 'sensitive'
 var s_hidden: bool = false
@@ -230,6 +231,10 @@ def OnGrepResult(ev: dict<any>)
   endfor
   s_total = get(ev, 'total', len(s_items))
   s_capped = get(ev, 'capped', false)
+  # A daemon that stopped counting at its scan ceiling says so; one too old to
+  # know about the field reports total == len(items) anyway, so defaulting to
+  # true cannot turn a lower bound into a claimed exact count.
+  s_total_exact = get(ev, 'total_exact', true)
   s_elapsed_ms = get(ev, 'elapsed_ms', 0)
   s_loading = false
   s_error = ''
@@ -348,6 +353,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   s_error = ''
   s_elapsed_ms = 0
   s_capped = false
+  s_total_exact = true
   s_marked = {}
   s_marked_items = {}
   s_mark_order = []
@@ -538,6 +544,11 @@ def PanelRender()
     count_str = 'searching…'
   elseif s_error !=# ''
     count_str = 'error'
+  elseif s_capped && s_total > len(s_items)
+    # An honest cap: how many were kept out of how many exist. The trailing +
+    # marks a total the daemon stopped counting at its scan ceiling.
+    count_str = printf('%d/%d%s results', len(s_items), s_total,
+      s_total_exact ? '' : '+')
   elseif s_capped
     count_str = string(len(s_items)) .. '+ results'
   elseif s_total != len(s_items)
@@ -1244,6 +1255,7 @@ def SendGrepRequest(pattern: string)
     s_loading = false
     s_error = ''
     s_capped = false
+    s_total_exact = true
     s_elapsed_ms = 0
     PanelRender()
     return

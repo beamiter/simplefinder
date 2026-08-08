@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use tokio::{
@@ -99,6 +102,11 @@ enum Event {
         done: bool,
         total: usize,
         capped: bool,
+        /// False when the scan ceiling stopped the walk, which makes `total` a
+        /// lower bound.  The Vim side defaults it to true, so an older daemon
+        /// — which reports `total == items.len()` and can only ever render
+        /// `200+ results` — keeps its old, non-committal wording.
+        total_exact: bool,
         elapsed_ms: u128,
     },
     #[serde(rename = "error")]
@@ -130,7 +138,11 @@ struct FileItem {
     indices: Vec<usize>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+/// The derived ordering is load-bearing, not incidental: the fields are laid
+/// out so that `Ord` *is* the (path, lnum, col) result order, which lets a
+/// bounded heap keep exactly the first `max` results a complete sort would
+/// have produced.  Reordering these fields silently reorders the panel.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GrepItem {
     path: String,
     lnum: usize,
@@ -428,12 +440,37 @@ struct GrepOptions {
     exclude_globs: Vec<String>,
 }
 
+/// What a grep walk found.
+///
+/// `total` counts every match the walk saw, not just the ones that fit into
+/// `items`, so the panel can say `200/5312 results` instead of an
+/// unfalsifiable `200+`.
+struct GrepOutcome {
+    items: Vec<GrepItem>,
+    total: usize,
+    /// False once the scan ceiling stopped the walk; `total` is then a lower
+    /// bound and `items` is whatever the walk had reached, so callers must not
+    /// present either as complete.
+    total_exact: bool,
+}
+
+/// How many matches a single query may scan before the walk gives up counting.
+///
+/// Counting every match is what makes the reported total honest, but `.` as a
+/// regex over a monorepo matches every line of every file, and a user who
+/// asked for 200 results does not want to pay for a full read of the tree.
+/// The ceiling scales with the request so a deliberately large `max` still
+/// gets a proportionate scan, with a floor that keeps ordinary queries — which
+/// are nowhere near it — exact and therefore fully deterministic.
+const GREP_SCAN_CEILING_FACTOR: usize = 50;
+const GREP_SCAN_CEILING_MIN: usize = 10_000;
+
 fn handle_grep_sync(
     root: &str,
     pattern: &str,
     options: GrepOptions,
     token: &CancellationToken,
-) -> Result<(Vec<GrepItem>, bool), String> {
+) -> Result<GrepOutcome, String> {
     let expression = if options.is_regex {
         pattern.to_string()
     } else {
@@ -447,8 +484,19 @@ fn handle_grep_sync(
     let root_path = validate_root(root)?;
     let overrides =
         build_path_overrides(&root_path, &options.include_globs, &options.exclude_globs)?;
-    let results: Arc<std::sync::Mutex<Vec<GrepItem>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Worker threads used to append into a shared Vec in walk-completion
+    // order, and the drain below truncated that unordered Vec *before*
+    // sorting: the 200 results a user saw for a common term were a
+    // scheduling-dependent subset that differed between two identical
+    // queries, and <C-q> exported whichever one this run happened to
+    // produce.  A bounded max-heap keeps exactly the `max` smallest items
+    // under GrepItem's (path, lnum, col) ordering, which is the same set a
+    // full sort-then-truncate would have produced, without ever holding more
+    // than `max` items in memory.
+    let best: Arc<std::sync::Mutex<std::collections::BinaryHeap<GrepItem>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
+    let total = Arc::new(AtomicUsize::new(0));
+    let ceiling_hit = Arc::new(AtomicBool::new(false));
 
     let mut builder = WalkBuilder::new(&root_path);
     builder
@@ -463,20 +511,24 @@ fn handle_grep_sync(
             .git_exclude(false);
     }
     let walker = builder.build_parallel();
-    let max_results = options.max;
+    let max_results = options.max.max(1);
+    let ceiling = max_results
+        .saturating_mul(GREP_SCAN_CEILING_FACTOR)
+        .max(GREP_SCAN_CEILING_MIN);
 
     walker.run(|| {
         let matcher = matcher.clone();
         let root_path = root_path.to_path_buf();
-        let results = Arc::clone(&results);
-        let done = Arc::clone(&done);
+        let best = Arc::clone(&best);
+        let total = Arc::clone(&total);
+        let ceiling_hit = Arc::clone(&ceiling_hit);
         let token = token.clone();
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
             .build();
 
         Box::new(move |entry| {
-            if token.is_cancelled() || done.load(std::sync::atomic::Ordering::Relaxed) {
+            if token.is_cancelled() || ceiling_hit.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
             }
 
@@ -495,34 +547,56 @@ fn handle_grep_sync(
                 .to_string_lossy()
                 .into_owned();
 
-            let mut local_items = Vec::new();
+            let mut local_items: Vec<GrepItem> = Vec::new();
+            let mut local_total: usize = 0;
             let _ = searcher.search_path(
                 &matcher,
                 &path,
                 UTF8(|lnum, line| {
-                    let (col, col_end) = matcher
-                        .find(line.as_bytes())
-                        .ok()
-                        .flatten()
-                        .map(|m| (m.start() + 1, m.end() + 1))
-                        .unwrap_or((1, 1));
-                    local_items.push(GrepItem {
-                        path: rel.clone(),
-                        lnum: lnum as usize,
-                        col,
-                        col_end,
-                        text: truncate_line(line),
-                    });
-                    Ok(!token.is_cancelled() && local_items.len() <= max_results)
+                    local_total += 1;
+                    // Matches arrive in ascending line order within one file,
+                    // so its first `max_results` are the only ones that can
+                    // survive the global ordering; the rest are only counted.
+                    // Reading on past that point is what makes `total` honest,
+                    // and the file is open either way.
+                    if local_items.len() < max_results {
+                        let (col, col_end) = matcher
+                            .find(line.as_bytes())
+                            .ok()
+                            .flatten()
+                            .map(|m| (m.start() + 1, m.end() + 1))
+                            .unwrap_or((1, 1));
+                        local_items.push(GrepItem {
+                            path: rel.clone(),
+                            lnum: lnum as usize,
+                            col,
+                            col_end,
+                            text: truncate_line(line),
+                        });
+                    }
+                    // One pathological file must not outrun the global ceiling
+                    // on its own, so bound this scan too.
+                    Ok(!token.is_cancelled()
+                        && local_total < ceiling
+                        && !ceiling_hit.load(Ordering::Relaxed))
                 }),
             );
 
+            if local_total > 0 {
+                let seen = total.fetch_add(local_total, Ordering::Relaxed) + local_total;
+                if seen >= ceiling {
+                    ceiling_hit.store(true, Ordering::Relaxed);
+                }
+            }
             if !local_items.is_empty() {
-                let mut r = results.lock().unwrap();
-                r.extend(local_items);
-                if r.len() > max_results {
-                    done.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return ignore::WalkState::Quit;
+                let mut heap = best.lock().unwrap();
+                for item in local_items {
+                    heap.push(item);
+                    if heap.len() > max_results {
+                        // BinaryHeap is a max-heap, so this drops the item
+                        // furthest down the (path, lnum, col) order.
+                        heap.pop();
+                    }
                 }
             }
 
@@ -530,16 +604,12 @@ fn handle_grep_sync(
         })
     });
 
-    let mut results = results.lock().unwrap();
-    let capped = results.len() > max_results;
-    results.truncate(max_results);
-    results.sort_unstable_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then_with(|| a.lnum.cmp(&b.lnum))
-            .then_with(|| a.col.cmp(&b.col))
-    });
-    Ok((std::mem::take(&mut *results), capped))
+    let heap = std::mem::take(&mut *best.lock().unwrap());
+    Ok(GrepOutcome {
+        items: heap.into_sorted_vec(),
+        total: total.load(Ordering::Relaxed),
+        total_exact: !ceiling_hit.load(Ordering::Relaxed),
+    })
 }
 
 // ─────────────────── stdout writer ───────────────────
@@ -839,16 +909,17 @@ async fn serve() -> std::io::Result<()> {
                     .await;
 
                     match result {
-                        Ok(Ok((items, capped))) => {
-                            let total = items.len();
+                        Ok(Ok(outcome)) => {
+                            let capped = outcome.total > outcome.items.len();
                             send_event(
                                 &tx,
                                 &Event::GrepResult {
                                     id,
-                                    items,
+                                    items: outcome.items,
                                     done: true,
-                                    total,
+                                    total: outcome.total,
                                     capped,
+                                    total_exact: outcome.total_exact,
                                     elapsed_ms: started.elapsed().as_millis(),
                                 },
                             )
@@ -930,7 +1001,7 @@ mod tests {
         let root = temp_project();
         fs::write(root.join("sample.txt"), "alpha [one]\nALPHA two\n").unwrap();
 
-        let (literal, _) = handle_grep_sync(
+        let literal = handle_grep_sync(
             root.to_str().unwrap(),
             "[one]",
             GrepOptions {
@@ -945,7 +1016,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .unwrap();
-        let (folded, _) = handle_grep_sync(
+        let folded = handle_grep_sync(
             root.to_str().unwrap(),
             "alpha",
             GrepOptions {
@@ -961,10 +1032,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(literal.len(), 1);
-        assert_eq!(literal[0].col, 7);
-        assert_eq!(literal[0].col_end, 12);
-        assert_eq!(folded.len(), 2);
+        assert_eq!(literal.items.len(), 1);
+        assert_eq!(literal.items[0].col, 7);
+        assert_eq!(literal.items[0].col_end, 12);
+        assert_eq!(folded.items.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -975,7 +1046,7 @@ mod tests {
         let long = format!("{}needle", "x".repeat(600));
         fs::write(root.join("long.txt"), &long).unwrap();
 
-        let (items, _) = handle_grep_sync(
+        let items = handle_grep_sync(
             root.to_str().unwrap(),
             "needle",
             GrepOptions {
@@ -991,10 +1062,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].path, "long.txt");
-        assert!(items[0].text.len() <= MAX_LINE_BYTES + '…'.len_utf8());
-        assert!(items[0].text.ends_with('…'));
+        assert_eq!(items.items.len(), 1);
+        assert_eq!(items.items[0].path, "long.txt");
+        assert!(items.items[0].text.len() <= MAX_LINE_BYTES + '…'.len_utf8());
+        assert!(items.items[0].text.ends_with('…'));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1002,6 +1073,80 @@ mod tests {
     fn invalid_root_returns_a_useful_error() {
         let error = validate_root("/path/that/does/not/exist/simplefinder").unwrap_err();
         assert!(error.contains("cannot access root"));
+    }
+
+    /// A capped grep used to hand back whichever matches the walk threads
+    /// happened to append first: results were accumulated in completion order
+    /// and truncated *before* being sorted, so two identical queries returned
+    /// two different subsets and `<C-q>` exported an arbitrary one of them.
+    /// The bounded heap has to return the same prefix of the sorted result
+    /// every time, and the count it reports has to be the real number of
+    /// matches rather than the number that fit.
+    #[test]
+    fn a_capped_grep_is_deterministic_and_counts_every_match() {
+        let root = temp_project();
+        // Enough files, and enough matches per file, that the walk needs more
+        // than one thread and more than one batch to finish.
+        for file in 0..24 {
+            let body: String = (0..8)
+                .map(|line| format!("needle {file} {line}\n"))
+                .collect();
+            fs::write(root.join(format!("file{file:02}.txt")), body).unwrap();
+        }
+
+        let run = || {
+            handle_grep_sync(
+                root.to_str().unwrap(),
+                "needle",
+                GrepOptions {
+                    is_regex: false,
+                    ignore_case: false,
+                    max: 20,
+                    hidden: false,
+                    no_ignore: false,
+                    include_globs: Vec::new(),
+                    exclude_globs: Vec::new(),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+
+        let first = run();
+        assert_eq!(first.items.len(), 20, "the cap is honoured");
+        assert_eq!(
+            first.total,
+            24 * 8,
+            "every match is counted, not just the kept ones"
+        );
+        assert!(first.total_exact);
+        assert!(
+            first.total > first.items.len(),
+            "the fixture must actually exceed the cap"
+        );
+
+        // The kept results are the first `max` of the fully sorted result,
+        // which is the only subset a user can reason about.
+        let mut sorted = first.items.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, first.items,
+            "results come back in (path, lnum, col) order"
+        );
+        assert_eq!(first.items[0].path, "file00.txt");
+        assert_eq!(first.items[0].lnum, 1);
+
+        for _ in 0..8 {
+            let again = run();
+            assert_eq!(
+                serde_json::to_string(&again.items).unwrap(),
+                serde_json::to_string(&first.items).unwrap(),
+                "two runs of the same capped query must be byte-identical"
+            );
+            assert_eq!(again.total, first.total);
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1048,7 +1193,7 @@ mod tests {
         assert_eq!(markdown.as_ref(), &["docs/readme.md"]);
         assert_eq!(cache.read().await.len(), 2);
 
-        let (matches, capped) = handle_grep_sync(
+        let grepped = handle_grep_sync(
             root.to_str().unwrap(),
             "needle",
             GrepOptions {
@@ -1063,9 +1208,10 @@ mod tests {
             &token,
         )
         .unwrap();
-        assert!(!capped);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "src/keep.rs");
+        assert_eq!(grepped.total, 1);
+        assert!(grepped.total_exact);
+        assert_eq!(grepped.items.len(), 1);
+        assert_eq!(grepped.items[0].path, "src/keep.rs");
 
         fs::remove_dir_all(root).unwrap();
     }
