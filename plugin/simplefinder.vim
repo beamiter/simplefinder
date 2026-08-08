@@ -14,6 +14,10 @@ g:simplefinder_max_results = get(g:, 'simplefinder_max_results', 200)
 g:simplefinder_debounce_ms = get(g:, 'simplefinder_debounce_ms', 50)
 g:simplefinder_panel_width = get(g:, 'simplefinder_panel_width', 50)
 g:simplefinder_recent_files_max = get(g:, 'simplefinder_recent_files_max', 100)
+# Queries kept per source for <C-Up>/<C-Down> recall, for this session only.
+g:simplefinder_history_max = get(g:, 'simplefinder_history_max', 50)
+# How many buffer lines :SimpleFinderLines collects before it stops.
+g:simplefinder_lines_max = get(g:, 'simplefinder_lines_max', 50000)
 g:simplefinder_position = get(g:, 'simplefinder_position', 'right')
 g:simplefinder_close_on_select = get(g:, 'simplefinder_close_on_select', 1)
 g:simplefinder_hidden = get(g:, 'simplefinder_hidden', 0)

@@ -21,6 +21,7 @@ var s_source_winid: number = 0
 var s_source_bufnr: number = 0
 var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'symbols' | 'recent' | 'buffers' | 'lines' | 'help'
 var s_query: string = ''
+var s_query_cursor: number = 0   # insertion point, in characters, within s_query
 var s_items: list<dict<any>> = []
 var s_cursor_idx: number = 0
 var s_total: number = 0
@@ -436,6 +437,10 @@ enddef
 # =============================================================
 
 def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = false)
+  # Whatever the panel was searching for is now history, even when the user
+  # went straight from one source to another without closing it.
+  RecordHistory()
+
   # Editing another file into the old panel window makes that window the new
   # source just as surely as closing/reopening the panel does.
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
@@ -448,7 +453,8 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   endif
 
   s_mode = mode
-  s_query = initial_query
+  SetQuery(initial_query)
+  s_history_idx = -1
   s_items = []
   s_cursor_idx = 0
   s_scroll_off = 0
@@ -529,6 +535,7 @@ def EnsurePanel()
 enddef
 
 def PanelClose()
+  RecordHistory()
   PreviewClose()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
@@ -707,7 +714,11 @@ def PanelRender()
   if !empty(s_include_globs) || !empty(s_exclude_globs)
     flags ..= printf(' [glob +%d/-%d]', len(s_include_globs), len(s_exclude_globs))
   endif
-  add(lines, TruncDisplay(' > ' .. s_query .. "\u2581" .. flags, width))
+  # The block glyph is the query cursor, so it is drawn where the next
+  # character will be inserted rather than always at the end.
+  s_query_cursor = max([0, min([s_query_cursor, strchars(s_query)])])
+  add(lines, TruncDisplay(' > ' .. strcharpart(s_query, 0, s_query_cursor)
+    .. "\u2581" .. strcharpart(s_query, s_query_cursor) .. flags, width))
 
   # Separator
   add(lines, repeat('─', width))
@@ -1095,6 +1106,13 @@ def SetupMappings()
   nnoremap <silent><buffer> <C-l> <ScriptCmd>PanelHandleKey(0, '<lt>C-l>')<CR>
   nnoremap <silent><buffer> <C-d> <ScriptCmd>PanelHandleKey(0, '<lt>C-d>')<CR>
   nnoremap <silent><buffer> <C-f> <ScriptCmd>PanelHandleKey(0, '<lt>C-f>')<CR>
+  nnoremap <silent><buffer> <C-y> <ScriptCmd>PanelHandleKey(0, '<lt>C-y>')<CR>
+  nnoremap <silent><buffer> <Left> <ScriptCmd>PanelHandleKey(0, '<lt>Left>')<CR>
+  nnoremap <silent><buffer> <Right> <ScriptCmd>PanelHandleKey(0, '<lt>Right>')<CR>
+  nnoremap <silent><buffer> <Home> <ScriptCmd>PanelHandleKey(0, '<lt>Home>')<CR>
+  nnoremap <silent><buffer> <End> <ScriptCmd>PanelHandleKey(0, '<lt>End>')<CR>
+  nnoremap <silent><buffer> <C-Up> <ScriptCmd>PanelHandleKey(0, '<lt>C-Up>')<CR>
+  nnoremap <silent><buffer> <C-Down> <ScriptCmd>PanelHandleKey(0, '<lt>C-Down>')<CR>
 
   # Map the complete printable ASCII range, including regex punctuation.
   for code in range(32, 126)
@@ -1142,6 +1160,13 @@ def PanelHandleKey(winid: number, key: string): bool
     '<C-l>': "\<C-l>",
     '<C-d>': "\<C-d>",
     '<C-f>': "\<C-f>",
+    '<C-y>': "\<C-y>",
+    '<Left>': "\<Left>",
+    '<Right>': "\<Right>",
+    '<Home>': "\<Home>",
+    '<End>': "\<End>",
+    '<C-Up>': "\<C-Up>",
+    '<C-Down>': "\<C-Down>",
   }
   if has_key(special_keys, key)
     k = special_keys[key]
@@ -1259,26 +1284,53 @@ def PanelHandleKey(winid: number, key: string): bool
     return true
   endif
 
+  # Query cursor motion.  Nothing is searched again: the query has not changed,
+  # only where the next character will land.
+  if k ==# "\<Left>"
+    MoveQueryCursor(-1)
+    return true
+  endif
+  if k ==# "\<Right>"
+    MoveQueryCursor(1)
+    return true
+  endif
+  if k ==# "\<Home>"
+    s_query_cursor = 0
+    PanelRender()
+    return true
+  endif
+  if k ==# "\<End>"
+    s_query_cursor = strchars(s_query)
+    PanelRender()
+    return true
+  endif
+
+  # Query history, per source.
+  if k ==# "\<C-Up>"
+    RecallHistory(1)
+    return true
+  endif
+  if k ==# "\<C-Down>"
+    RecallHistory(-1)
+    return true
+  endif
+
   # Editing
   if k ==# "\<BS>" || k ==# "\<C-h>"
-    if len(s_query) > 0
-      s_query = strcharpart(s_query, 0, strchars(s_query) - 1)
-      DebouncedSearch()
-      PanelRender()
+    if s_query_cursor > 0
+      ReplaceQueryRange(s_query_cursor - 1, s_query_cursor, '')
     endif
     return true
   endif
   if k ==# "\<C-u>"
-    s_query = ''
-    DebouncedSearch()
-    PanelRender()
+    ReplaceQueryRange(0, strchars(s_query), '')
     return true
   endif
   if k ==# "\<C-w>"
-    # Delete last word
-    s_query = substitute(s_query, '\S*\s*$', '', '')
-    DebouncedSearch()
-    PanelRender()
+    # Delete the word before the cursor, leaving anything after it alone.
+    var before = strcharpart(s_query, 0, s_query_cursor)
+    var kept = substitute(before, '\S*\s*$', '', '')
+    ReplaceQueryRange(strchars(kept), s_query_cursor, '')
     return true
   endif
 
@@ -1286,18 +1338,164 @@ def PanelHandleKey(winid: number, key: string): bool
     EditQueryLine()
     return true
   endif
+  if k ==# "\<C-y>"
+    PasteRegister()
+    return true
+  endif
 
   # Printable text: one keystroke from the <Char-NN> mappings above, or a whole
   # string handed back by the command-line editor.
   if k !=# '' && char2nr(k) >= 32
-    s_query ..= k
-    DebouncedSearch()
-    PanelRender()
+    ReplaceQueryRange(s_query_cursor, s_query_cursor, k)
     return true
   endif
 
   # Consume all other keys
   return true
+enddef
+
+# ─────────────────── Query editing ───────────────────
+#
+# The query used to be append-only: every edit landed at the end, so a typo in
+# the middle of a long pattern meant deleting everything after it.  It is now a
+# real insertion point, kept in *characters* so a multi-byte query (which <C-f>
+# and <C-y> can produce) cannot be cut through the middle of a character.
+
+def MoveQueryCursor(delta: number)
+  var moved = max([0, min([s_query_cursor + delta, strchars(s_query)])])
+  if moved == s_query_cursor
+    return
+  endif
+  s_query_cursor = moved
+  PanelRender()
+enddef
+
+# Set the whole query at once (command-line edit, history recall, resume).
+def SetQuery(text: string)
+  s_query = text
+  s_query_cursor = strchars(text)
+enddef
+
+# The single place the query text changes while the panel is open: replaces the
+# character range [from, to) with `text`, leaves the cursor after what was
+# inserted, and re-searches.  Editing always leaves history recall, so <C-Up>
+# starts again from the query now on screen rather than from where recall was.
+def ReplaceQueryRange(from: number, to: number, text: string)
+  var total = strchars(s_query)
+  var lo = max([0, min([from, total])])
+  var hi = max([lo, min([to, total])])
+  if lo == hi && text ==# ''
+    return
+  endif
+  s_query = strcharpart(s_query, 0, lo) .. text .. strcharpart(s_query, hi)
+  s_query_cursor = lo + strchars(text)
+  s_history_idx = -1
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  DebouncedSearch()
+  PanelRender()
+enddef
+
+# Splice a register into the query at the cursor.
+#
+# Registers are where paths, identifiers and error messages already are — the
+# thing you want to search for is usually one yank away — and a register is
+# also the shortest route to text no keyboard mapping can produce: the panel
+# reads keystrokes with one mapping per printable ASCII character, so a yanked
+# CJK identifier reaches the query this way when typing it cannot.
+def PasteRegister()
+  echo '"'
+  var name: string
+  try
+    name = exists('*getcharstr') ? getcharstr() : nr2char(getchar())
+  catch /^Vim:Interrupt$/
+    return
+  endtry
+  redraw
+  if name ==# '' || name ==# "\<Esc>" || name ==# "\<C-c>"
+    return
+  endif
+  var text: string
+  try
+    text = getreg(name)
+  catch
+    # An unknown register name is a typo, not an error worth a panel line.
+    return
+  endtry
+  if text ==# ''
+    return
+  endif
+  # A linewise register ends in a newline and may hold several lines; a query
+  # is one line, so join it the way the multi-line Visual selection does.
+  text = substitute(text, '[\r\n]\+$', '', '')
+  text = substitute(text, '[\r\n]\+', ' ', 'g')
+  if text ==# ''
+    return
+  endif
+  ReplaceQueryRange(s_query_cursor, s_query_cursor, text)
+enddef
+
+# ─────────────────── Query history ───────────────────
+#
+# Per source, because the queries are not interchangeable: a file path fragment
+# is not a grep pattern, and cycling through the wrong kind is worse than
+# having no history at all.  Kept in memory for the session only — writing a
+# state file would need a documented location, a size policy and a story about
+# concurrent Vim instances, none of which are needed to fix "I want the pattern
+# I ran a minute ago".
+
+var s_history: dict<list<string>> = {}
+var s_history_idx: number = -1    # -1 = editing; 0.. = index into the list
+var s_history_stash: string = ''  # the query recall started from
+
+# grep and igrep are the same search with different entry points, so they share
+# one list; everything else keeps its own.
+def HistoryKey(mode: string): string
+  return mode ==# 'igrep' ? 'grep' : mode
+enddef
+
+def RecordHistory()
+  if s_mode ==# '' || s_query ==# ''
+    return
+  endif
+  var key = HistoryKey(s_mode)
+  var entries = get(s_history, key, [])
+  filter(entries, (_, v) => v !=# s_query)
+  insert(entries, s_query, 0)
+  var mx = max([0, get(g:, 'simplefinder_history_max', 50)])
+  if len(entries) > mx
+    entries = mx == 0 ? [] : entries[: mx - 1]
+  endif
+  s_history[key] = entries
+enddef
+
+# delta > 0 walks towards older queries, < 0 back towards the one being edited.
+def RecallHistory(delta: number)
+  var entries = get(s_history, HistoryKey(s_mode), [])
+  if empty(entries)
+    return
+  endif
+  if s_history_idx < 0
+    if delta < 0
+      return
+    endif
+    s_history_stash = s_query
+  endif
+  var idx = s_history_idx + delta
+  if idx >= len(entries)
+    return
+  endif
+  if idx < 0
+    idx = -1
+    SetQuery(s_history_stash)
+  else
+    SetQuery(entries[idx])
+  endif
+  s_history_idx = idx
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  DebouncedSearch()
+  PanelRender()
 enddef
 
 # Hand the query to Vim's command line for one edit.
@@ -1328,7 +1526,8 @@ def EditQueryLine()
   if edited ==# '' || edited ==# s_query
     return
   endif
-  s_query = edited
+  SetQuery(edited)
+  s_history_idx = -1
   s_cursor_idx = 0
   s_scroll_off = 0
   DebouncedSearch()
@@ -1718,31 +1917,31 @@ export def Resume()
   var query = s_query
   if mode ==# 'buffers'
     Buffers()
-    s_query = query
+    SetQuery(query)
     FilterBuffers()
     return
   endif
   if mode ==# 'recent'
     RecentFiles()
-    s_query = query
+    SetQuery(query)
     FilterRecentFiles()
     return
   endif
   if mode ==# 'lines'
     Lines()
-    s_query = query
+    SetQuery(query)
     FilterLines()
     return
   endif
   if mode ==# 'help'
     HelpTags()
-    s_query = query
+    SetQuery(query)
     FilterHelp()
     return
   endif
   if mode ==# 'gitfiles'
     GitFiles()
-    s_query = query
+    SetQuery(query)
     FilterGitFiles()
     return
   endif

@@ -164,17 +164,37 @@ snapshot; closing the panel clears the selection, so |:SimpleFinderResume|
 never restores invisible old marks.
 
 Query editing~
-  <BS> <C-h>      delete last character
+  <BS> <C-h>      delete the character before the cursor
   <C-u>           clear the query
-  <C-w>           delete the last word
+  <C-w>           delete the word before the cursor
+  <Left> <Right>  move the query cursor one character
+  <Home> <End>    move to the start / end of the query
+  <C-y>{reg}      paste a register into the query at the cursor
   <C-f>           edit the query on Vim's command line
+  <C-Up>          recall an older query for this source
+  <C-Down>        walk back towards the query you were editing
+
+The block glyph in the prompt line is the query cursor: typing, <BS> and <C-w>
+all act there, so a typo in the middle of a long pattern no longer costs
+everything after it.
 
 The panel reads keystrokes with one mapping per printable ASCII character, so
-typing into it is limited to ASCII and to appending at the end. <C-f> hands
-the query to the real command line for a single edit and searches again with
-the result. That is how to enter a non-ASCII query, move about inside a query,
-or paste a register with |c_CTRL-R|. Leaving that command line with <Esc>
-keeps the query as it was; use <C-u> in the panel to clear it.
+*typing* into it is limited to ASCII. Text that cannot be typed still reaches
+the query two ways. <C-y> followed by a register name splices that register in
+at the cursor -- a yanked identifier, path or error message, whatever its
+script -- joining a multi-line register with spaces. <C-f> hands the query to
+the real command line for a single edit, which brings every input method with
+it; leaving that command line with <Esc> keeps the query as it was.
+
+                                             *g:simplefinder_history_max*
+Each source keeps its own list of queries actually searched for, most recent
+first, recalled with <C-Up> and <C-Down>. |:SimpleFinderGrep| and
+|:SimpleFinderIGrep| share one list, since they are the same search; a file
+path fragment and a grep pattern are not interchangeable, so nothing else
+does. <C-Down> past the newest entry restores the query recall started from.
+g:simplefinder_history_max (default 50) caps each list. The history lives in
+the running Vim only -- it is not written to disk and does not survive a
+restart.
 
 Search options (grep modes)~
   <C-r>           toggle literal text / regex     flag: [txt] / [.*]
@@ -207,6 +227,8 @@ Set before the plugin loads; defaults shown. >
   g:simplefinder_smart_case = 1          smart case for grep
   g:simplefinder_ignore_case = 0         force case-insensitive grep
   g:simplefinder_recent_files_max = 100  recent file list size
+  g:simplefinder_history_max = 50        queries kept per source, this session
+  g:simplefinder_lines_max = 50000       buffer lines :SimpleFinderLines reads
   g:simplefinder_root = ''               pin the search root ('' = auto)
   g:simplefinder_root_markers = ['.git', 'Cargo.toml', 'package.json',
                                  'go.mod', 'CMakeLists.txt', 'Makefile',
