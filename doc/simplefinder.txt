@@ -10,7 +10,8 @@ CONTENTS                                               *simplefinder-contents*
   2. Commands .................... |simplefinder-commands|
   3. Panel keys .................. |simplefinder-keys|
   4. Configuration ............... |simplefinder-config|
-  5. Highlights .................. |simplefinder-highlights|
+  5. Mappings .................... |simplefinder-mappings|
+  6. Highlights .................. |simplefinder-highlights|
 
 ==============================================================================
 1. INTRODUCTION                                           *simplefinder-intro*
@@ -43,7 +44,16 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 :SimpleFinderGrepWord        Live grep for the word under the cursor.
 
                                                      *:SimpleFinderGrepVisual*
-:SimpleFinderGrepVisual      Live grep for the last visual selection.
+:SimpleFinderGrepVisual      Live grep for the Visual selection. Charwise,
+                             linewise and blockwise all work; multiple lines
+                             are joined with a space.
+                             Invoked while Visual mode is still active (the
+                             |<Plug>| mapping below) it reads the *current*
+                             selection; invoked as :'<,'>SimpleFinderGrepVisual
+                             there is no live selection left, so it reads the
+                             |'<| and |'>| marks instead.
+                             Map it with |<Plug>(simplefinder-grep-visual)|,
+                             not by hand -- see |simplefinder-mappings|.
 
                                                         *:SimpleFinderBuffers*
 :SimpleFinderBuffers         Fuzzy-find open buffers (most recent first).
@@ -204,17 +214,32 @@ g:simplefinder_exclude_globs
 	globs fail closed with an older daemon and ask you to rerun ./install.sh.
 	Pure Vim sources and |:SimpleFinderGitFiles| are intentionally unchanged.
 
-Suggested mappings: >
+==============================================================================
+5. MAPPINGS                                            *simplefinder-mappings*
+
+Nothing is mapped by default. Every command can simply be mapped by name: >
 
   nnoremap <leader>ff <Cmd>SimpleFinderFiles<CR>
   nnoremap <leader>fg <Cmd>SimpleFinderIGrep<CR>
   nnoremap <leader>fb <Cmd>SimpleFinderBuffers<CR>
   nnoremap <leader>fw <Cmd>SimpleFinderGrepWord<CR>
   nnoremap <leader>fr <Cmd>SimpleFinderResume<CR>
-  xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
 <
+                                        *<Plug>(simplefinder-grep-visual)*
+Visual-mode grep is the exception, and the plugin ships the mapping: >
+
+  xmap <leader>fg <Plug>(simplefinder-grep-visual)
+<
+Use it instead of writing your own. Grepping a selection has to happen while
+Visual mode is still active, because Vim only writes the |'<| and |'>| marks
+once the selection *ends* -- until then they still describe the previous one.
+A hand-written mapping that reads the marks therefore searches one selection
+behind, and finds nothing at all on the first selection of a session. The
+<Plug> mapping is a |<Cmd>| mapping for exactly that reason: it never leaves
+Visual mode, so the live region is still readable.
+
 ==============================================================================
-5. HIGHLIGHTS                                        *simplefinder-highlights*
+6. HIGHLIGHTS                                        *simplefinder-highlights*
 
 Override any of these with :highlight after the plugin loads.
 

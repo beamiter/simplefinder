@@ -42,7 +42,7 @@ Plug 'your-name/simplefinder', { 'do': './install.sh' }
 | `:SimpleFinderGrep [text]` | 搜索项目文本 |
 | `:SimpleFinderIGrep [text]` | 打开实时全文搜索 |
 | `:SimpleFinderGrepWord` | 搜索光标下单词 |
-| `:SimpleFinderGrepVisual` | 搜索最近一次可视选择 |
+| `:SimpleFinderGrepVisual` | 搜索当前可视选择 |
 | `:SimpleFinderBuffers` | 查找已打开缓冲区 |
 | `:SimpleFinderRecent` | 查找最近文件 |
 | `:SimpleFinderLines` | 模糊搜索当前缓冲区的行 |
@@ -60,8 +60,13 @@ nnoremap <leader>fg <Cmd>SimpleFinderIGrep<CR>
 nnoremap <leader>fb <Cmd>SimpleFinderBuffers<CR>
 nnoremap <leader>fw <Cmd>SimpleFinderGrepWord<CR>
 nnoremap <leader>fr <Cmd>SimpleFinderResume<CR>
-xnoremap <leader>fg <Cmd>SimpleFinderGrepVisual<CR>
+xmap      <leader>fg <Plug>(simplefinder-grep-visual)
 ```
+
+可视模式请用 `<Plug>(simplefinder-grep-visual)`,不要自行绑定。它必须在可视模式
+仍然生效时运行才能读到当前选区：`'<` / `'>` 标记要等选区结束才写入,自己写的
+映射很容易搜成上一次的选区。`:'<,'>SimpleFinderGrepVisual` 命令形式没有活动选区
+可读,仍按标记工作。
 
 ## 面板按键
 

@@ -57,6 +57,16 @@ command! SimpleFinderLog            simplefinder#ShowLog()
 command! SimpleFinderStop           simplefinder#Stop()
 
 # =============================================================
+# Mappings
+# =============================================================
+# Grepping a Visual selection is the one entry point a user cannot map
+# correctly by hand: it has to run *while* Visual mode is still active, since
+# the '< and '> marks still describe the previous selection until the current
+# one ends.  That makes the exact <Cmd> form load-bearing, so ship it rather
+# than asking every user to rediscover it.
+xnoremap <silent> <Plug>(simplefinder-grep-visual) <Cmd>SimpleFinderGrepVisual<CR>
+
+# =============================================================
 # Highlights
 # =============================================================
 highlight default SFinderBorder   ctermfg=75  guifg=#5fafff

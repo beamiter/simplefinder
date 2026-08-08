@@ -1439,20 +1439,74 @@ export def GrepWord()
   endif
 enddef
 
-export def GrepVisual()
-  var [_, l1, c1, _] = getpos("'<")
-  var [_, l2, c2, _] = getpos("'>")
-  var lines = getline(l1, l2)
-  if len(lines) == 0
-    return
+# Exclusive byte offset at which an inclusive selection ending on byte `col`
+# stops.  `$` reports one past the last byte, and with 'selection' inclusive
+# `col` addresses the *first* byte of the character under the cursor, so a
+# naive `strpart(line, 0, col)` cuts multi-byte characters in half.
+def SelectionEnd(line: string, col: number): number
+  if &selection ==# 'exclusive'
+    return col - 1
   endif
-  if len(lines) == 1
-    lines[0] = strpart(lines[0], c1 - 1, c2 - c1 + 1)
+  if col > len(line)
+    return len(line)
+  endif
+  return col - 1 + strlen(matchstr(line, '.', col - 1))
+enddef
+
+# Text of the region a Visual-mode invocation is really about.
+#
+# A `<Cmd>` mapping — the form the README and the help teach — runs while
+# Visual mode is still active, and Vim only writes the '< and '> marks when
+# the selection *ends*.  Inside the mapping those marks therefore still
+# describe the previous selection (:help <Cmd>), which is why every grep
+# searched one selection behind and the first of a session searched nothing.
+# `v` (the anchor) and `.` (the cursor) hold the live region, so read those
+# whenever a Visual (or Select) mode is actually current, and fall back to the
+# marks for `:'<,'>SimpleFinderGrepVisual`, where no Visual mode is left.
+def VisualRegionText(): string
+  # mode() spells Select mode with s/S/<C-s>; the geometry is identical.
+  var live = strpart(mode(), 0, 1)
+  var kind = {s: 'v', S: 'V', ["\<C-s>"]: "\<C-v>"}->get(live, live)
+  var start: list<number>
+  var finish: list<number>
+  if kind ==# 'v' || kind ==# 'V' || kind ==# "\<C-v>"
+    start = getpos('v')
+    finish = getpos('.')
   else
-    lines[0] = strpart(lines[0], c1 - 1)
-    lines[-1] = strpart(lines[-1], 0, c2)
+    kind = visualmode()
+    start = getpos("'<")
+    finish = getpos("'>")
   endif
-  var text = join(lines, ' ')
+  if start[1] <= 0 || finish[1] <= 0
+    return ''
+  endif
+  # The cursor may sit at either end of the selection.
+  if start[1] > finish[1] || (start[1] == finish[1] && start[2] > finish[2])
+    [start, finish] = [finish, start]
+  endif
+
+  var lines = getline(start[1], finish[1])
+  if empty(lines)
+    return ''
+  endif
+  if kind ==# 'V'
+    # Linewise: whole lines, whatever the columns happen to say.
+  elseif kind ==# "\<C-v>"
+    var left = min([start[2], finish[2]])
+    var right = max([start[2], finish[2]])
+    map(lines, (_, l) => strpart(l, left - 1, SelectionEnd(l, right) - left + 1))
+  elseif len(lines) == 1
+    lines[0] = strpart(lines[0], start[2] - 1,
+      SelectionEnd(lines[0], finish[2]) - start[2] + 1)
+  else
+    lines[0] = strpart(lines[0], start[2] - 1)
+    lines[-1] = strpart(lines[-1], 0, SelectionEnd(lines[-1], finish[2]))
+  endif
+  return join(lines, ' ')
+enddef
+
+export def GrepVisual()
+  var text = VisualRegionText()
   if text !=# ''
     PanelOpen('igrep', text)
     SendGrepRequest(text)
