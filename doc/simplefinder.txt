@@ -251,6 +251,7 @@ Buffers mode~
 Set before the plugin loads; defaults shown. >
 
   g:simplefinder_max_results = 200       max results per query
+  g:simplefinder_threads = 0             daemon worker threads (0 = per core)
   g:simplefinder_debounce_ms = 50        input debounce
   g:simplefinder_panel_width = 50        panel width in columns
   g:simplefinder_position = 'right'      'left' or 'right'
@@ -304,6 +305,19 @@ g:simplefinder_max_results
 	exactly this with a trailing +: `200/10000+ results`. Narrow the
 	pattern (or raise g:simplefinder_max_results, which raises the ceiling
 	with it) to get a complete scan and a stable set back.
+
+					     *g:simplefinder_threads*
+g:simplefinder_threads
+	How many worker threads the daemon uses for the file walk and for
+	fuzzy scoring. Default 0, meaning one per core.
+
+	Scoring is per candidate and independent, so the file list is split
+	across these threads and the partial rankings merged before the single
+	sort that decides the order -- the result is exactly the ranking one
+	thread would have produced, whatever the thread count. Both were
+	previously pinned at min(cores, 8), which left most of a large machine
+	idle on the keystroke path. Lower it to leave cores for something else;
+	values above 64 are clamped.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs

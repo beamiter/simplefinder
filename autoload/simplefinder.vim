@@ -1761,6 +1761,13 @@ enddef
 # Search functions — daemon-based
 # =============================================================
 
+# Worker threads for the daemon's walk and its scoring.  0 (the default) means
+# one per core; the daemon clamps anything absurd.
+def RequestThreads(): number
+  var value = get(g:, 'simplefinder_threads', 0)
+  return type(value) == v:t_number && value > 0 ? value : 0
+enddef
+
 def SendFilesRequest(query: string)
   if !PathGlobsReady()
     return
@@ -1790,6 +1797,7 @@ def SendFilesRequest(query: string)
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
     exclude_globs: s_exclude_globs,
+    threads: RequestThreads(),
   })
 enddef
 
@@ -1847,6 +1855,7 @@ def SendGrepRequest(pattern: string)
     # predates streaming on its single-reply path instead of relying on it to
     # ignore a field it has never heard of.
     stream: simplefinder#core#HasCap('stream'),
+    threads: RequestThreads(),
   })
 enddef
 
@@ -2424,6 +2433,7 @@ def SendSymbolRequest(query: string)
     # A symbol search is a grep over the whole project, so it benefits from
     # partial batches exactly as much as one the user typed.
     stream: simplefinder#core#HasCap('stream'),
+    threads: RequestThreads(),
   })
 enddef
 

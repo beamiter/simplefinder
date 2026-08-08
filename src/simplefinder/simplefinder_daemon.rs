@@ -42,6 +42,11 @@ enum Request {
         include_globs: Vec<String>,
         #[serde(default)]
         exclude_globs: Vec<String>,
+        /// Worker threads for the walk and the scoring; 0 means "one per
+        /// core".  An older daemon ignores the field, and an older plugin
+        /// omits it, so both directions land on the default.
+        #[serde(default)]
+        threads: usize,
     },
     #[serde(rename = "grep")]
     Grep {
@@ -67,6 +72,8 @@ enum Request {
         /// with this daemon keeps getting exactly one reply per request.
         #[serde(default)]
         stream: bool,
+        #[serde(default)]
+        threads: usize,
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
@@ -82,6 +89,22 @@ enum Request {
 
 fn default_max() -> usize {
     200
+}
+
+/// How many worker threads a request may use.
+///
+/// The walk and the scoring were both pinned at `num_cpus().min(8)`: a
+/// deliberate cap when eight cores was a big machine, and three quarters of a
+/// 32-core box left idle now.  0 (the default) means one per core; an explicit
+/// value is clamped to something a stray configuration cannot turn into
+/// thousands of threads.
+fn worker_threads(requested: usize) -> usize {
+    const MAX_THREADS: usize = 64;
+    if requested == 0 {
+        num_cpus::get().clamp(1, MAX_THREADS)
+    } else {
+        requested.clamp(1, MAX_THREADS)
+    }
 }
 
 /// Bumped whenever the wire format changes in a way the Vim side must know
@@ -211,15 +234,30 @@ fn prune_cache(cache: &mut HashMap<String, CacheEntry>) {
     }
 }
 
+/// Everything that decides which files a walk yields, and how many threads
+/// yield them.  Grouped because every one of them belongs in the cache key:
+/// two walks that disagree on any of the first four are not the same list.
+struct WalkOptions<'a> {
+    hidden: bool,
+    no_ignore: bool,
+    include_globs: &'a [String],
+    exclude_globs: &'a [String],
+    threads: usize,
+}
+
 async fn get_or_walk_files(
     cache: &FileCache,
     root: &str,
-    hidden: bool,
-    no_ignore: bool,
-    include_globs: &[String],
-    exclude_globs: &[String],
+    options: &WalkOptions<'_>,
     token: &CancellationToken,
 ) -> Result<Option<Arc<Vec<String>>>, String> {
+    let WalkOptions {
+        hidden,
+        no_ignore,
+        include_globs,
+        exclude_globs,
+        threads,
+    } = *options;
     let root_path = validate_root(root)?;
     let cache_key = serde_json::to_string(&(
         root_path.to_string_lossy(),
@@ -247,7 +285,7 @@ async fn get_or_walk_files(
         let mut builder = WalkBuilder::new(&root_path);
         builder
             .hidden(!hidden)
-            .threads(num_cpus::get().min(8))
+            .threads(worker_threads(threads))
             .overrides(overrides);
         if no_ignore {
             builder
@@ -368,10 +406,41 @@ fn build_path_overrides(
 
 // ─────────────────── Fuzzy matching ───────────────────
 
+/// Fewest candidates worth handing to a thread of its own.  Scoring a short
+/// path is a few hundred nanoseconds, so splitting a small list costs more in
+/// thread setup than it saves.
+const FUZZY_CHUNK_MIN: usize = 2_000;
+
+/// Score one slice of the candidate list.  `None` means the search was
+/// cancelled — a superseded keystroke — and nothing downstream should run.
+fn score_range(
+    files: &[String],
+    range: std::ops::Range<usize>,
+    pattern: &Pattern,
+    token: &CancellationToken,
+) -> Option<Vec<(i64, usize)>> {
+    let mut matcher = NucleoMatcher::new(Config::DEFAULT);
+    // Score as (score, index) pairs: no path is cloned until it survives
+    // truncation, and the Utf32 scratch buffer is reused across candidates.
+    let mut buf = Vec::new();
+    let mut scored: Vec<(i64, usize)> = Vec::new();
+    for index in range {
+        if index % 1024 == 0 && token.is_cancelled() {
+            return None;
+        }
+        let haystack = Utf32Str::new(&files[index], &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            scored.push((score as i64, index));
+        }
+    }
+    Some(scored)
+}
+
 fn fuzzy_filter(
     files: &[String],
     query: &str,
     max: usize,
+    threads: usize,
     token: &CancellationToken,
 ) -> Option<(Vec<FileItem>, usize)> {
     if query.is_empty() {
@@ -387,28 +456,46 @@ fn fuzzy_filter(
         return Some((items, files.len()));
     }
 
-    let mut matcher = NucleoMatcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
 
-    // Score as (score, index) pairs: no path is cloned until it survives
-    // truncation, and the Utf32 scratch buffer is reused across candidates.
-    let mut buf = Vec::new();
-    let mut scored: Vec<(i64, usize)> = Vec::new();
-    for (index, p) in files.iter().enumerate() {
-        if index % 1024 == 0 && token.is_cancelled() {
-            return None;
-        }
-        let haystack = Utf32Str::new(p, &mut buf);
-        if let Some(score) = pattern.score(haystack, &mut matcher) {
-            scored.push((score as i64, index));
-        }
-    }
+    // Every keystroke rescores the whole file list, and on a 100k-file repo
+    // that was one core doing all of it while the rest of the machine waited.
+    // Scoring is embarrassingly parallel — each candidate is independent — so
+    // the list is split, scored per thread with a matcher of its own, and the
+    // partial results merged before the single sort that decides the order.
+    // The sort breaks ties by path, so the merged order does not depend on
+    // which thread finished first.
+    let workers = worker_threads(threads).min(files.len().div_ceil(FUZZY_CHUNK_MIN).max(1));
+    let mut scored: Vec<(i64, usize)> = if workers <= 1 {
+        score_range(files, 0..files.len(), &pattern, token)?
+    } else {
+        let chunk = files.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..files.len())
+                .step_by(chunk)
+                .map(|start| {
+                    let end = (start + chunk).min(files.len());
+                    let pattern = &pattern;
+                    scope.spawn(move || score_range(files, start..end, pattern, token))
+                })
+                .collect();
+            let mut merged: Vec<(i64, usize)> = Vec::new();
+            for handle in handles {
+                // A panicking scorer is a bug, not a result: fail the search
+                // rather than quietly return a partial ranking.
+                merged.extend(handle.join().ok()??);
+            }
+            Some(merged)
+        })?
+    };
 
     let total = scored.len();
     scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1])));
     scored.truncate(max);
 
     // Only the surviving page is materialized and needs highlight positions.
+    let mut matcher = NucleoMatcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
     let mut idx_buf: Vec<u32> = Vec::new();
     let mut items: Vec<FileItem> = Vec::with_capacity(scored.len());
     for (score, index) in scored {
@@ -445,6 +532,8 @@ struct GrepOptions {
     no_ignore: bool,
     include_globs: Vec<String>,
     exclude_globs: Vec<String>,
+    /// 0 means one worker per core; see worker_threads().
+    threads: usize,
 }
 
 /// What a grep walk found.
@@ -532,7 +621,7 @@ fn handle_grep_sync(
     let mut builder = WalkBuilder::new(&root_path);
     builder
         .hidden(!options.hidden)
-        .threads(num_cpus::get().min(8))
+        .threads(worker_threads(options.threads))
         .overrides(overrides);
     if options.no_ignore {
         builder
@@ -833,6 +922,7 @@ async fn serve() -> std::io::Result<()> {
                 no_ignore,
                 include_globs,
                 exclude_globs,
+                threads,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -848,10 +938,13 @@ async fn serve() -> std::io::Result<()> {
                     let files = match get_or_walk_files(
                         &cache,
                         &root,
-                        hidden,
-                        no_ignore,
-                        &include_globs,
-                        &exclude_globs,
+                        &WalkOptions {
+                            hidden,
+                            no_ignore,
+                            include_globs: &include_globs,
+                            exclude_globs: &exclude_globs,
+                            threads,
+                        },
                         &token,
                     )
                     .await
@@ -880,7 +973,7 @@ async fn serve() -> std::io::Result<()> {
                     let max = max.min(5_000);
                     let token_clone = token.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        fuzzy_filter(&files, &query, max, &token_clone)
+                        fuzzy_filter(&files, &query, max, threads, &token_clone)
                     })
                     .await;
                     let (items, total) = match result {
@@ -934,6 +1027,7 @@ async fn serve() -> std::io::Result<()> {
                 include_globs,
                 exclude_globs,
                 stream,
+                threads,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -983,6 +1077,7 @@ async fn serve() -> std::io::Result<()> {
                                 no_ignore,
                                 include_globs,
                                 exclude_globs,
+                                threads,
                             },
                             sink,
                             &token_clone,
@@ -1046,6 +1141,52 @@ mod tests {
         path
     }
 
+    /// Scoring is split across threads, so the merge has to reproduce exactly
+    /// what one thread would have produced: same survivors, same order, same
+    /// total, same highlight positions.  A chunk boundary in the wrong place,
+    /// or a merge that lets thread completion order leak into the ranking,
+    /// shows up here as a different list.
+    #[test]
+    fn parallel_scoring_ranks_exactly_as_one_thread_would() {
+        // Comfortably more candidates than FUZZY_CHUNK_MIN, so the parallel
+        // path actually splits, with scores that genuinely differ: the query
+        // matches contiguously in some paths and scattered in others.
+        let mut files: Vec<String> = (0..9_000)
+            .map(|n| format!("crates/pkg{n:04}/src/needle_target.rs"))
+            .collect();
+        files.extend((0..3_000).map(|n| format!("vendor/n{n:04}/e/e/d/l/e/other.rs")));
+        files.extend((0..2_000).map(|n| format!("docs/unrelated{n:04}.md")));
+        files.sort();
+
+        let token = CancellationToken::new();
+        let (single, single_total) = fuzzy_filter(&files, "needle", 200, 1, &token).unwrap();
+        for threads in [2, 4, 13] {
+            let (many, total) = fuzzy_filter(&files, "needle", 200, threads, &token).unwrap();
+            assert_eq!(total, single_total, "{threads} threads changed the total");
+            assert_eq!(
+                many.iter().map(|i| &i.path).collect::<Vec<_>>(),
+                single.iter().map(|i| &i.path).collect::<Vec<_>>(),
+                "{threads} threads changed the ranking"
+            );
+            assert_eq!(
+                many.iter().map(|i| &i.indices).collect::<Vec<_>>(),
+                single.iter().map(|i| &i.indices).collect::<Vec<_>>(),
+                "{threads} threads changed the highlight positions"
+            );
+        }
+        assert_eq!(single.len(), 200, "the cap still applies");
+    }
+
+    /// An explicit thread count is honoured, and a nonsensical one cannot turn
+    /// into thousands of threads or none at all.
+    #[test]
+    fn worker_threads_are_clamped() {
+        assert_eq!(worker_threads(1), 1);
+        assert_eq!(worker_threads(7), 7);
+        assert_eq!(worker_threads(usize::MAX), 64);
+        assert!(worker_threads(0) >= 1);
+    }
+
     #[test]
     fn fuzzy_filter_is_ranked_and_deterministic() {
         let files = vec![
@@ -1054,7 +1195,7 @@ mod tests {
             "src/other.rs".to_string(),
         ];
         let token = CancellationToken::new();
-        let (items, total) = fuzzy_filter(&files, "finder", 10, &token).unwrap();
+        let (items, total) = fuzzy_filter(&files, "finder", 10, 0, &token).unwrap();
 
         assert_eq!(total, 2);
         assert_eq!(items.len(), 2);
@@ -1072,7 +1213,7 @@ mod tests {
     #[test]
     fn fuzzy_filter_reports_total_before_truncation() {
         let files = vec!["a.rs".into(), "ab.rs".into(), "abc.rs".into()];
-        let (items, total) = fuzzy_filter(&files, "a", 1, &CancellationToken::new()).unwrap();
+        let (items, total) = fuzzy_filter(&files, "a", 1, 0, &CancellationToken::new()).unwrap();
 
         assert_eq!(items.len(), 1);
         assert_eq!(total, 3);
@@ -1094,6 +1235,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                threads: 0,
             },
             None,
             &CancellationToken::new(),
@@ -1110,6 +1252,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                threads: 0,
             },
             None,
             &CancellationToken::new(),
@@ -1141,6 +1284,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                threads: 0,
             },
             None,
             &CancellationToken::new(),
@@ -1189,6 +1333,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                threads: 0,
             },
             Some(sink),
             &CancellationToken::new(),
@@ -1225,6 +1370,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                threads: 0,
             },
             None,
             &CancellationToken::new(),
@@ -1291,6 +1437,7 @@ mod tests {
                     no_ignore: false,
                     include_globs: Vec::new(),
                     exclude_globs: Vec::new(),
+                    threads: 0,
                 },
                 None,
                 &CancellationToken::new(),
@@ -1351,10 +1498,13 @@ mod tests {
         let files = get_or_walk_files(
             &cache,
             root.to_str().unwrap(),
-            false,
-            false,
-            &include,
-            &exclude,
+            &WalkOptions {
+                hidden: false,
+                no_ignore: false,
+                include_globs: &include,
+                exclude_globs: &exclude,
+                threads: 0,
+            },
             &token,
         )
         .await
@@ -1367,10 +1517,13 @@ mod tests {
         let markdown = get_or_walk_files(
             &cache,
             root.to_str().unwrap(),
-            false,
-            false,
-            &["*.md".to_owned()],
-            &[],
+            &WalkOptions {
+                hidden: false,
+                no_ignore: false,
+                include_globs: &["*.md".to_owned()],
+                exclude_globs: &[],
+                threads: 0,
+            },
             &token,
         )
         .await
@@ -1390,6 +1543,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: include,
                 exclude_globs: exclude,
+                threads: 0,
             },
             None,
             &token,

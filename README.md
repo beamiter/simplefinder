@@ -119,6 +119,7 @@ releases that snapshot; closing the panel clears the entire selection, so
 
 ```vim
 let g:simplefinder_max_results = 200
+let g:simplefinder_threads = 0              " daemon 工作线程数,0 = 每核一个"
 let g:simplefinder_debounce_ms = 50
 let g:simplefinder_panel_width = 50
 let g:simplefinder_position = 'right'       " 'left' 或 'right'
