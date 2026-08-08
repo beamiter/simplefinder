@@ -88,6 +88,22 @@ for s:attempt in range(4)
         \ 'a capped grep returns the same results on every run')
 endfor
 
+" The panel captures keystrokes with one mapping per printable ASCII character
+" and nothing else, so a non-ASCII keystroke matched no mapping and was dropped
+" without a word -- grepping a Chinese identifier from the panel was simply not
+" possible. <C-f> hands the query to the command line, which accepts anything.
+SimpleFinderIGrep needle
+call s:Wait()
+call feedkeys("\<C-f>\<C-u>中文 needle\<CR>", 'xt')
+call assert_match('中文 needle', s:Panel(), 'a non-ASCII query reaches the panel')
+
+" Every <C-f> here has to end in <CR>: input() falls through to stdin when the
+" typeahead does not close it, and in -es mode that hangs the suite instead of
+" failing it. Cancelling with <Esc> is therefore left untested on purpose.
+call feedkeys("\<C-f>\<C-u>needle\<CR>", 'xt')
+call s:Wait()
+call assert_notmatch('中文', s:Panel(), 'the edited query replaces the old one')
+
 " Results that arrive while you are in another tab still have to be drawn.
 " PanelRender guarded on win_id2win(), which is tabpage-local and returns 0 for
 " a perfectly live panel that merely sits in another tab, so the results were

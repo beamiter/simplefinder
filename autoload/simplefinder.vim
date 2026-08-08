@@ -683,13 +683,13 @@ def PanelRender()
   endwhile
 
   # Help line
-  var help = " \u23ce open  \u21e5 mark  ^q qf  ^l loclist  ^e preview  esc close"
+  var help = " \u23ce open  \u21e5 mark  ^f edit  ^q qf  ^l loc  ^e preview  esc"
   if s_error !=# '' && !empty(s_items)
     help = ' ! ' .. s_error
   elseif s_mode ==# 'grep' || s_mode ==# 'igrep'
-    help = ' ^r regex  ^a case  ^o hidden  ^g ignores  ^q qf  ^l loc'
+    help = ' ^f edit  ^r regex  ^a case  ^o hidden  ^g ignores  ^q qf  ^l loc'
   elseif s_mode ==# 'buffers'
-    help = " \u23ce open  \u21e5 mark  ^d bdelete  ^q qf  ^l loc  esc close"
+    help = " \u23ce open  \u21e5 mark  ^f edit  ^d bdelete  ^q qf  ^l loc  esc"
   endif
   add(lines, TruncDisplay(help, width))
 
@@ -1014,6 +1014,7 @@ def SetupMappings()
   nnoremap <silent><buffer> <C-q> <ScriptCmd>PanelHandleKey(0, '<lt>C-q>')<CR>
   nnoremap <silent><buffer> <C-l> <ScriptCmd>PanelHandleKey(0, '<lt>C-l>')<CR>
   nnoremap <silent><buffer> <C-d> <ScriptCmd>PanelHandleKey(0, '<lt>C-d>')<CR>
+  nnoremap <silent><buffer> <C-f> <ScriptCmd>PanelHandleKey(0, '<lt>C-f>')<CR>
 
   # Map the complete printable ASCII range, including regex punctuation.
   for code in range(32, 126)
@@ -1060,6 +1061,7 @@ def PanelHandleKey(winid: number, key: string): bool
     '<C-q>': "\<C-q>",
     '<C-l>': "\<C-l>",
     '<C-d>': "\<C-d>",
+    '<C-f>': "\<C-f>",
   }
   if has_key(special_keys, key)
     k = special_keys[key]
@@ -1200,8 +1202,14 @@ def PanelHandleKey(winid: number, key: string): bool
     return true
   endif
 
-  # Printable character
-  if strlen(k) == 1 && char2nr(k) >= 32
+  if k ==# "\<C-f>"
+    EditQueryLine()
+    return true
+  endif
+
+  # Printable text: one keystroke from the <Char-NN> mappings above, or a whole
+  # string handed back by the command-line editor.
+  if k !=# '' && char2nr(k) >= 32
     s_query ..= k
     DebouncedSearch()
     PanelRender()
@@ -1210,6 +1218,41 @@ def PanelHandleKey(winid: number, key: string): bool
 
   # Consume all other keys
   return true
+enddef
+
+# Hand the query to Vim's command line for one edit.
+#
+# The panel reads keystrokes by mapping <Char-32> through <Char-126>, one
+# mapping per character: that is the whole of printable ASCII and nothing else.
+# A non-ASCII keystroke matches no mapping, lands in a nomodifiable nofile
+# buffer in Normal mode and is dropped without a word -- so in a plugin whose
+# own README is written in Chinese there was no way to grep a Chinese
+# identifier from the panel at all.  input() borrows the real command line for
+# one edit, which brings every input method with it, along with the two other
+# things a one-mapping-per-character reader cannot offer: moving about inside
+# the query, and pasting a register with CTRL-R.
+def EditQueryLine()
+  var edited: string
+  try
+    # The dict form of input() carries a cancelreturn, but Vim9's compiled
+    # signature for input() in a 9.1 build only declares the string arguments,
+    # so it is a type error here.  Without it <Esc> and an empty line are
+    # indistinguishable, so treat both as "leave the query alone" -- the panel
+    # already has CTRL-U for clearing it, and silently wiping a query someone
+    # cancelled out of is the worse of the two failure modes.
+    edited = input('> ', s_query)
+  catch /^Vim:Interrupt$/
+    return
+  endtry
+  redraw
+  if edited ==# '' || edited ==# s_query
+    return
+  endif
+  s_query = edited
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  DebouncedSearch()
+  PanelRender()
 enddef
 
 # ─────────────────── Debounced search ───────────────────

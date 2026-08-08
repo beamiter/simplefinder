@@ -158,6 +158,14 @@ Query editing~
   <BS> <C-h>      delete last character
   <C-u>           clear the query
   <C-w>           delete the last word
+  <C-f>           edit the query on Vim's command line
+
+The panel reads keystrokes with one mapping per printable ASCII character, so
+typing into it is limited to ASCII and to appending at the end. <C-f> hands
+the query to the real command line for a single edit and searches again with
+the result. That is how to enter a non-ASCII query, move about inside a query,
+or paste a register with |c_CTRL-R|. Leaving that command line with <Esc>
+keeps the query as it was; use <C-u> in the panel to clear it.
 
 Search options (grep modes)~
   <C-r>           toggle literal text / regex     flag: [txt] / [.*]

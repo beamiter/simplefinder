@@ -82,6 +82,7 @@ xmap      <leader>fg <Plug>(simplefinder-grep-visual)
 | `<C-l>` | 将标记结果(无标记时为全部)导出到启动 split 的 location list |
 | `<C-e>` | 开关预览弹窗 |
 | `<C-u>` / `<C-w>` | 清空查询 / 删除上一个词 |
+| `<C-f>` | 在命令行上编辑查询（非 ASCII 输入、光标移动、`<C-r>` 粘贴寄存器） |
 | `<C-r>` | 在全文搜索中切换纯文本/正则 |
 | `<C-a>` | 循环大小写模式:smart `[sC]` → 忽略 `[aa]` → 敏感 `[Aa]` |
 | `<C-o>` | 切换隐藏文件 |
