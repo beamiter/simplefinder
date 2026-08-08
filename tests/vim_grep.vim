@@ -88,6 +88,19 @@ for s:attempt in range(4)
         \ 'a capped grep returns the same results on every run')
 endfor
 
+" Results that arrive while you are in another tab still have to be drawn.
+" PanelRender guarded on win_id2win(), which is tabpage-local and returns 0 for
+" a perfectly live panel that merely sits in another tab, so the results were
+" stored and never painted: coming back showed a stale `searching…` until the
+" next keypress.
+SimpleFinderIGrep needle
+tabnew
+call s:Wait()
+call assert_notmatch('searching', s:Panel(), 'the panel is drawn from another tab')
+call assert_match('20/192 results', s:Panel(),
+      \ 'results arriving while the panel is off-tab reach the buffer')
+tabclose
+
 call simplefinder#Stop()
 call delete(s:project, 'rf')
 

@@ -541,13 +541,19 @@ def TruncDisplay(str: string, maxwidth: number): string
 enddef
 
 def PanelRender()
-  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0 || s_panel_bufnr < 0
+  # win_id2win() is tabpage-local: it returns 0 for a live panel that simply
+  # lives in another tab.  Guarding on it meant results arriving while you were
+  # elsewhere were stored and never drawn, so coming back showed a stale
+  # `searching…` until the next keypress.  getwininfo() and setbufline() are
+  # both tabpage-agnostic, so there is nothing to skip.
+  var panel_info = s_panel_winid == 0 ? [] : getwininfo(s_panel_winid)
+  if empty(panel_info) || s_panel_bufnr < 0
     return
   endif
   AssignItemIdentities(s_items)
 
-  s_eff_width = winwidth(win_id2win(s_panel_winid))
-  s_eff_height = winheight(win_id2win(s_panel_winid))
+  s_eff_width = panel_info[0].width
+  s_eff_height = panel_info[0].height
   var width = s_eff_width
   var lines: list<string> = []
 
@@ -715,7 +721,10 @@ enddef
 
 # Move the panel cursor onto the selected result row so cursorline tracks it.
 def SyncCursorLine()
-  if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0 || s_panel_bufnr < 0
+  # win_execute() reaches a window in any tabpage, so this must not use the
+  # tabpage-local win_id2win() either — the cursor row has to be right when
+  # the user comes back to the tab, not one repaint later.
+  if s_panel_winid == 0 || empty(getwininfo(s_panel_winid)) || s_panel_bufnr < 0
     return
   endif
   if empty(s_items)

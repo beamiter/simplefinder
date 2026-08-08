@@ -2,6 +2,15 @@
 
 ## Unreleased - 2026-08-05
 
+### 面板在另一个 tab 时也会绘制结果
+
+- `PanelRender()` / `SyncCursorLine()` 用 `win_id2win()` 做存活判定,而它是
+  tabpage 局部的:面板好端端地待在另一个 tab 时它返回 0,于是异步到达的结果
+  只写进状态、从不落到 buffer——切回去看到的是一个停在 `searching…` 的面板,
+  要按一下键才会更新。改用 tabpage 无关的 `getwininfo()`;渲染本身走
+  `setbufline()`,`win_execute()` 也能跨 tab,没有任何需要跳过的理由。
+- `tests/vim_grep.vim` 覆盖:发起搜索后立刻 `tabnew`,面板 buffer 仍须拿到结果。
+
 ### 未命名缓冲区也能导出到 quickfix
 
 - `<C-q>` / `<C-l>` 现在优先使用结果自带的 `bufnr`。此前条目只带 `filename`,
