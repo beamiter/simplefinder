@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-08-05
 
+### 未命名缓冲区也能导出到 quickfix
+
+- `<C-q>` / `<C-l>` 现在优先使用结果自带的 `bufnr`。此前条目只带 `filename`,
+  未命名缓冲区的 `filename` 是空串,`setqflist()` 会生成 `bufnr: 0` 的条目,
+  `:cc` 和列表里的 `<CR>` 都跳不到任何地方。`AcceptItem()` 早就是这么解析的。
+- 冒烟测试覆盖:`:enew` 后 `:SimpleFinderLines` 再 `<C-q>`,导出的条目必须带
+  真实 bufnr 且 `valid`。
+
 ### CI 以 Makefile 为唯一事实来源
 
 - `test` job 改为只跑 `make check`。此前它手抄了 Makefile 的一部分:clippy 从未

@@ -1389,7 +1389,17 @@ def SendToList(location: bool)
 
   var qf: list<dict<any>> = []
   for item in selected
-    var entry: dict<any> = {filename: ResolvePath(item)}
+    # Prefer the buffer number when the source recorded one.  An unnamed
+    # buffer has no path at all, so a filename-only entry becomes bufnr 0 and
+    # neither :cc nor <CR> in the list goes anywhere; AcceptItem already
+    # resolves items this way round for exactly the same reason.
+    var entry: dict<any> = {}
+    var src_bufnr = get(item, 'bufnr', -1)
+    if src_bufnr > 0 && bufexists(src_bufnr)
+      entry.bufnr = src_bufnr
+    else
+      entry.filename = ResolvePath(item)
+    endif
     if get(item, 'lnum', 0) > 0
       entry.lnum = item.lnum
       entry.col = max([1, get(item, 'col', 1)])

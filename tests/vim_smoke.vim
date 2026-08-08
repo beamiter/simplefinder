@@ -128,6 +128,22 @@ call assert_match('source window is in another tab', s:PanelText())
 call feedkeys("\<Esc>", 'xt')
 tabclose
 
+" An unnamed buffer has no path, so a filename-only quickfix entry became
+" {'bufnr': 0} and neither :cc nor <CR> in the list went anywhere. Lines()
+" records the buffer number precisely so that this case can still be exported.
+enew
+call setline(1, ['unnamed alpha', 'unnamed bravo'])
+setlocal nomodified
+let s:unnamed_bufnr = bufnr('%')
+SimpleFinderLines
+call feedkeys("\<C-q>", 'xt')
+let s:unnamed_qf = getqflist()
+call assert_equal(2, len(s:unnamed_qf), 'both lines of the unnamed buffer export')
+call assert_equal(s:unnamed_bufnr, s:unnamed_qf[0].bufnr,
+      \ 'an unnamed buffer exports by buffer number')
+call assert_equal(1, s:unnamed_qf[0].valid, 'the exported entry is jumpable')
+cclose
+
 " Help tags source.
 SimpleFinderHelp
 call assert_true(s:PanelVisible(), 'help panel opens')
