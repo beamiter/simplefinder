@@ -72,6 +72,12 @@ enum Request {
         /// with this daemon keeps getting exactly one reply per request.
         #[serde(default)]
         stream: bool,
+        /// Opt in to sharing the file finder's list of the tree instead of
+        /// walking it again, and to publishing this grep's own walk into it.
+        /// Off by default so an older plugin — which cannot know the list is
+        /// at most CACHE_TTL_SECS old — keeps walking for every request.
+        #[serde(default)]
+        file_cache: bool,
         #[serde(default)]
         threads: usize,
     },
@@ -157,6 +163,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("match_indices", true),
         ("path_globs", true),
         ("stream", true),
+        ("grep_cache", true),
     ])
 }
 
@@ -245,6 +252,65 @@ struct WalkOptions<'a> {
     threads: usize,
 }
 
+/// The cache key for one set of walk options.
+///
+/// Grep now reads and writes the same cache as the file finder, so the key has
+/// to be derived in exactly one place: two callers that disagreed by a field
+/// would share an entry that does not describe the same tree.
+fn walk_cache_key(
+    root_path: &std::path::Path,
+    options: &WalkOptions<'_>,
+) -> Result<String, String> {
+    serde_json::to_string(&(
+        root_path.to_string_lossy(),
+        options.hidden,
+        options.no_ignore,
+        options.include_globs,
+        options.exclude_globs,
+    ))
+    .map_err(|error| format!("could not build file-cache key: {error}"))
+}
+
+/// The cached file list for these walk options, if a fresh one exists.
+///
+/// Never walks.  A caller that misses here does what it did unconditionally
+/// before — walk — so a cold cache costs nothing but the lookup.
+async fn cached_files(
+    cache: &FileCache,
+    root: &str,
+    options: &WalkOptions<'_>,
+) -> Option<Arc<Vec<String>>> {
+    let root_path = validate_root(root).ok()?;
+    let key = walk_cache_key(&root_path, options).ok()?;
+    let map = cache.read().await;
+    let entry = map.get(&key)?;
+    (entry.created.elapsed().as_secs() < CACHE_TTL_SECS).then(|| Arc::clone(&entry.files))
+}
+
+/// Publish a file list produced outside `get_or_walk_files` — a grep walk —
+/// so the next request can skip its own walk.  The caller must have walked the
+/// whole tree with these options; a partial list here is invisible corruption.
+async fn store_files(cache: &FileCache, root: &str, options: &WalkOptions<'_>, files: Vec<String>) {
+    // Both failures mean the root vanished or is unserialisable, which the
+    // grep that produced this list has already reported; there is nothing to
+    // cache and nothing further to say.
+    let Ok(root_path) = validate_root(root) else {
+        return;
+    };
+    let Ok(key) = walk_cache_key(&root_path, options) else {
+        return;
+    };
+    let mut map = cache.write().await;
+    map.insert(
+        key,
+        CacheEntry {
+            files: Arc::new(files),
+            created: Instant::now(),
+        },
+    );
+    prune_cache(&mut map);
+}
+
 async fn get_or_walk_files(
     cache: &FileCache,
     root: &str,
@@ -259,14 +325,7 @@ async fn get_or_walk_files(
         threads,
     } = *options;
     let root_path = validate_root(root)?;
-    let cache_key = serde_json::to_string(&(
-        root_path.to_string_lossy(),
-        hidden,
-        no_ignore,
-        include_globs,
-        exclude_globs,
-    ))
-    .map_err(|error| format!("could not build file-cache key: {error}"))?;
+    let cache_key = walk_cache_key(&root_path, options)?;
     let overrides = build_path_overrides(&root_path, include_globs, exclude_globs)?;
 
     // Check cache first (with TTL)
@@ -548,6 +607,14 @@ struct GrepOutcome {
     /// bound and `items` is whatever the walk had reached, so callers must not
     /// present either as complete.
     total_exact: bool,
+    /// Every file the walk visited, sorted, when — and only when — the walk ran
+    /// to completion.  A grep that had to walk anyway has produced exactly the
+    /// list `get_or_walk_files` would have produced, so handing it back lets
+    /// the caller warm the shared cache and spare the *next* keystroke its
+    /// walk.  `None` after a cached scan (there was no walk) and after a walk
+    /// that stopped early (the list would be a partial tree, which must never
+    /// be cached as if it were whole).
+    walked: Option<Vec<String>>,
 }
 
 /// How many matches a single query may scan before the walk gives up counting.
@@ -576,10 +643,293 @@ const STREAM_INTERVAL: Duration = Duration::from_millis(80);
 /// sink stay non-blocking.
 type GrepSink = Arc<dyn Fn(Vec<GrepItem>, usize, bool) + Send + Sync>;
 
+/// One grep in progress: the shared best-of set, the counters, and the
+/// per-file work itself.
+///
+/// A grep can get its candidate files two ways — by walking the tree, or by
+/// reading the list a recent walk already produced — and what happens *inside*
+/// each file is identical either way.  Keeping that half here means the two
+/// strategies cannot drift apart on ordering, on the scan ceiling, or on when
+/// a streamed batch goes out.
+struct GrepScan {
+    /// Cloned per worker: `grep_searcher` wants an owned matcher and a
+    /// `Searcher` of its own per thread, and cloning a compiled regex is far
+    /// cheaper than compiling it again.
+    matcher: grep_regex::RegexMatcher,
+    /// Worker threads used to append into a shared Vec in walk-completion
+    /// order, and the drain truncated that unordered Vec *before* sorting: the
+    /// 200 results a user saw for a common term were a scheduling-dependent
+    /// subset that differed between two identical queries, and `<C-q>`
+    /// exported whichever one that run happened to produce.  A bounded
+    /// max-heap keeps exactly the `max` smallest items under `GrepItem`'s
+    /// (path, lnum, col) ordering — the same set a full sort-then-truncate
+    /// would have produced — without ever holding more than `max` items.
+    best: std::sync::Mutex<std::collections::BinaryHeap<GrepItem>>,
+    total: AtomicUsize,
+    ceiling_hit: AtomicBool,
+    last_flush: std::sync::Mutex<Instant>,
+    stream: Option<GrepSink>,
+    max_results: usize,
+    ceiling: usize,
+}
+
+impl GrepScan {
+    fn new(
+        matcher: grep_regex::RegexMatcher,
+        max_results: usize,
+        ceiling: usize,
+        stream: Option<GrepSink>,
+    ) -> Self {
+        GrepScan {
+            matcher,
+            best: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+            total: AtomicUsize::new(0),
+            ceiling_hit: AtomicBool::new(false),
+            // Backdated so the very first file with matches paints
+            // immediately; the point of streaming is that a cold scan over a
+            // monorepo shows something in milliseconds rather than after the
+            // last file is read.
+            last_flush: std::sync::Mutex::new(
+                Instant::now()
+                    .checked_sub(STREAM_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            ),
+            stream,
+            max_results,
+            ceiling,
+        }
+    }
+
+    /// True while the scan should keep going.
+    fn running(&self, token: &CancellationToken) -> bool {
+        !token.is_cancelled() && !self.ceiling_hit.load(Ordering::Relaxed)
+    }
+
+    fn matcher_for_worker(&self) -> grep_regex::RegexMatcher {
+        self.matcher.clone()
+    }
+
+    /// Search one file and fold its matches into the best-of set.
+    ///
+    /// `rel` is the path as the panel will show it — relative to the search
+    /// root — which is also the first key of the result ordering, so it has to
+    /// be derived the same way whether it came from a walk or from the cache.
+    fn visit(
+        &self,
+        searcher: &mut grep_searcher::Searcher,
+        matcher: &grep_regex::RegexMatcher,
+        path: &std::path::Path,
+        rel: &str,
+        token: &CancellationToken,
+    ) {
+        let mut local_items: Vec<GrepItem> = Vec::new();
+        let mut local_total: usize = 0;
+        let _ = searcher.search_path(
+            matcher,
+            path,
+            UTF8(|lnum, line| {
+                local_total += 1;
+                // Matches arrive in ascending line order within one file, so
+                // its first `max_results` are the only ones that can survive
+                // the global ordering; the rest are only counted.  Reading on
+                // past that point is what makes `total` honest, and the file
+                // is open either way.
+                if local_items.len() < self.max_results {
+                    let (col, col_end) = matcher
+                        .find(line.as_bytes())
+                        .ok()
+                        .flatten()
+                        .map(|m| (m.start() + 1, m.end() + 1))
+                        .unwrap_or((1, 1));
+                    local_items.push(GrepItem {
+                        path: rel.to_string(),
+                        lnum: lnum as usize,
+                        col,
+                        col_end,
+                        text: truncate_line(line),
+                    });
+                }
+                // One pathological file must not outrun the global ceiling on
+                // its own, so bound this scan too.
+                Ok(local_total < self.ceiling && self.running(token))
+            }),
+        );
+
+        if local_total > 0 {
+            let seen = self.total.fetch_add(local_total, Ordering::Relaxed) + local_total;
+            if seen >= self.ceiling {
+                self.ceiling_hit.store(true, Ordering::Relaxed);
+            }
+        }
+        if local_items.is_empty() {
+            return;
+        }
+
+        {
+            let mut heap = self.best.lock().unwrap();
+            for item in local_items {
+                heap.push(item);
+                if heap.len() > self.max_results {
+                    // BinaryHeap is a max-heap, so this drops the item
+                    // furthest down the (path, lnum, col) order.
+                    heap.pop();
+                }
+            }
+        }
+
+        // Repaint at most every STREAM_INTERVAL.  `last_flush` is taken before
+        // `best` here and never the other way round, so the two locks cannot
+        // deadlock against each other.
+        let Some(sink) = &self.stream else {
+            return;
+        };
+        let snapshot = {
+            let mut last = self.last_flush.lock().unwrap();
+            if last.elapsed() < STREAM_INTERVAL {
+                None
+            } else {
+                *last = Instant::now();
+                Some(self.best.lock().unwrap().clone().into_sorted_vec())
+            }
+        };
+        if let Some(items) = snapshot {
+            sink(
+                items,
+                self.total.load(Ordering::Relaxed),
+                !self.ceiling_hit.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Drain the best-of set into the reply.  `walked` is the caller's to fill
+    /// in: only it knows whether this scan walked anything.
+    fn finish(&self) -> GrepOutcome {
+        let heap = std::mem::take(&mut *self.best.lock().unwrap());
+        GrepOutcome {
+            items: heap.into_sorted_vec(),
+            total: self.total.load(Ordering::Relaxed),
+            total_exact: !self.ceiling_hit.load(Ordering::Relaxed),
+            walked: None,
+        }
+    }
+}
+
+/// Grep by walking the tree, returning every file the walk saw.
+///
+/// The returned list is `None` unless the walk ran to completion: a scan that
+/// a cancelled keystroke or the ceiling cut short has seen only part of the
+/// tree, and caching that as the project's file list would make every later
+/// search blind to the rest of it.
+fn grep_by_walk(
+    scan: &Arc<GrepScan>,
+    root_path: &std::path::Path,
+    options: &GrepOptions,
+    token: &CancellationToken,
+) -> Result<Option<Vec<String>>, String> {
+    let overrides =
+        build_path_overrides(root_path, &options.include_globs, &options.exclude_globs)?;
+    let mut builder = WalkBuilder::new(root_path);
+    builder
+        .hidden(!options.hidden)
+        .threads(worker_threads(options.threads))
+        .overrides(overrides);
+    if options.no_ignore {
+        builder
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
+
+    // A channel rather than a shared Vec behind a mutex: this fires for every
+    // file in the tree, including the great majority with no match at all,
+    // which used to touch no lock whatsoever.
+    let (file_tx, file_rx) = std::sync::mpsc::channel::<String>();
+    builder.build_parallel().run(|| {
+        let matcher = scan.matcher_for_worker();
+        let scan = Arc::clone(scan);
+        let root_path = root_path.to_path_buf();
+        let file_tx = file_tx.clone();
+        let token = token.clone();
+        let mut searcher = new_searcher();
+
+        Box::new(move |entry| {
+            if !scan.running(&token) {
+                return ignore::WalkState::Quit;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let path = entry.path().to_path_buf();
+            let rel = path
+                .strip_prefix(&root_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            scan.visit(&mut searcher, &matcher, &path, &rel, &token);
+            let _ = file_tx.send(rel);
+            ignore::WalkState::Continue
+        })
+    });
+    drop(file_tx);
+
+    let mut walked: Vec<String> = file_rx.into_iter().collect();
+    if !scan.running(token) {
+        return Ok(None);
+    }
+    // Sorted, because this is handed to the same cache the file finder reads
+    // and that list is ordered.
+    walked.sort();
+    Ok(Some(walked))
+}
+
+/// Grep the files a recent walk already found.
+///
+/// Interactive grep sends one request per keystroke, and each of those used to
+/// re-walk the whole tree — re-reading every .gitignore and stat-ing every
+/// directory — before it could read a single file.  When the shared cache
+/// still holds a list built with these exact walk options, the tree is already
+/// known and only the reading is left.
+fn grep_by_list(
+    scan: &GrepScan,
+    root_path: &std::path::Path,
+    files: &[String],
+    threads: usize,
+    token: &CancellationToken,
+) {
+    let workers = worker_threads(threads).min(files.len()).max(1);
+    let chunk = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        for part in files.chunks(chunk) {
+            scope.spawn(move || {
+                let matcher = scan.matcher_for_worker();
+                let mut searcher = new_searcher();
+                for rel in part {
+                    if !scan.running(token) {
+                        return;
+                    }
+                    scan.visit(&mut searcher, &matcher, &root_path.join(rel), rel, token);
+                }
+            });
+        }
+    });
+}
+
+fn new_searcher() -> grep_searcher::Searcher {
+    SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build()
+}
+
 fn handle_grep_sync(
     root: &str,
     pattern: &str,
     options: GrepOptions,
+    cached: Option<Arc<Vec<String>>>,
     stream: Option<GrepSink>,
     token: &CancellationToken,
 ) -> Result<GrepOutcome, String> {
@@ -594,166 +944,23 @@ fn handle_grep_sync(
         .map_err(|e| e.to_string())?;
 
     let root_path = validate_root(root)?;
-    let overrides =
-        build_path_overrides(&root_path, &options.include_globs, &options.exclude_globs)?;
-    // Worker threads used to append into a shared Vec in walk-completion
-    // order, and the drain below truncated that unordered Vec *before*
-    // sorting: the 200 results a user saw for a common term were a
-    // scheduling-dependent subset that differed between two identical
-    // queries, and <C-q> exported whichever one this run happened to
-    // produce.  A bounded max-heap keeps exactly the `max` smallest items
-    // under GrepItem's (path, lnum, col) ordering, which is the same set a
-    // full sort-then-truncate would have produced, without ever holding more
-    // than `max` items in memory.
-    let best: Arc<std::sync::Mutex<std::collections::BinaryHeap<GrepItem>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
-    let total = Arc::new(AtomicUsize::new(0));
-    let ceiling_hit = Arc::new(AtomicBool::new(false));
-    // Backdated so the very first file with matches paints immediately; the
-    // point of streaming is that a cold walk over a monorepo shows something
-    // in milliseconds instead of after the last file is read.
-    let last_flush = Arc::new(std::sync::Mutex::new(
-        Instant::now()
-            .checked_sub(STREAM_INTERVAL)
-            .unwrap_or_else(Instant::now),
-    ));
-
-    let mut builder = WalkBuilder::new(&root_path);
-    builder
-        .hidden(!options.hidden)
-        .threads(worker_threads(options.threads))
-        .overrides(overrides);
-    if options.no_ignore {
-        builder
-            .ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false);
-    }
-    let walker = builder.build_parallel();
     let max_results = options.max.max(1);
     let ceiling = max_results
         .saturating_mul(GREP_SCAN_CEILING_FACTOR)
         .max(GREP_SCAN_CEILING_MIN);
+    let scan = Arc::new(GrepScan::new(matcher, max_results, ceiling, stream));
 
-    walker.run(|| {
-        let matcher = matcher.clone();
-        let root_path = root_path.to_path_buf();
-        let best = Arc::clone(&best);
-        let total = Arc::clone(&total);
-        let ceiling_hit = Arc::clone(&ceiling_hit);
-        let last_flush = Arc::clone(&last_flush);
-        let stream = stream.clone();
-        let token = token.clone();
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .build();
+    let walked = match cached {
+        Some(files) => {
+            grep_by_list(&scan, &root_path, &files, options.threads, token);
+            None
+        }
+        None => grep_by_walk(&scan, &root_path, &options, token)?,
+    };
 
-        Box::new(move |entry| {
-            if token.is_cancelled() || ceiling_hit.load(Ordering::Relaxed) {
-                return ignore::WalkState::Quit;
-            }
-
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path().to_path_buf();
-            let rel = path
-                .strip_prefix(&root_path)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-
-            let mut local_items: Vec<GrepItem> = Vec::new();
-            let mut local_total: usize = 0;
-            let _ = searcher.search_path(
-                &matcher,
-                &path,
-                UTF8(|lnum, line| {
-                    local_total += 1;
-                    // Matches arrive in ascending line order within one file,
-                    // so its first `max_results` are the only ones that can
-                    // survive the global ordering; the rest are only counted.
-                    // Reading on past that point is what makes `total` honest,
-                    // and the file is open either way.
-                    if local_items.len() < max_results {
-                        let (col, col_end) = matcher
-                            .find(line.as_bytes())
-                            .ok()
-                            .flatten()
-                            .map(|m| (m.start() + 1, m.end() + 1))
-                            .unwrap_or((1, 1));
-                        local_items.push(GrepItem {
-                            path: rel.clone(),
-                            lnum: lnum as usize,
-                            col,
-                            col_end,
-                            text: truncate_line(line),
-                        });
-                    }
-                    // One pathological file must not outrun the global ceiling
-                    // on its own, so bound this scan too.
-                    Ok(!token.is_cancelled()
-                        && local_total < ceiling
-                        && !ceiling_hit.load(Ordering::Relaxed))
-                }),
-            );
-
-            if local_total > 0 {
-                let seen = total.fetch_add(local_total, Ordering::Relaxed) + local_total;
-                if seen >= ceiling {
-                    ceiling_hit.store(true, Ordering::Relaxed);
-                }
-            }
-            if !local_items.is_empty() {
-                let mut heap = best.lock().unwrap();
-                for item in local_items {
-                    heap.push(item);
-                    if heap.len() > max_results {
-                        // BinaryHeap is a max-heap, so this drops the item
-                        // furthest down the (path, lnum, col) order.
-                        heap.pop();
-                    }
-                }
-                drop(heap);
-
-                // Repaint at most every STREAM_INTERVAL.  `last_flush` is
-                // taken before `best` here and never the other way round, so
-                // the two locks cannot deadlock against each other.
-                if let Some(sink) = &stream {
-                    let snapshot = {
-                        let mut last = last_flush.lock().unwrap();
-                        if last.elapsed() < STREAM_INTERVAL {
-                            None
-                        } else {
-                            *last = Instant::now();
-                            Some(best.lock().unwrap().clone().into_sorted_vec())
-                        }
-                    };
-                    if let Some(items) = snapshot {
-                        sink(
-                            items,
-                            total.load(Ordering::Relaxed),
-                            !ceiling_hit.load(Ordering::Relaxed),
-                        );
-                    }
-                }
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    let heap = std::mem::take(&mut *best.lock().unwrap());
     Ok(GrepOutcome {
-        items: heap.into_sorted_vec(),
-        total: total.load(Ordering::Relaxed),
-        total_exact: !ceiling_hit.load(Ordering::Relaxed),
+        walked,
+        ..scan.finish()
     })
 }
 
@@ -1027,10 +1234,12 @@ async fn serve() -> std::io::Result<()> {
                 include_globs,
                 exclude_globs,
                 stream,
+                file_cache: use_file_cache,
                 threads,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
+                let cache = file_cache.clone();
                 let token = CancellationToken::new();
                 {
                     let mut map = cancels.write().await;
@@ -1065,6 +1274,24 @@ async fn serve() -> std::io::Result<()> {
                             },
                         ) as GrepSink
                     });
+                    // Interactive grep sends one request per keystroke and each
+                    // used to re-walk the tree before reading a single file.
+                    // The walk options are the file finder's, so a warm entry
+                    // here is the same list a `files` request would serve.
+                    let walk_options = WalkOptions {
+                        hidden,
+                        no_ignore,
+                        include_globs: &include_globs,
+                        exclude_globs: &exclude_globs,
+                        threads,
+                    };
+                    let cached = if use_file_cache {
+                        cached_files(&cache, &root, &walk_options).await
+                    } else {
+                        None
+                    };
+                    let root_for_cache = root.clone();
+                    let globs_for_cache = (include_globs.clone(), exclude_globs.clone());
                     let result = tokio::task::spawn_blocking(move || {
                         handle_grep_sync(
                             &root,
@@ -1079,6 +1306,7 @@ async fn serve() -> std::io::Result<()> {
                                 exclude_globs,
                                 threads,
                             },
+                            cached,
                             sink,
                             &token_clone,
                         )
@@ -1086,7 +1314,29 @@ async fn serve() -> std::io::Result<()> {
                     .await;
 
                     match result {
-                        Ok(Ok(outcome)) => {
+                        Ok(Ok(mut outcome)) => {
+                            // A grep that had to walk has produced exactly the
+                            // list the file finder walks for, so publish it and
+                            // spare the next keystroke its own walk.  `walked`
+                            // is None unless the walk ran to completion.
+                            if let Some(walked) = outcome.walked.take()
+                                && use_file_cache
+                            {
+                                let (include_globs, exclude_globs) = globs_for_cache;
+                                store_files(
+                                    &cache,
+                                    &root_for_cache,
+                                    &WalkOptions {
+                                        hidden,
+                                        no_ignore,
+                                        include_globs: &include_globs,
+                                        exclude_globs: &exclude_globs,
+                                        threads,
+                                    },
+                                    walked,
+                                )
+                                .await;
+                            }
                             let capped = outcome.total > outcome.items.len();
                             send_event(
                                 &tx,
@@ -1238,6 +1488,7 @@ mod tests {
                 threads: 0,
             },
             None,
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1254,6 +1505,7 @@ mod tests {
                 exclude_globs: Vec::new(),
                 threads: 0,
             },
+            None,
             None,
             &CancellationToken::new(),
         )
@@ -1286,6 +1538,7 @@ mod tests {
                 exclude_globs: Vec::new(),
                 threads: 0,
             },
+            None,
             None,
             &CancellationToken::new(),
         )
@@ -1335,6 +1588,7 @@ mod tests {
                 exclude_globs: Vec::new(),
                 threads: 0,
             },
+            None,
             Some(sink),
             &CancellationToken::new(),
         )
@@ -1372,6 +1626,7 @@ mod tests {
                 exclude_globs: Vec::new(),
                 threads: 0,
             },
+            None,
             None,
             &CancellationToken::new(),
         )
@@ -1440,6 +1695,7 @@ mod tests {
                     threads: 0,
                 },
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .unwrap()
@@ -1478,6 +1734,178 @@ mod tests {
             );
             assert_eq!(again.total, first.total);
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn grep_options(max: usize) -> GrepOptions {
+        GrepOptions {
+            is_regex: false,
+            ignore_case: false,
+            max,
+            hidden: false,
+            no_ignore: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            threads: 0,
+        }
+    }
+
+    /// Interactive grep sends a request per keystroke, and each one used to
+    /// re-walk the tree.  A grep that walks now hands its file list back so the
+    /// next one can skip the walk — which is only sound if that list is
+    /// *exactly* what the file finder would have cached itself.
+    #[tokio::test]
+    async fn a_walking_grep_publishes_the_list_the_file_finder_would_have() {
+        let root = temp_project();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/one.txt"), "needle\n").unwrap();
+        fs::write(root.join("src/two.txt"), "nothing\n").unwrap();
+        fs::write(root.join("three.txt"), "needle\n").unwrap();
+
+        let outcome = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            grep_options(20),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
+        let options = WalkOptions {
+            hidden: false,
+            no_ignore: false,
+            include_globs: &[],
+            exclude_globs: &[],
+            threads: 0,
+        };
+        let walked = get_or_walk_files(
+            &cache,
+            root.to_str().unwrap(),
+            &options,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            outcome.walked.as_deref(),
+            Some(walked.as_slice()),
+            "a completed grep walk yields the file finder's list, sorted"
+        );
+
+        // And it really does land in the cache the next request reads.
+        assert!(
+            cached_files(&cache, root.to_str().unwrap(), &options)
+                .await
+                .is_some()
+        );
+        store_files(
+            &cache,
+            root.to_str().unwrap(),
+            &options,
+            outcome.walked.unwrap(),
+        )
+        .await;
+        assert_eq!(
+            cached_files(&cache, root.to_str().unwrap(), &options)
+                .await
+                .unwrap()
+                .as_ref(),
+            walked.as_ref()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The cached list is the whole candidate set: a file missing from it is
+    /// not searched, which is what proves the walk was skipped rather than
+    /// merely made redundant.
+    #[test]
+    fn a_cached_grep_reads_the_list_instead_of_the_tree() {
+        let root = temp_project();
+        fs::write(root.join("a.txt"), "needle\n").unwrap();
+        fs::write(root.join("b.txt"), "needle\n").unwrap();
+
+        let walked = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            grep_options(20),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(walked.total, 2, "the walk sees both files");
+
+        let from_full_list = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            grep_options(20),
+            Some(Arc::new(vec!["a.txt".to_owned(), "b.txt".to_owned()])),
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&from_full_list.items).unwrap(),
+            serde_json::to_string(&walked.items).unwrap(),
+            "the same files produce the same results whichever way they were found"
+        );
+        assert_eq!(from_full_list.total, walked.total);
+        assert!(
+            from_full_list.walked.is_none(),
+            "a cached grep walked nothing and must not claim to have"
+        );
+
+        let partial = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            grep_options(20),
+            Some(Arc::new(vec!["a.txt".to_owned()])),
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            partial.items.len(),
+            1,
+            "only the listed file is searched — the tree is never consulted"
+        );
+        assert_eq!(partial.items[0].path, "a.txt");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A walk the scan ceiling cut short has seen part of the tree.  Caching
+    /// that as the project's file list would make every later search blind to
+    /// the rest of it, so it must not be published.
+    #[test]
+    fn a_truncated_walk_publishes_nothing() {
+        let root = temp_project();
+        let flood: String =
+            std::iter::repeat_n("needle\n", GREP_SCAN_CEILING_MIN + 2_000).collect();
+        fs::write(root.join("flood.txt"), flood).unwrap();
+        fs::write(root.join("quiet.txt"), "nothing\n").unwrap();
+
+        let outcome = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            grep_options(1),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(!outcome.total_exact, "the ceiling stopped this scan");
+        assert!(
+            outcome.walked.is_none(),
+            "a partial tree must never be cached as the whole one"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1545,6 +1973,7 @@ mod tests {
                 exclude_globs: exclude,
                 threads: 0,
             },
+            None,
             None,
             &token,
         )

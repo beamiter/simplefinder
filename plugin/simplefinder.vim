@@ -13,8 +13,11 @@ g:simplefinder_daemon_path = get(g:, 'simplefinder_daemon_path', '')
 g:simplefinder_max_results = get(g:, 'simplefinder_max_results', 200)
 # Daemon worker threads for the file walk and fuzzy scoring; 0 = one per core.
 g:simplefinder_threads = get(g:, 'simplefinder_threads', 0)
-# Daemon worker threads for the file walk and fuzzy scoring; 0 = one per core.
-g:simplefinder_threads = get(g:, 'simplefinder_threads', 0)
+# Let grep reuse the file list a recent walk already produced instead of
+# walking the tree again for every keystroke.  Set to 0 to walk every time, if
+# you create files while a grep panel is open and want them searched at once
+# rather than when the list expires.
+g:simplefinder_grep_cache = get(g:, 'simplefinder_grep_cache', 1)
 g:simplefinder_debounce_ms = get(g:, 'simplefinder_debounce_ms', 50)
 g:simplefinder_panel_width = get(g:, 'simplefinder_panel_width', 50)
 g:simplefinder_recent_files_max = get(g:, 'simplefinder_recent_files_max', 100)

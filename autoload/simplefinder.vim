@@ -1768,6 +1768,21 @@ def RequestThreads(): number
   return type(value) == v:t_number && value > 0 ? value : 0
 enddef
 
+# Whether this grep may share the file finder's picture of the tree.
+#
+# Interactive grep sends a request per keystroke and each one re-walked the
+# whole project — every .gitignore re-read, every directory stat-ed again —
+# before a single file could be searched.  The daemon already keeps that list
+# for the file finder, so grep can read it instead, and publish its own walk
+# into it when it does have to walk.  The list is at most 30 seconds old, which
+# is the trade: a file created mid-session is not searched until it expires.
+# Off by default on the wire, so a daemon that never heard of the field cannot
+# be assumed to honour it.
+def RequestFileCache(): bool
+  return get(g:, 'simplefinder_grep_cache', 1) != 0
+    && simplefinder#core#HasCap('grep_cache')
+enddef
+
 def SendFilesRequest(query: string)
   if !PathGlobsReady()
     return
@@ -1855,6 +1870,7 @@ def SendGrepRequest(pattern: string)
     # predates streaming on its single-reply path instead of relying on it to
     # ignore a field it has never heard of.
     stream: simplefinder#core#HasCap('stream'),
+    file_cache: RequestFileCache(),
     threads: RequestThreads(),
   })
 enddef
@@ -2431,8 +2447,10 @@ def SendSymbolRequest(query: string)
     include_globs: s_include_globs,
     exclude_globs: s_exclude_globs,
     # A symbol search is a grep over the whole project, so it benefits from
-    # partial batches exactly as much as one the user typed.
+    # partial batches — and from not re-walking the tree — exactly as much as
+    # one the user typed.
     stream: simplefinder#core#HasCap('stream'),
+    file_cache: RequestFileCache(),
     threads: RequestThreads(),
   })
 enddef

@@ -15,7 +15,8 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 - `:SimpleFinderResume` 恢复上次搜索（模式、查询、选项）
 - 遵循 `.gitignore`，并可即时切换隐藏文件和忽略规则
 - 原生 include/exclude 路径 glob，同时约束文件、全文和符号搜索
-- 文件列表缓存、请求防抖和旧请求取消
+- 文件列表缓存、请求防抖和旧请求取消；全文搜索也读这份列表，不再为每次按键
+  重新遍历整棵目录树（`g:simplefinder_grep_cache = 0` 可关闭）
 - 文件、最近文件、缓冲区、光标词和可视选择搜索
 - 编辑、水平/垂直分屏和新标签页打开；缓冲区模式可直接关闭 buffer
 - 清晰的加载、错误、耗时、结果上限和空状态反馈
@@ -120,6 +121,7 @@ releases that snapshot; closing the panel clears the entire selection, so
 ```vim
 let g:simplefinder_max_results = 200
 let g:simplefinder_threads = 0              " daemon 工作线程数,0 = 每核一个"
+let g:simplefinder_grep_cache = 1           " grep 复用最近一次遍历出的文件列表
 let g:simplefinder_debounce_ms = 50
 let g:simplefinder_panel_width = 50
 let g:simplefinder_position = 'right'       " 'left' 或 'right'

@@ -33,6 +33,15 @@ negotiated (protocol v4, `stream` capability), so a daemon built before this
 version keeps replying once per search. |:SimpleFinderFiles| does not stream:
 its ranking needs the whole file list before anything can be ordered.
 
+Grep does not walk the tree for every keystroke. The daemon keeps the file list
+it built for |:SimpleFinderFiles| for 30 seconds, and a grep whose filters match
+that list reads it instead of walking again — no directory stat-ed twice, no
+ignore file re-read — while a grep that does have to walk publishes its own list
+so the next keystroke can skip it. The trade is that a file created while a
+panel is open is not searched until the list expires; set
+|g:simplefinder_grep_cache| to 0 to walk every time. This is negotiated too
+(`grep_cache` capability), so an older daemon keeps walking.
+
 The first search of a session is the one that starts the daemon, so it is
 raised before that negotiation has finished. It waits for the handshake (up to
 two seconds) and then goes out knowing what the daemon can do, instead of
@@ -252,6 +261,7 @@ Set before the plugin loads; defaults shown. >
 
   g:simplefinder_max_results = 200       max results per query
   g:simplefinder_threads = 0             daemon worker threads (0 = per core)
+  g:simplefinder_grep_cache = 1          grep reuses a recent file walk
   g:simplefinder_debounce_ms = 50        input debounce
   g:simplefinder_panel_width = 50        panel width in columns
   g:simplefinder_position = 'right'      'left' or 'right'
@@ -318,6 +328,25 @@ g:simplefinder_threads
 	previously pinned at min(cores, 8), which left most of a large machine
 	idle on the keystroke path. Lower it to leave cores for something else;
 	values above 64 are clamped.
+
+					   *g:simplefinder_grep_cache*
+g:simplefinder_grep_cache
+	Whether grep may reuse the file list a recent walk produced instead of
+	walking the tree itself. Default 1.
+
+	Interactive grep sends one request per keystroke, and each of those
+	re-walked the whole project -- every ignore file re-read, every
+	directory stat-ed again -- before it could read a single file. The
+	daemon already keeps that list for |:SimpleFinderFiles|, keyed on the
+	same root, hidden/ignore toggles and path globs, so a grep with the same
+	filters can read it; a grep that does have to walk publishes its own
+	list in turn, and a walk cut short by cancellation or by the scan
+	ceiling publishes nothing, since a partial tree must never be cached as
+	a whole one.
+
+	The list is at most 30 seconds old, so a file created while a panel is
+	open is not searched until it expires. Set this to 0 to walk for every
+	request, as versions before 0.5.0 always did.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs

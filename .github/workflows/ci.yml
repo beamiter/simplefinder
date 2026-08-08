@@ -53,3 +53,4 @@ jobs:
           grep -F '"protocol_version":4' <<<"$response"
           grep -F '"path_globs":true' <<<"$response"
           grep -F '"stream":true' <<<"$response"
+          grep -F '"grep_cache":true' <<<"$response"
