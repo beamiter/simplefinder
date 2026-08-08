@@ -2,6 +2,15 @@
 
 ## Unreleased - 2026-08-05
 
+### CI 以 Makefile 为唯一事实来源
+
+- `test` job 改为只跑 `make check`。此前它手抄了 Makefile 的一部分:clippy 从未
+  在 CI 里跑过,而几个 Vim 测试排在"安装 Vim"这一步之前。
+- MSRV job 的工具链版本改为从 `Cargo.toml` 的 `rust-version` 读取,不再手写。
+  本套件里有六个仓库把 pin 写成 1.85.0 而 `Cargo.toml` 声明 1.88,`cargo check
+  --locked` 对更高的 rust-version 是硬错误,于是每次 push 都红——注释要求"保持
+  同步"并不是一道检查。
+
 ### grep 结果流式返回
 
 - 协议里的 `done` 字段从第一版起就存在,却从来没有被置为 false:每个请求只产生

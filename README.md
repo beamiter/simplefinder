@@ -151,12 +151,11 @@ let g:simplefinder_exclude_globs = ['*.generated.rs', 'fixtures/**']
 ## 开发与验证
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo build
-vim -Nu NONE -i NONE -n -es -S tests/vim_smoke.vim
-vim -Nu NONE -i NONE -n -es -S tests/vim_symbols.vim
-vim -Nu NONE -i NONE -n -es -S tests/vim_globs.vim
+make check
 ```
+
+`make check` 是唯一的门禁，CI 也只跑它：`core-verify`(校验 vendored simplecore
+的 sha256)、`fmt`、`clippy`、`cargo test`、`defcompile`(强制编译每个 Vim9 def,
+否则冷分支里的类型错误要等用户走到才暴露)，以及全部 Vim 端测试。
 
 Vim 与后端通过标准输入/输出上的一行一个 JSON 消息通信。每次查询都有独立 ID；新查询会取消旧任务，过期结果不会写入当前面板。

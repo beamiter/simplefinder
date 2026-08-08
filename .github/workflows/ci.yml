@@ -10,36 +10,42 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.
+  #
+  # The toolchain is read out of Cargo.toml rather than written here.  Six
+  # repos in this suite pinned 1.85.0 against a declared 1.88 and were red on
+  # every push for weeks, because `cargo check --locked` treats a higher
+  # rust-version as a hard error and a comment asking for the two to be kept in
+  # step is not a check.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - id: rust-version
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$msrv" || { echo "Cargo.toml declares no rust-version"; exit 1; }
+          echo "msrv=$msrv" >>"$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.msrv }}
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
+
+  # `make check` and nothing else: the Makefile is the single source of truth
+  # for what has to pass.  This job used to hand-list a subset of it, which
+  # meant clippy never ran in CI at all and the Vim tests ran before the step
+  # that installs Vim.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --check
-      - run: cargo test --locked
-      - run: cargo build --locked
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_smoke.vim
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_symbols.vim
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_globs.vim
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_visual.vim
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_grep.vim
-      - run: vim -Nu NONE -i NONE -n -es -S tests/vim_stream.vim
+          components: rustfmt, clippy
       - name: Install Vim
         run: sudo apt-get update && sudo apt-get install --yes vim
-      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
-        run: make defcompile
-      - name: simplecore supervisor regression suite
-        run: make vim-core
+      - run: make check
       - name: Verify the daemon capability handshake
         run: |
           response="$(printf '%s\n' '{"type":"ping","id":1}' | ./target/debug/simplefinder-daemon)"
