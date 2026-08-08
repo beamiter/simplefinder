@@ -35,6 +35,7 @@ var s_error: string = ''
 var s_elapsed_ms: number = 0
 var s_capped: bool = false
 var s_total_exact: bool = true  # false once the daemon stopped counting matches
+var s_stream_id: number = 0     # request whose partial batches are on screen
 var s_regex: bool = false
 var s_case_mode: string = 'smart'   # 'smart' | 'ignore' | 'sensitive'
 var s_hidden: bool = false
@@ -219,6 +220,17 @@ def OnFilesResult(ev: dict<any>)
 enddef
 
 def OnGrepResult(ev: dict<any>)
+  var id = get(ev, 'id', 0)
+  # A streaming daemon repaints the same request several times, each batch a
+  # refined snapshot rather than an append.  The first batch of a request is a
+  # new result set and belongs at the top; a later one must not yank the
+  # viewport, so the row under the cursor is followed by its stable identity —
+  # a match found late can sort in above it and shift every index below.
+  var anchor = ''
+  if id != 0 && id == s_stream_id && s_cursor_idx < len(s_items)
+    anchor = ItemIdentity(s_items[s_cursor_idx])
+  endif
+
   s_items = []
   for item in get(ev, 'items', [])
     add(s_items, {
@@ -236,11 +248,24 @@ def OnGrepResult(ev: dict<any>)
   # true cannot turn a lower bound into a claimed exact count.
   s_total_exact = get(ev, 'total_exact', true)
   s_elapsed_ms = get(ev, 'elapsed_ms', 0)
-  s_loading = false
   s_error = ''
-  s_current_id = 0
+
+  # `done` has always been on the wire; until streaming landed it was always
+  # true, so a daemon that does not stream still takes exactly this path once.
+  var done = get(ev, 'done', true)
+  s_loading = !done
+  s_current_id = done ? 0 : id
+  s_stream_id = done ? 0 : id
+
   s_cursor_idx = 0
   s_scroll_off = 0
+  if anchor !=# ''
+    AssignItemIdentities(s_items)
+    var found = indexof(s_items, (_, item) => ItemIdentity(item) ==# anchor)
+    if found >= 0
+      s_cursor_idx = found
+    endif
+  endif
   PanelRender()
 enddef
 
@@ -354,6 +379,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   s_elapsed_ms = 0
   s_capped = false
   s_total_exact = true
+  s_stream_id = 0
   s_marked = {}
   s_marked_items = {}
   s_mark_order = []
@@ -541,7 +567,11 @@ def PanelRender()
   var title = get(mode_names, s_mode, s_mode)
   var count_str = ''
   if s_loading
-    count_str = 'searching…'
+    # A streamed search paints partial results while the walk is still going,
+    # so say how much is on screen as well as that more is coming.
+    count_str = empty(s_items)
+      ? 'searching…'
+      : printf('%d results · searching…', len(s_items))
   elseif s_error !=# ''
     count_str = 'error'
   elseif s_capped && s_total > len(s_items)
@@ -1256,6 +1286,7 @@ def SendGrepRequest(pattern: string)
     s_error = ''
     s_capped = false
     s_total_exact = true
+    s_stream_id = 0
     s_elapsed_ms = 0
     PanelRender()
     return
@@ -1287,6 +1318,10 @@ def SendGrepRequest(pattern: string)
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
     exclude_globs: s_exclude_globs,
+    # Opting in per request rather than unconditionally keeps a daemon that
+    # predates streaming on its single-reply path instead of relying on it to
+    # ignore a field it has never heard of.
+    stream: simplefinder#core#HasCap('stream'),
   })
 enddef
 

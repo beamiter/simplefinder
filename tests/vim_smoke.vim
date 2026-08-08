@@ -166,9 +166,10 @@ while s:tries < 200 && !simplefinder#core#Ready()
   let s:tries += 1
 endwhile
 call assert_true(simplefinder#core#Ready(), 'the daemon completes its handshake')
-call assert_equal(3, simplefinder#core#Protocol(), 'protocol v3 is negotiated')
+call assert_equal(4, simplefinder#core#Protocol(), 'protocol v4 is negotiated')
 call assert_true(simplefinder#core#HasCap('grep'), 'grep capability is advertised')
 call assert_true(simplefinder#core#HasCap('path_globs'), 'path glob capability is advertised')
+call assert_true(simplefinder#core#HasCap('stream'), 'streaming capability is advertised')
 SimpleFinderStop
 sleep 100m
 call assert_false(simplefinder#core#IsRunning(), 'stop really stops the daemon')

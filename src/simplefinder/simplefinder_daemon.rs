@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -62,6 +62,11 @@ enum Request {
         include_globs: Vec<String>,
         #[serde(default)]
         exclude_globs: Vec<String>,
+        /// Opt in to partial `done: false` batches.  The plugin sets it only
+        /// after the handshake advertises `stream`, so an older plugin paired
+        /// with this daemon keeps getting exactly one reply per request.
+        #[serde(default)]
+        stream: bool,
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
@@ -80,8 +85,9 @@ fn default_max() -> usize {
 }
 
 /// Bumped whenever the wire format changes in a way the Vim side must know
-/// about.  v1 was the implicit, un-negotiated format.
-const PROTOCOL_VERSION: u32 = 3;
+/// about.  v1 was the implicit, un-negotiated format.  v4 added streamed grep
+/// batches and the `total_exact` field on `grep_result`.
+const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -127,6 +133,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("cancel", true),
         ("match_indices", true),
         ("path_globs", true),
+        ("stream", true),
     ])
 }
 
@@ -465,10 +472,26 @@ struct GrepOutcome {
 const GREP_SCAN_CEILING_FACTOR: usize = 50;
 const GREP_SCAN_CEILING_MIN: usize = 10_000;
 
+/// Shortest gap between two streamed repaints.  The walk finds matches far
+/// faster than a human can read them, and every batch costs Vim a full panel
+/// render, so batching is what makes streaming cheaper than not streaming.
+const STREAM_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Where a streaming grep sends a partial result: `(items, total, total_exact)`.
+///
+/// Every batch is a *snapshot* of the best results so far, never an append.
+/// The bounded heap can promote a match found late into the middle of the
+/// order, so appending would paint rows in walk order and then reshuffle them
+/// under the user at the end; a snapshot only ever refines.  That is also why
+/// dropping a batch is harmless — the next one supersedes it — which lets the
+/// sink stay non-blocking.
+type GrepSink = Arc<dyn Fn(Vec<GrepItem>, usize, bool) + Send + Sync>;
+
 fn handle_grep_sync(
     root: &str,
     pattern: &str,
     options: GrepOptions,
+    stream: Option<GrepSink>,
     token: &CancellationToken,
 ) -> Result<GrepOutcome, String> {
     let expression = if options.is_regex {
@@ -497,6 +520,14 @@ fn handle_grep_sync(
         Arc::new(std::sync::Mutex::new(std::collections::BinaryHeap::new()));
     let total = Arc::new(AtomicUsize::new(0));
     let ceiling_hit = Arc::new(AtomicBool::new(false));
+    // Backdated so the very first file with matches paints immediately; the
+    // point of streaming is that a cold walk over a monorepo shows something
+    // in milliseconds instead of after the last file is read.
+    let last_flush = Arc::new(std::sync::Mutex::new(
+        Instant::now()
+            .checked_sub(STREAM_INTERVAL)
+            .unwrap_or_else(Instant::now),
+    ));
 
     let mut builder = WalkBuilder::new(&root_path);
     builder
@@ -522,6 +553,8 @@ fn handle_grep_sync(
         let best = Arc::clone(&best);
         let total = Arc::clone(&total);
         let ceiling_hit = Arc::clone(&ceiling_hit);
+        let last_flush = Arc::clone(&last_flush);
+        let stream = stream.clone();
         let token = token.clone();
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -596,6 +629,29 @@ fn handle_grep_sync(
                         // BinaryHeap is a max-heap, so this drops the item
                         // furthest down the (path, lnum, col) order.
                         heap.pop();
+                    }
+                }
+                drop(heap);
+
+                // Repaint at most every STREAM_INTERVAL.  `last_flush` is
+                // taken before `best` here and never the other way round, so
+                // the two locks cannot deadlock against each other.
+                if let Some(sink) = &stream {
+                    let snapshot = {
+                        let mut last = last_flush.lock().unwrap();
+                        if last.elapsed() < STREAM_INTERVAL {
+                            None
+                        } else {
+                            *last = Instant::now();
+                            Some(best.lock().unwrap().clone().into_sorted_vec())
+                        }
+                    };
+                    if let Some(items) = snapshot {
+                        sink(
+                            items,
+                            total.load(Ordering::Relaxed),
+                            !ceiling_hit.load(Ordering::Relaxed),
+                        );
                     }
                 }
             }
@@ -877,6 +933,7 @@ async fn serve() -> std::io::Result<()> {
                 no_ignore,
                 include_globs,
                 exclude_globs,
+                stream,
             } => {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
@@ -890,6 +947,30 @@ async fn serve() -> std::io::Result<()> {
                     let started = Instant::now();
                     let token_clone = token.clone();
                     let max = max.min(5_000);
+                    // Partial batches are best-effort: each one supersedes the
+                    // last, so `try_send` may drop one when Vim is behind
+                    // without losing anything.  Only the final `done: true`
+                    // reply below is sent with backpressure, because it is the
+                    // one the panel is not allowed to miss.
+                    let sink: Option<GrepSink> = stream.then(|| {
+                        let tx = tx.clone();
+                        Arc::new(
+                            move |items: Vec<GrepItem>, total: usize, total_exact: bool| {
+                                let event = Event::GrepResult {
+                                    id,
+                                    done: false,
+                                    total,
+                                    capped: total > items.len(),
+                                    total_exact,
+                                    elapsed_ms: started.elapsed().as_millis(),
+                                    items,
+                                };
+                                if let Ok(line) = serde_json::to_string(&event) {
+                                    let _ = tx.try_send(line);
+                                }
+                            },
+                        ) as GrepSink
+                    });
                     let result = tokio::task::spawn_blocking(move || {
                         handle_grep_sync(
                             &root,
@@ -903,6 +984,7 @@ async fn serve() -> std::io::Result<()> {
                                 include_globs,
                                 exclude_globs,
                             },
+                            sink,
                             &token_clone,
                         )
                     })
@@ -1013,6 +1095,7 @@ mod tests {
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
             },
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1028,6 +1111,7 @@ mod tests {
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
             },
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1058,6 +1142,7 @@ mod tests {
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
             },
+            None,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1066,6 +1151,106 @@ mod tests {
         assert_eq!(items.items[0].path, "long.txt");
         assert!(items.items[0].text.len() <= MAX_LINE_BYTES + '…'.len_utf8());
         assert!(items.items[0].text.ends_with('…'));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The wire format carried a `done` field from the start and nothing ever
+    /// set it to false: every request produced exactly one event, so on a cold
+    /// walk the panel said `Searching…` until the last file had been read.
+    /// A streaming grep has to hand back usable results before the walk ends,
+    /// and each batch has to be a correctly ordered snapshot in its own right
+    /// — otherwise the rows would reshuffle under the user when the final
+    /// batch lands.
+    #[test]
+    fn a_streaming_grep_reports_before_the_walk_finishes() {
+        let root = temp_project();
+        for file in 0..24 {
+            let body: String = (0..8)
+                .map(|line| format!("needle {file} {line}\n"))
+                .collect();
+            fs::write(root.join(format!("file{file:02}.txt")), body).unwrap();
+        }
+
+        let batches: Arc<std::sync::Mutex<Vec<Vec<GrepItem>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector = Arc::clone(&batches);
+        let sink: GrepSink = Arc::new(move |items, _total, _exact| {
+            collector.lock().unwrap().push(items);
+        });
+
+        let outcome = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: false,
+                max: 20,
+                hidden: false,
+                no_ignore: false,
+                include_globs: Vec::new(),
+                exclude_globs: Vec::new(),
+            },
+            Some(sink),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let batches = batches.lock().unwrap();
+        assert!(
+            !batches.is_empty(),
+            "a streaming grep must report at least one partial batch"
+        );
+        for batch in batches.iter() {
+            assert!(!batch.is_empty(), "an empty batch is not worth a repaint");
+            assert!(batch.len() <= 20, "a partial batch still honours the cap");
+            let mut sorted = batch.clone();
+            sorted.sort();
+            assert_eq!(
+                &sorted, batch,
+                "every batch is a correctly ordered snapshot"
+            );
+        }
+        // A batch reports what the walk knew at the time, so a match found
+        // later can sort in above it and displace it entirely — that is what
+        // "refines" means, and why batches replace rather than accumulate.
+        // What they may never contain is a row that is not a real match.
+        let every_match: std::collections::BTreeSet<_> = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            GrepOptions {
+                is_regex: false,
+                ignore_case: false,
+                max: 24 * 8,
+                hidden: false,
+                no_ignore: false,
+                include_globs: Vec::new(),
+                exclude_globs: Vec::new(),
+            },
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .collect();
+        for batch in batches.iter() {
+            for item in batch {
+                assert!(every_match.contains(item), "{item:?} is not a real match");
+            }
+        }
+
+        // At least one batch has to have been sent while results were still
+        // incomplete; otherwise nothing was gained over the old single reply.
+        assert!(
+            batches.iter().any(|batch| batch != &outcome.items),
+            "results must reach the panel before the walk finishes"
+        );
+
+        // Streaming must not change what the search actually found.
+        assert_eq!(outcome.items.len(), 20);
+        assert_eq!(outcome.total, 24 * 8);
+
+        drop(batches);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1107,6 +1292,7 @@ mod tests {
                     include_globs: Vec::new(),
                     exclude_globs: Vec::new(),
                 },
+                None,
                 &CancellationToken::new(),
             )
             .unwrap()
@@ -1205,6 +1391,7 @@ mod tests {
                 include_globs: include,
                 exclude_globs: exclude,
             },
+            None,
             &token,
         )
         .unwrap();
