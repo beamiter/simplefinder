@@ -31,7 +31,9 @@ Any other pattern answers once with no results, so a stray request cannot hang
 the test waiting for a gate that will never open.
 
 Environment
-  FAKE_GATE  path prefix; batch K waits for <prefix>.K before it is sent
+  FAKE_GATE       path prefix; batch K waits for <prefix>.K before it is sent
+  FAKE_NO_STREAM  when set, the pong omits the `stream` capability, which is
+                  how a daemon built before streaming looks on the wire
 """
 
 import json
@@ -102,20 +104,23 @@ def main():
 
         kind = req.get("type")
         if kind == "ping":
+            caps = {
+                "files": True,
+                "grep": True,
+                "cancel": True,
+                "match_indices": True,
+                "path_globs": True,
+                "stream": True,
+            }
+            if os.environ.get("FAKE_NO_STREAM"):
+                del caps["stream"]
             emit(
                 {
                     "type": "pong",
                     "id": req.get("id", 0),
                     "protocol_version": 4,
                     "version": "fake",
-                    "capabilities": {
-                        "files": True,
-                        "grep": True,
-                        "cancel": True,
-                        "match_indices": True,
-                        "path_globs": True,
-                        "stream": True,
-                    },
+                    "capabilities": caps,
                 }
             )
         elif kind == "grep":

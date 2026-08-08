@@ -32,6 +32,14 @@ negotiated (protocol v4, `stream` capability), so a daemon built before this
 version keeps replying once per search. |:SimpleFinderFiles| does not stream:
 its ranking needs the whole file list before anything can be ordered.
 
+The first search of a session is the one that starts the daemon, so it is
+raised before that negotiation has finished. It waits for the handshake (up to
+two seconds) and then goes out knowing what the daemon can do, instead of
+asking for the lowest common denominator on the one search guaranteed to be
+slow — nothing is cached yet. The same applies after |:SimpleFinderRestart| and
+after a crash restart. A daemon that never answers still gets the search, which
+then behaves as it did before streaming existed.
+
 Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 |+popupwin|. Run ./install.sh once to compile the daemon (Rust 1.88+).
 

@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-05
 
+### 会话里的第一次搜索也会流式返回
+
+- `EnsureBackend()` 只负责**启动**进程:ping 还在路上、pong 没回来,
+  `HasCap('stream')` 自然是 false,于是请求带着 `stream: false` 发出去——偏偏
+  这一次搜索是最慢的一次(什么缓存都还没有)。而 `:SimpleFinderGrep`、
+  `:SimpleFinderGrepWord`、`:SimpleFinderGrepVisual` 都是一次性命令,之后没有
+  任何东西会重发,所以帮助里承诺的流式在会话的第一次搜索上从来没兑现过;
+  `:SimpleFinderRestart` 之后、崩溃重启之后同样如此。
+- 握手未完成时发起的搜索现在挂起等待 pong,拿到能力后再按面板的当前状态重新
+  派发(mode/query 都从面板读,期间关掉面板就不再发)。等待有 2 秒上限:一个
+  永远不回应握手的 daemon 仍然会收到请求,只是退回旧的单次应答行为。
+- `:SimpleFinderSymbols` 也带上 `stream` 字段——它本来就是一次全项目 grep。
+- `tests/vim_stream.vim`:会话的第一条 grep 命令(daemon 尚未启动)必须逐批
+  上屏。此前那条 "未协商的请求只应答一次" 的断言用的 pattern 根本没有批次
+  序列,假 daemon 无论 `stream` 是 true 还是 false 都只回一次,是一个**不可能
+  失败的测试**。改由 `FAKE_NO_STREAM` 让假 daemon 不声明 `stream` 能力,真正
+  覆盖旧 daemon 的降级路径。
+
 ### `<C-f>`:在命令行上编辑查询
 
 - 面板用 `<Char-32>`..`<Char-126>` 逐个字符建映射来收键,也就是只覆盖可打印

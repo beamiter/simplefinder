@@ -82,7 +82,79 @@ def SetupCore()
     handshake: {request: {type: 'ping'}, reply_type: 'pong'},
     OnEvent: OnDaemonEvent,
     OnExit: OnDaemonExit,
+    OnStart: OnDaemonStart,
+    OnReady: OnDaemonReady,
   })
+enddef
+
+# ─────────────────── Waiting for the handshake ───────────────────
+#
+# EnsureBackend() only *starts* the daemon: the ping is on the wire and the
+# pong has not come back, so simplefinder#core#HasCap() answers false for
+# everything.  A request built in that window has to ask for the lowest common
+# denominator — which meant the first grep of a session, of a restart, and of
+# every crash-recovery went out with stream:false and came back in one lump.
+# That is exactly the search most likely to be slow (nothing is cached yet),
+# and :SimpleFinderGrep, GrepWord and GrepVisual are one-shot, so nothing ever
+# re-sent them: the help promised streaming that the first search never did.
+#
+# Requests raised before the pong therefore wait for it and are re-dispatched
+# from the panel's live state once capabilities are known.  The wait is
+# bounded: a daemon that never answers still gets its request, un-negotiated
+# and degraded exactly as before, rather than leaving the panel on `searching…`
+# for good.
+const NEGOTIATE_BUDGET_MS: number = 2000
+
+var s_negotiated: bool = false      # capabilities known, or given up on
+var s_negotiate_timer: number = 0
+var s_deferred: bool = false        # a search is waiting for the handshake
+
+def OnDaemonStart()
+  # A restart renegotiates: the new process may be a different build.
+  s_negotiated = false
+  if s_negotiate_timer > 0
+    timer_stop(s_negotiate_timer)
+  endif
+  s_negotiate_timer = timer_start(NEGOTIATE_BUDGET_MS, (_) => {
+    s_negotiate_timer = 0
+    FinishNegotiation()
+  })
+enddef
+
+def OnDaemonReady(protocol: number, caps: dict<any>)
+  FinishNegotiation()
+enddef
+
+def FinishNegotiation()
+  if s_negotiate_timer > 0
+    timer_stop(s_negotiate_timer)
+    s_negotiate_timer = 0
+  endif
+  s_negotiated = true
+  if !s_deferred
+    return
+  endif
+  s_deferred = false
+  # The panel may have been closed, or moved to another source, while the ping
+  # was in flight.  DispatchSearch() reads the live panel state, so the only
+  # thing worth checking is that there is still a panel to fill.
+  if s_panel_winid == 0 || empty(getwininfo(s_panel_winid))
+    s_loading = false
+    return
+  endif
+  DispatchSearch()
+enddef
+
+# True when the caller must hold this request back; the flush above re-runs it.
+def AwaitNegotiation(): bool
+  if s_negotiated
+    return false
+  endif
+  s_deferred = true
+  s_loading = true
+  s_error = ''
+  PanelRender()
+  return true
 enddef
 
 def EnsureBackend(): bool
@@ -1309,6 +1381,9 @@ def SendFilesRequest(query: string)
   if !EnsureBackend()
     return
   endif
+  if AwaitNegotiation()
+    return
+  endif
   # Cancel previous
   if s_current_id > 0
     Send({type: 'cancel', id: s_current_id})
@@ -1352,6 +1427,9 @@ def SendGrepRequest(pattern: string)
     return
   endif
   if !EnsureBackend()
+    return
+  endif
+  if AwaitNegotiation()
     return
   endif
   # Cancel previous
@@ -1920,6 +1998,9 @@ def SendSymbolRequest(query: string)
   if !EnsureBackend()
     return
   endif
+  if AwaitNegotiation()
+    return
+  endif
   if s_current_id > 0
     Send({type: 'cancel', id: s_current_id})
   endif
@@ -1944,6 +2025,9 @@ def SendSymbolRequest(query: string)
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
     exclude_globs: s_exclude_globs,
+    # A symbol search is a grep over the whole project, so it benefits from
+    # partial batches exactly as much as one the user typed.
+    stream: simplefinder#core#HasCap('stream'),
   })
 enddef
 

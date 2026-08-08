@@ -92,19 +92,20 @@ function! s:Release(index, Cond, label) abort
   return s:WaitFor(a:Cond, a:label)
 endfunction
 
-" A request sent before the handshake lands cannot know whether the daemon
-" streams, so it must not ask for it -- and the daemon must answer it in one
-" shot.  That is also the path an older daemon always takes.
-SimpleFinderIGrep warmup
-call s:WaitFor({-> s:Panel() !~# 'searching'}, 'the un-negotiated request gets one reply')
-call assert_equal(4, simplefinder#core#Protocol(), 'protocol v4 is negotiated')
-call assert_true(simplefinder#core#HasCap('stream'), 'the stream capability is advertised')
-
+" The very first search of the session, with the daemon not yet started, has to
+" stream too.  EnsureBackend() only *starts* the process: the ping is on the
+" wire and the pong is not back, so HasCap('stream') was false and the request
+" went out asking for a single reply -- on the one search guaranteed to be slow,
+" because nothing is cached yet.  :SimpleFinderGrep, GrepWord and GrepVisual are
+" one-shot, so nothing re-sent them afterwards either.  A request raised before
+" the handshake now waits for it.
 SimpleFinderIGrep needle
 
 " First paint: results are on screen while the search is still running. Before
 " streaming, this state did not exist -- the panel was empty until the end.
 call s:Release(1, {-> s:Panel() =~# 'b\.txt'}, 'the first batch paints')
+call assert_equal(4, simplefinder#core#Protocol(), 'protocol v4 is negotiated')
+call assert_true(simplefinder#core#HasCap('stream'), 'the stream capability is advertised')
 call assert_match('2 results · searching…', s:Panel(),
       \ 'a partial result says how much is on screen and that more is coming')
 
@@ -153,6 +154,22 @@ call assert_equal('f08.txt', s:TopFile(),
 call assert_equal(11, s:CursorBufline(),
       \ 'the selected row keeps its place in the viewport')
 call assert_match('41 results', s:Panel(), 'the final viewport batch is applied in full')
+
+" A daemon that predates streaming must still be driven single-shot: waiting
+" for the handshake is what makes that decision, so it has to survive a restart
+" onto a different build as well as a cold start.  The search below is issued
+" while the new process is still handshaking.
+let $FAKE_NO_STREAM = 1
+SimpleFinderRestart
+call s:WaitFor({-> !simplefinder#core#IsRunning()}, 'the streaming daemon exits')
+" The search itself starts the replacement, so it is again issued while the
+" handshake is in flight.
+SimpleFinderIGrep needle
+call s:WaitFor({-> s:Panel() !~# 'searching'}, 'the un-negotiated daemon answers')
+call assert_false(simplefinder#core#HasCap('stream'),
+      \ 'the restarted daemon advertises no streaming')
+call assert_match('0 results', s:Panel(),
+      \ 'a daemon without the stream capability takes the single-reply path')
 
 call simplefinder#Stop()
 for s:n in range(1, 5)
