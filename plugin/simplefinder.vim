@@ -26,6 +26,10 @@ g:simplefinder_regex = get(g:, 'simplefinder_regex', 0)
 g:simplefinder_ignore_case = get(g:, 'simplefinder_ignore_case', 0)
 g:simplefinder_smart_case = get(g:, 'simplefinder_smart_case', 1)
 g:simplefinder_preview = get(g:, 'simplefinder_preview', 1)
+g:simplefinder_preview_syntax = get(g:, 'simplefinder_preview_syntax', 1)
+g:simplefinder_preview_width = get(g:, 'simplefinder_preview_width', 0)
+g:simplefinder_preview_max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+g:simplefinder_preview_cache = get(g:, 'simplefinder_preview_cache', 4)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
 # Native path filters for daemon-backed files, grep, and symbol searches.
 # Includes are positive ignore-style globs; excludes are kept separate so a

@@ -2,6 +2,27 @@
 
 ## Unreleased - 2026-08-05
 
+### 预览弹窗:语法高亮、滚动、读 buffer、带缓存
+
+- 预览此前每次移动光标都 `readfile(path, '', start + height - 1)`,而这是从
+  文件头一路读到目标行:一个在 40000 行文件里靠后的结果,每按一次 `<C-j>` 就
+  重读几万行,在同一个文件的两个结果之间来回还要各付一次。现在整文件读一次再
+  切片,并按 (路径, mtime, 大小) 缓存最近 `g:simplefinder_preview_cache`(默认
+  4)个文件。
+- 文件已经在某个 buffer 里打开时,预览直接读 buffer:`lines` 模式的条目文本本来
+  就来自 `getline()`,此前预览却读磁盘——插入五行未保存的内容之后,高亮的那一行
+  根本不含匹配。buffer 在内存里,因此不受 `g:simplefinder_preview_max_bytes`
+  (默认 2 MiB,取代写死的常量)限制。
+- 预览按 filetype 高亮:已加载 buffer 用它自己的 `&filetype`,否则按扩展名查表
+  (`g:simplefinder_preview_syntax = 0` 关闭)。仅在 filetype 变化时才重设,避免
+  每次移动光标都重新加载语法文件。
+- `<PageDown>` / `<PageUp>` 滚动预览。滚动相对当前匹配,换一个结果就复位。
+- 新增 `g:simplefinder_preview_width`(默认 0 = 用满面板旁边的列)。
+- 路径不再经过 `expand()`:那是个对着文件名跑的通配符/环境变量/`%`、`#` 展开器,
+  文件名不是表达式。改用 `fnamemodify(':p')`,只做 `~` 和相对路径解析。
+- 新增 `tests/vim_preview.vim`:未保存 buffer 的内容、按 filetype 的高亮(已打开
+  与未打开两种来源)、滚动与到底停住、换结果复位、名字里带 `#`/`%` 的文件。
+
 ### 查询变成真正可编辑的提示行
 
 - 此前查询只能往末尾追加:长模式中间打错一个字,就得把后面全删掉重打。现在

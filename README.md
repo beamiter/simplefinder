@@ -9,7 +9,8 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 - 并行项目全文搜索，支持纯文本、正则、smart-case，匹配片段高亮，跳过二进制文件
 - 全文搜索结果流式返回：遍历尚未结束就先画出已找到的匹配，标题显示
   `12 results · searching…`；每批都是完整有序的快照，不会在结束时重排
-- 预览弹窗：实时预览选中文件或匹配行上下文（`<C-e>` 开关）
+- 预览弹窗：实时预览选中文件或匹配行上下文（`<C-e>` 开关）；按 filetype 高亮，
+  可上下滚动，文件已在 buffer 里打开时读 buffer（未保存的修改也能正确预览）
 - 多选标记 + 一键导出 quickfix 列表
 - `:SimpleFinderResume` 恢复上次搜索（模式、查询、选项）
 - 遵循 `.gitignore`，并可即时切换隐藏文件和忽略规则
@@ -81,6 +82,7 @@ xmap      <leader>fg <Plug>(simplefinder-grep-visual)
 | `<C-q>` | 将标记结果(无标记时为全部)导出到 quickfix |
 | `<C-l>` | 将标记结果(无标记时为全部)导出到启动 split 的 location list |
 | `<C-e>` | 开关预览弹窗 |
+| `<PageDown>` / `<PageUp>` | 滚动预览(相对当前匹配,换结果即复位) |
 | `<C-u>` / `<C-w>` | 清空查询 / 删除光标前的一个词 |
 | `<Left>` / `<Right>` / `<Home>` / `<End>` | 在查询里移动光标(提示行的方块就是光标) |
 | `<C-y>{reg}` | 把寄存器粘到光标处(多行寄存器按空格拼接) |
@@ -116,6 +118,12 @@ let g:simplefinder_panel_width = 50
 let g:simplefinder_position = 'right'       " 'left' 或 'right'
 let g:simplefinder_close_on_select = 1
 let g:simplefinder_preview = 1              " 默认开启预览弹窗
+let g:simplefinder_preview_syntax = 1       " 预览按 filetype 高亮
+let g:simplefinder_preview_width = 0        " 0 = 用满面板旁边的列
+let g:simplefinder_preview_max_bytes = 2097152
+let g:simplefinder_preview_cache = 4        " 缓存最近几个文件的内容
+let g:simplefinder_history_max = 50         " 每个来源保留的历史查询条数
+let g:simplefinder_lines_max = 50000        " :SimpleFinderLines 读取的行数上限
 let g:simplefinder_hidden = 0
 let g:simplefinder_no_ignore = 0
 let g:simplefinder_regex = 0

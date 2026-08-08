@@ -487,6 +487,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
     s_error = s_glob_error
   endif
   s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
+  s_preview_scroll = 0
   s_project_root = FindProjectRoot()
 
   EnsurePanel()
@@ -537,6 +538,7 @@ enddef
 def PanelClose()
   RecordHistory()
   PreviewClose()
+  PreviewCacheClear()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
     s_debounce_timer = 0
@@ -914,6 +916,9 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
   if s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
     return
   endif
+  # A preview scrolled with <PageDown> is scrolled relative to the match being
+  # looked at, so selecting another result starts it over.
+  s_preview_scroll = 0
 
   var height = s_eff_height
   var max_items = height - 4
@@ -976,6 +981,119 @@ enddef
 
 # ─────────────────── Preview popup ───────────────────
 
+var s_preview_scroll: number = 0   # extra lines scrolled past the match line
+var s_preview_syntax: string = ''  # what the popup window is currently set to
+
+# Cached whole-file reads, newest first: {key: '<path>:<ftime>:<size>', lines}.
+#
+# The preview used to call readfile(path, '', start + height - 1) on every
+# cursor move, which reads the file from byte 0 down to the line it wants: a
+# result 30,000 lines into a file re-parsed 30,000 lines per <C-j>, and moving
+# between two results in the same file paid for it twice.  Reading the file
+# once and slicing it is the same work for a single visit and free thereafter;
+# the size guard below bounds what that can cost.
+var s_preview_cache: list<dict<any>> = []
+
+def PreviewCacheClear()
+  s_preview_cache = []
+enddef
+
+def CachedFileLines(path: string): list<string>
+  var key = printf('%s:%d:%d', path, getftime(path), getfsize(path))
+  var hit = indexof(s_preview_cache, (_, e) => e.key ==# key)
+  if hit >= 0
+    if hit > 0
+      # Most recently used first, so the eviction below drops the coldest.
+      insert(s_preview_cache, remove(s_preview_cache, hit), 0)
+    endif
+    return s_preview_cache[0].lines
+  endif
+  var lines: list<string> = []
+  try
+    lines = readfile(path)
+  catch
+    return []
+  endtry
+  insert(s_preview_cache, {key: key, lines: lines}, 0)
+  var mx = max([1, get(g:, 'simplefinder_preview_cache', 4)])
+  if len(s_preview_cache) > mx
+    s_preview_cache = s_preview_cache[: mx - 1]
+  endif
+  return lines
+enddef
+
+# The loaded buffer showing `path`, if there is one.
+#
+# bufnr() takes a *pattern*, so a path holding regex punctuation would match
+# the wrong buffer or none at all; comparing full names is both cheaper to
+# reason about and correct.
+def LoadedBufferFor(path: string): number
+  if path ==# ''
+    return 0
+  endif
+  var full = fnamemodify(path, ':p')
+  for info in getbufinfo({bufloaded: 1})
+    if info.name !=# '' && fnamemodify(info.name, ':p') ==# full
+      return info.bufnr
+    endif
+  endfor
+  return 0
+enddef
+
+# What the preview should show, and where it should come from.
+#
+# A buffer with unsaved edits is the authority on its own content: previewing
+# the file on disk showed text that no longer matched the result — in `lines`
+# mode the item text comes from getline(), so after five inserted lines the
+# highlighted preview line did not contain the match at all.
+def PreviewSlice(path: string, buf: number, start: number, count: number): list<string>
+  if buf > 0 && bufloaded(buf)
+    return getbufline(buf, start, start + count - 1)
+  endif
+  var all = CachedFileLines(path)
+  if len(all) < start
+    return []
+  endif
+  return all[start - 1 : start + count - 2]
+enddef
+
+def PreviewLineCount(path: string, buf: number): number
+  if buf > 0 && bufloaded(buf)
+    return getbufinfo(buf)[0].linecount
+  endif
+  return len(CachedFileLines(path))
+enddef
+
+# Extension -> filetype for files that are not open in a buffer.  Vim's own
+# filetype detection needs a buffer to run against, and creating one per
+# preview would fire autocommands for a file the user only pointed at.
+var s_preview_filetypes: dict<string> = {
+  rs: 'rust', py: 'python', js: 'javascript', jsx: 'javascriptreact',
+  ts: 'typescript', tsx: 'typescriptreact', go: 'go', c: 'c', h: 'c',
+  cc: 'cpp', cpp: 'cpp', cxx: 'cpp', hpp: 'cpp', hh: 'cpp', java: 'java',
+  rb: 'ruby', lua: 'lua', vim: 'vim', sh: 'sh', bash: 'bash', zsh: 'zsh',
+  hs: 'haskell', jl: 'julia', php: 'php', cs: 'cs', kt: 'kotlin',
+  swift: 'swift', scala: 'scala', pl: 'perl', r: 'r', sql: 'sql',
+  md: 'markdown', markdown: 'markdown', rst: 'rst', tex: 'tex',
+  json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml', ini: 'dosini',
+  conf: 'conf', xml: 'xml', html: 'html', css: 'css', scss: 'scss',
+  txt: '', log: '',
+}
+
+def PreviewFiletype(path: string, buf: number): string
+  if get(g:, 'simplefinder_preview_syntax', 1) == 0
+    return ''
+  endif
+  if buf > 0 && bufloaded(buf)
+    return getbufvar(buf, '&filetype')
+  endif
+  var name = fnamemodify(path, ':t')
+  if name ==# 'Makefile' || name ==# 'makefile'
+    return 'make'
+  endif
+  return get(s_preview_filetypes, tolower(fnamemodify(path, ':e')), '')
+enddef
+
 def PreviewClose()
   if s_preview_winid > 0
     try
@@ -983,11 +1101,23 @@ def PreviewClose()
     catch
     endtry
     s_preview_winid = 0
+    s_preview_syntax = ''
   endif
 enddef
 
+# Scroll the preview without moving the selection.  The offset is in lines and
+# is reset whenever the selected result changes, so scrolling is always
+# relative to the match you are looking at.
+def PreviewScroll(delta: number)
+  if !s_preview_on || s_preview_winid <= 0
+    return
+  endif
+  s_preview_scroll += delta
+  PreviewUpdate()
+enddef
+
 def PreviewUpdate()
-  if !s_preview_on || s_panel_winid == 0 || win_id2win(s_panel_winid) == 0
+  if !s_preview_on || s_panel_winid == 0 || empty(getwininfo(s_panel_winid))
     PreviewClose()
     return
   endif
@@ -996,8 +1126,17 @@ def PreviewUpdate()
     return
   endif
   var item = s_items[s_cursor_idx]
-  var path = fnamemodify(expand(ResolvePath(item)), ':p')
-  if path ==# '' || !filereadable(path)
+  # No expand() here: it is a wildcard, environment-variable and %/#-special
+  # expander pointed at a file name, and a name is not an expression.
+  # fnamemodify(':p') resolves '~' and relative paths, which is all that is
+  # wanted.
+  var raw_path = ResolvePath(item)
+  var path = raw_path ==# '' ? '' : fnamemodify(raw_path, ':p')
+  var buf = get(item, 'bufnr', 0)
+  if buf <= 0 || !bufloaded(buf)
+    buf = LoadedBufferFor(path)
+  endif
+  if buf <= 0 && (path ==# '' || !filereadable(path))
     PreviewClose()
     return
   endif
@@ -1013,6 +1152,10 @@ def PreviewUpdate()
     col = pcol + s_eff_width + 3
     width = &columns - col - 1
   endif
+  var wanted = get(g:, 'simplefinder_preview_width', 0)
+  if wanted > 0
+    width = min([width, max([30, wanted])])
+  endif
   if width < 30
     PreviewClose()
     return
@@ -1022,20 +1165,34 @@ def PreviewUpdate()
   var lnum = get(item, 'lnum', 0)
   var lines: list<string> = []
   var hl_line = 0
-  var fsize = getfsize(path)
-  if fsize < 0 || fsize > 2097152
+  var syntax = ''
+  # An unsaved buffer is read from memory, so its size on disk says nothing
+  # about the cost of previewing it.
+  var fsize = buf > 0 && bufloaded(buf) ? 0 : getfsize(path)
+  var max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+  if fsize < 0 || (max_bytes > 0 && fsize > max_bytes)
     lines = ['── file too large to preview ──']
+    s_preview_scroll = 0
   else
+    var total = PreviewLineCount(path, buf)
     var start = 1
     if lnum > 0
       start = max([1, lnum - height / 2])
     endif
-    var raw = readfile(path, '', start + height - 1)
-    lines = len(raw) > start - 1 ? raw[start - 1 :] : []
+    # Clamp the scroll offset against the file rather than letting it run off
+    # either end: <PageDown> at the bottom must simply stop.
+    var lowest = 1 - start
+    var highest = max([lowest, total - height + 1 - start])
+    s_preview_scroll = max([lowest, min([s_preview_scroll, highest])])
+    start += s_preview_scroll
+    lines = PreviewSlice(path, buf, start, height)
     if empty(lines)
       lines = ['── empty file ──']
-    elseif lnum > 0
-      hl_line = lnum - start + 1
+    else
+      syntax = PreviewFiletype(path, buf)
+      if lnum > 0 && lnum >= start && lnum < start + height
+        hl_line = lnum - start + 1
+      endif
     endif
   endif
 
@@ -1066,6 +1223,16 @@ def PreviewUpdate()
       maxheight: height,
       title: title,
     })
+  endif
+  # Syntax is per window and survives popup_settext, so it is only worth
+  # setting when it actually changes — highlighting a 40-line popup is cheap,
+  # re-sourcing a syntax file on every <C-j> is not.
+  if syntax !=# s_preview_syntax
+    s_preview_syntax = syntax
+    try
+      win_execute(s_preview_winid, 'setlocal syntax=' .. (syntax ==# '' ? 'OFF' : syntax))
+    catch
+    endtry
   endif
   win_execute(s_preview_winid, 'call clearmatches()')
   if hl_line > 0
@@ -1113,6 +1280,8 @@ def SetupMappings()
   nnoremap <silent><buffer> <End> <ScriptCmd>PanelHandleKey(0, '<lt>End>')<CR>
   nnoremap <silent><buffer> <C-Up> <ScriptCmd>PanelHandleKey(0, '<lt>C-Up>')<CR>
   nnoremap <silent><buffer> <C-Down> <ScriptCmd>PanelHandleKey(0, '<lt>C-Down>')<CR>
+  nnoremap <silent><buffer> <PageUp> <ScriptCmd>PanelHandleKey(0, '<lt>PageUp>')<CR>
+  nnoremap <silent><buffer> <PageDown> <ScriptCmd>PanelHandleKey(0, '<lt>PageDown>')<CR>
 
   # Map the complete printable ASCII range, including regex punctuation.
   for code in range(32, 126)
@@ -1167,6 +1336,8 @@ def PanelHandleKey(winid: number, key: string): bool
     '<End>': "\<End>",
     '<C-Up>': "\<C-Up>",
     '<C-Down>': "\<C-Down>",
+    '<PageUp>': "\<PageUp>",
+    '<PageDown>': "\<PageDown>",
   }
   if has_key(special_keys, key)
     k = special_keys[key]
@@ -1231,6 +1402,14 @@ def PanelHandleKey(winid: number, key: string): bool
     PreviewUpdate()
     return true
   endif
+  if k ==# "\<PageDown>"
+    PreviewScroll(max([1, s_eff_height / 2]))
+    return true
+  endif
+  if k ==# "\<PageUp>"
+    PreviewScroll(-max([1, s_eff_height / 2]))
+    return true
+  endif
   if k ==# "\<C-q>"
     SendToList(false)
     return true
@@ -1250,6 +1429,7 @@ def PanelHandleKey(winid: number, key: string): bool
       ToggleMark(s_cursor_idx)
       if s_cursor_idx < len(s_items) - 1
         s_cursor_idx += 1
+        s_preview_scroll = 0
       endif
       PanelRender()
     endif
@@ -1260,6 +1440,7 @@ def PanelHandleKey(winid: number, key: string): bool
       ToggleMark(s_cursor_idx)
       if s_cursor_idx > 0
         s_cursor_idx -= 1
+        s_preview_scroll = 0
       endif
       PanelRender()
     endif

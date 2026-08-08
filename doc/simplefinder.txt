@@ -206,6 +206,22 @@ All modes~
   <C-o>           toggle hidden files             flag: [hidden]
   <C-g>           toggle ignore files             flag: [all]
   <C-e>           toggle the preview popup
+  <PageDown>      scroll the preview down half a screen
+  <PageUp>        scroll the preview up half a screen
+
+                                                        *simplefinder-preview*
+The preview reads from the *buffer* whenever the file is loaded in one, so a
+result in a buffer with unsaved edits previews the text the result was found
+in rather than what is still on disk. A file that is not open is read once and
+kept, so moving back and forth between results in it costs one read;
+g:simplefinder_preview_cache (default 4) is how many such files are kept.
+It is highlighted with the loaded buffer's 'filetype', or one derived from the
+extension -- set g:simplefinder_preview_syntax to 0 to switch that off.
+Scrolling is relative to the match being previewed and starts over whenever
+another result is selected. g:simplefinder_preview_width (default 0 = fill the
+columns beside the panel) caps the popup width, and
+g:simplefinder_preview_max_bytes (default 2097152) is the size above which a
+file is not read at all; buffers are exempt, being already in memory.
 
 Buffers mode~
   <C-d>           delete (:bdelete) the selected buffer
@@ -221,6 +237,10 @@ Set before the plugin loads; defaults shown. >
   g:simplefinder_position = 'right'      'left' or 'right'
   g:simplefinder_close_on_select = 1     close panel after opening a result
   g:simplefinder_preview = 1             preview popup on by default
+  g:simplefinder_preview_syntax = 1      highlight the preview
+  g:simplefinder_preview_width = 0       preview width (0 = all that is free)
+  g:simplefinder_preview_max_bytes = 2097152   largest file read for preview
+  g:simplefinder_preview_cache = 4       files kept from previous previews
   g:simplefinder_hidden = 0              include hidden files
   g:simplefinder_no_ignore = 0           ignore the ignore files
   g:simplefinder_regex = 0               grep starts in regex mode

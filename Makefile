@@ -20,6 +20,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_grep.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_stream.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_prompt.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_preview.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
