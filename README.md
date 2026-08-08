@@ -130,10 +130,14 @@ let g:simplefinder_debug = 0
 项目根会从当前文件目录向上查找标记；没有匹配时使用当前工作目录。扫描默认遵循 `.ignore`、`.gitignore`、全局 Git ignore 和 `.git/info/exclude`。
 
 匹配数超过 `g:simplefinder_max_results` 时，grep 保留 (path, lnum, col) 排序中最靠前
-的那一批——与完整排序后截断的结果集相同——所以同一查询每次返回同一批结果，`<C-q>`
-导出的 quickfix 也是确定的。面板同时显示两个数字，如 `200/5312 results`。为了让总数
-可信，daemon 会继续统计到 `g:simplefinder_max_results` 的 50 倍(至少 10000)为止；
-`.` 这类正则会立刻触顶，此时总数是下界，面板显示为 `200/10000+ results`。
+的那一批——与完整排序后截断的结果集相同——所以只要走完整棵树，同一查询每次返回同一批
+结果，`<C-q>` 导出的 quickfix 也是确定的。面板同时显示两个数字，如 `200/5312 results`。
+为了让总数可信，daemon 会继续统计到 `g:simplefinder_max_results` 的 50 倍(至少 10000)
+为止；`.` 这类正则会立刻触顶。触顶会直接结束遍历，所以此后两个数字都不完整：总数是
+下界，保留的结果也只是"已扫完的那些文件"里最靠前的一批，而哪些文件先扫完取决于线程
+调度——同一查询两次可能给出不同结果，`<C-q>` 导出的 quickfix 也可能不同。面板用结尾的
+`+` 标记这一点：`200/10000+ results`。缩小 pattern(或调大 `g:simplefinder_max_results`，
+上限随之提高)就能重新拿到完整扫描和稳定结果集。
 
 `g:simplefinder_include_globs` 和 `g:simplefinder_exclude_globs` 使用相对项目根的
 ignore 风格 glob。include 列表非空时只遍历匹配文件，exclude 随后排除匹配项；

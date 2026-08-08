@@ -218,15 +218,23 @@ g:simplefinder_max_results
 
 	A grep that finds more keeps the first g:simplefinder_max_results of
 	the (path, line, column) order -- the same results a full sort would
-	have put first -- so the same query always returns the same set and
-	<C-q> always exports the same quickfix list. The panel then reports
-	both numbers, e.g. `200/5312 results`, rather than only how many fit.
+	have put first -- so a query that scans the whole tree returns the same
+	set every time and <C-q> exports the same quickfix list. The panel then
+	reports both numbers, e.g. `200/5312 results`, rather than only how
+	many fit.
 
 	Counting is what makes that total honest, so the daemon keeps scanning
 	past the cap. It stops at 50x g:simplefinder_max_results matches (at
 	least 10000), which a normal search is nowhere near but `.` as a regex
-	over a monorepo reaches immediately. Past that point the total is a
-	lower bound and the panel marks it: `200/10000+ results`.
+	over a monorepo reaches immediately. Stopping ends the walk itself, so
+	past that point neither number is complete: the total is a lower bound,
+	and the kept results are the first ones out of whichever files the walk
+	had reached -- which files those are depends on how the walker's
+	threads were scheduled, so two runs of the same query can return
+	different sets and <C-q> can export different lists. The panel marks
+	exactly this with a trailing +: `200/10000+ results`. Narrow the
+	pattern (or raise g:simplefinder_max_results, which raises the ceiling
+	with it) to get a complete scan and a stable set back.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs
