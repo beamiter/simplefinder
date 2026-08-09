@@ -1153,7 +1153,18 @@ def PreviewScroll(delta: number)
 enddef
 
 def PreviewUpdate()
-  if !s_preview_on || s_panel_winid == 0 || empty(getwininfo(s_panel_winid))
+  var panel_info = s_panel_winid == 0 ? [] : getwininfo(s_panel_winid)
+  if !s_preview_on || empty(panel_info)
+    PreviewClose()
+    return
+  endif
+  # PanelRender() is tabpage-agnostic and repaints a panel wherever it lives,
+  # but a popup is not: it is created in the current tabpage, and its geometry
+  # below comes from the panel window.  From another tab win_id2win() answers
+  # 0 and win_screenpos(0) means "the current window", so drawing anyway put a
+  # preview over whatever the user was editing in a tab with no panel in it.
+  # The preview is redrawn when the user comes back to the panel.
+  if panel_info[0].tabnr != tabpagenr()
     PreviewClose()
     return
   endif
@@ -1178,7 +1189,7 @@ def PreviewUpdate()
   endif
 
   # Fill the space beside the panel; skip when too narrow to be useful
-  var [_, pcol] = win_screenpos(win_id2win(s_panel_winid))
+  var pcol = panel_info[0].wincol
   var width = 0
   var col = 2
   if get(g:, 'simplefinder_position', 'right') !=# 'left'

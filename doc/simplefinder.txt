@@ -254,6 +254,12 @@ columns beside the panel) caps the popup width, and
 g:simplefinder_preview_max_bytes (default 2097152) is the size above which a
 file is not read at all; buffers are exempt, being already in memory.
 
+A popup belongs to the tabpage it was created in, and the preview is sized from
+the panel window. Results arriving while you are in another tab therefore
+repaint the panel but not the preview, which would otherwise have to be drawn
+over whatever you are editing there; it comes back when you return to the
+panel.
+
 Buffers mode~
   <C-d>           delete (:bdelete) the selected buffer
 
