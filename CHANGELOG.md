@@ -2,6 +2,19 @@
 
 ## Unreleased - 2026-08-09
 
+### 三个插件其实会 clamp 的下限，不再被报成 `[ERROR]`
+
+- `[ERROR]` 的含义是"这个值根本用不上"，而且只有 `[ERROR]` 会在一次会话第一次搜索前
+  用 WarningMsg echo 出来；"低于插件自己会 clamp 的下限"按文档是 `[WARN]`。可
+  `history_max`、`preview_width`、`preview_max_bytes` 三个的下限都没写 `min_note`，于
+  是被报成了 `[ERROR]`——`max([0, ...])`、`if wanted > 0`、`max_bytes > 0 &&`，三处代码
+  对低于下限的值的处理跟 0 完全一样。写 `let g:simplefinder_preview_max_bytes = -1`
+  表示"不限大小"的人，因此每个会话都会在第一次搜索前挨一条红色的错误，而插件正按他
+  想要的方式在跑。同一张表里 `threads = -1` 形状完全相同却是 `[WARN]`，差别只在它带了
+  `min_note`。
+- 三个都补上 `min_note`，降级为 `[WARN]`，并说明插件实际做了什么；帮助里那份下限清单
+  也一并写清楚：带括号说明的那些就是 `[WARN]`。
+
 ### `g:simplefinder_grep_cache = 0` 真的变回不遍历列表
 
 - 这个开关的承诺是"回到 0.5.0 之前那样每次都走遍历"，可 `grep_by_walk()` 无论如何都

@@ -215,6 +215,30 @@ call assert_match('the panel opens at 24 columns',
       \ 'a clamped value is a warning that says what it was clamped to')
 let g:simplefinder_panel_width = 50
 
+" ── A value the plugin honours is never an [ERROR] ──
+"
+" [ERROR] and [WARN] are not decoration: [ERROR] means the value cannot be used
+" as written, and those are the lines CheckConfigOnce() echoes in WarningMsg in
+" front of the first search of the session.  A floor the plugin simply clamps
+" is the documented [WARN] case, so reporting one as an [ERROR] nags a user
+" whose setting is doing precisely what they asked for.  Each pair below is the
+" clamp in the plugin, quoted: `max([0, ...])` for history_max, `if wanted > 0`
+" for preview_width and `max_bytes > 0 &&` for preview_max_bytes -- in all
+" three a value below the floor behaves exactly as 0 does.
+for s:case in [
+      \ ['history_max', -1, 50, 'no query is remembered'],
+      \ ['preview_width', -5, 0, 'the preview picks its own width'],
+      \ ['preview_max_bytes', -1, 2097152, 'no size limit is applied']]
+  execute 'let g:simplefinder_' . s:case[0] . ' = ' . s:case[1]
+  let s:text = s:ProblemText()
+  call assert_notmatch('\[ERROR\] g:simplefinder_' . s:case[0], s:text,
+        \ s:case[0] . ': a value the plugin clamps is used, so it is not an error')
+  call assert_match('\[WARN\] g:simplefinder_' . s:case[0] . ' = ' . s:case[1]
+        \ . ' is below the minimum 0; ' . s:case[3], s:text,
+        \ s:case[0] . ': a clamped value is a warning that says what it was clamped to')
+  execute 'let g:simplefinder_' . s:case[0] . ' = ' . s:case[2]
+endfor
+
 let g:simplefinder_root_markers = ['.git', 42]
 call assert_match('every entry must be a non-empty string',
       \ s:ProblemText())
