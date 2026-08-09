@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-08-09
 
+### `:SimpleFinderStop` 不会被一个还在等握手的搜索复活
+
+- 握手未完成时挂起的请求由一个 2 秒定时器兜底,但没有任何东西会取消它,而重新
+  派发要经过 `EnsureBackend()`——那是**启动** daemon 的那条路。结果是:搜索挂起
+  期间执行 `:SimpleFinderStop`,2 秒后进程又被拉起来,屏幕上没有任何东西解释它
+  从哪来。文档里"显式停止不会被在途事件撤销"的承诺,在这条路径上没有兑现。
+- `Stop()` 现在取消挂起的握手等待(停表、丢弃挂起的请求),面板不再停在
+  `searching…`,而是说明放弃的原因;`FinishNegotiation()` 另外加一道保险,
+  daemon 已经不在了就不再派发。`:SimpleFinderRestart` 不受影响——那里的请求
+  本来就该等新进程握手。
+- 新增 `tests/vim_negotiate.vim` 与 `tests/fake_slow_daemon.py`(拿不到 gate
+  文件就永远不回 ping):停止之后跨过 2 秒预算,daemon 必须仍然是停的,而且
+  假 daemon 记录的进程数必须还是 1;随后用户自己再搜一次仍然能正常启动、协商、
+  出结果。
+
 ### marks 的文件名不再经过 `expand()`
 
 - `Marks()` 用 `fnamemodify(expand(file), ':p')` 解析标记所在的文件,而

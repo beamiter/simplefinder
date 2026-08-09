@@ -137,13 +137,43 @@ def FinishNegotiation()
   endif
   s_deferred = false
   # The panel may have been closed, or moved to another source, while the ping
-  # was in flight.  DispatchSearch() reads the live panel state, so the only
+  # was in flight.  DispatchSearch() reads the live panel state, so the first
   # thing worth checking is that there is still a panel to fill.
   if s_panel_winid == 0 || empty(getwininfo(s_panel_winid))
     s_loading = false
     return
   endif
+  # And the second is that there is still a backend.  Re-dispatching goes
+  # through EnsureBackend(), which *starts* the daemon: a request still held
+  # when the process went away — :SimpleFinderStop, or a crash the supervisor
+  # decided not to restart — would otherwise spawn a new one up to two seconds
+  # later, silently undoing the stop.
+  if !simplefinder#core#IsRunning()
+    s_loading = false
+    if s_error ==# ''
+      s_error = 'backend stopped before the handshake completed'
+    endif
+    PanelRender()
+    return
+  endif
   DispatchSearch()
+enddef
+
+# :SimpleFinderStop is an instruction, not a pause: drop anything held for a
+# handshake that is never going to arrive, rather than leave the panel on
+# `searching…` until the budget runs out.
+def CancelNegotiation()
+  if s_negotiate_timer > 0
+    timer_stop(s_negotiate_timer)
+    s_negotiate_timer = 0
+  endif
+  if !s_deferred
+    return
+  endif
+  s_deferred = false
+  s_loading = false
+  s_error = 'backend stopped before the handshake completed'
+  PanelRender()
 enddef
 
 # True when the caller must hold this request back; the flush above re-runs it.
@@ -228,6 +258,7 @@ enddef
 
 export def Stop()
   SetupCore()
+  CancelNegotiation()
   simplefinder#core#Stop()
 enddef
 

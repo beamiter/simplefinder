@@ -48,7 +48,10 @@ two seconds) and then goes out knowing what the daemon can do, instead of
 asking for the lowest common denominator on the one search guaranteed to be
 slow — nothing is cached yet. The same applies after |:SimpleFinderRestart| and
 after a crash restart. A daemon that never answers still gets the search, which
-then behaves as it did before streaming existed.
+then behaves as it did before streaming existed. A search still waiting when
+the daemon goes away is dropped rather than re-sent: re-sending it runs through
+the code that starts the daemon, and stopping one is an instruction, not a
+pause.
 
 Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 |+popupwin|. Run ./install.sh once to compile the daemon (Rust 1.88+).
