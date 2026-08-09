@@ -89,6 +89,39 @@ endfunction
 call assert_equal([], s:Problems(),
       \ 'every documented option, at its default, is a value the plugin accepts')
 
+" ── The report never lands on somebody else's buffer ──
+"
+" This has to run before anything else opens the report, because the hazard is
+" on the create path: the report used to be opened by name, and
+" `:split SimpleFinderHealth` binds the window to that *file name*.  In a
+" directory that happens to hold a file so called, the buffer editing it was
+" emptied, forced to 'buftype=nofile' so it could no longer be written back,
+" and had 'modified' cleared -- unsaved work gone, silently.
+let s:decoy_dir = s:root . '/tests/health-decoy'
+call delete(s:decoy_dir, 'rf')
+call mkdir(s:decoy_dir, 'p')
+call writefile(['important note'], s:decoy_dir . '/SimpleFinderHealth')
+let s:cwd = getcwd()
+execute 'lcd ' . fnameescape(s:decoy_dir)
+edit SimpleFinderHealth
+call setline(2, 'UNSAVED EDIT')
+let s:decoy = bufnr('%')
+SimpleFinderHealth
+call assert_notequal(s:decoy, bufnr('%'),
+      \ 'the report opens a buffer of its own, not whatever the name resolved to')
+call assert_equal('nofile', &buftype, 'and that buffer is still the scratch report')
+call assert_match('SimpleFinder health', getline(1), 'holding the report itself')
+call assert_equal(['important note', 'UNSAVED EDIT'], getbufline(s:decoy, 1, '$'),
+      \ 'a file that happens to be called SimpleFinderHealth keeps its contents')
+call assert_equal('', getbufvar(s:decoy, '&buftype'),
+      \ 'and stays a file buffer, so it can still be written back')
+call assert_true(getbufvar(s:decoy, '&modified'),
+      \ 'and keeps the unsaved edit that would otherwise be lost without a word')
+close
+execute 'lcd ' . fnameescape(s:cwd)
+execute 'bwipeout! ' . s:decoy
+call delete(s:decoy_dir, 'rf')
+
 " ── A fresh session is not a broken one ──
 let s:lines = s:Report()
 call assert_equal('nofile', &buftype, 'the report is a scratch buffer')

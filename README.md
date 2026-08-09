@@ -197,6 +197,11 @@ issue 的，消息区这三件事都做不到。固定五段，顺序固定，�
   搜索启动，把预期状态写成 `[ERROR]` 会让每一份引用它的 bug report 走进死胡同
 - `CONTEXT`：项目根、include/exclude glob 数量、预览默认开关
 
+报告写在它自己新建的 buffer 里：先建空的，之后才命名成 `SimpleFinderHealth`，绝不去
+接管这个名字碰巧指到的那个 buffer。所以你目录里真有一个叫 `SimpleFinderHealth` 的
+文件时，它的内容、`buftype` 和未保存的修改都不会被动；名字已经被别的 buffer 占了，
+报告就干脆不要名字。
+
 配置校验单独也能调用：`simplefinder#ValidateConfig()` 返回一个诊断列表，空列表表示
 没有问题。`[ERROR]` 表示这个值根本用不上（名字不是选项、类型不对、路径不存在），
 `[WARN]` 表示会用，但不是按你写的用（低于插件自己会 clamp 的下限，或被另一个选项

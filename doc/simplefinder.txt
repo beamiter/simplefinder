@@ -591,6 +591,13 @@ What it guarantees:
         that was thrashing for one moment does not carry the red line for the
         rest of the session.
 
+        The report gets a buffer of its own, created empty and only then
+        named `SimpleFinderHealth`. It never adopts a buffer that name already
+        resolved to, so a file of yours that happens to be called
+        SimpleFinderHealth keeps its contents, its 'buftype' and its unsaved
+        changes. If some other buffer already holds the name, the report stays
+        unnamed rather than take it.
+
                                                       *:SimpleFinderRestart*
 :SimpleFinderRestart
         Stop the daemon and start a fresh one. Clears the crash-loop breaker,

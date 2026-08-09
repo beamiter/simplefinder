@@ -785,6 +785,24 @@ def RefreshHealthBuffer()
   setbufvar(s_health_bufnr, '&modified', 0)
 enddef
 
+# A scratch buffer of our own, never one that a name happened to resolve to.
+#
+# `:split SimpleFinderHealth` binds the new window to that *file name*, so in a
+# directory that holds a file called SimpleFinderHealth the command hijacked
+# whatever buffer was editing it: the contents were deleted, 'buftype' was
+# forced to nofile so the file could no longer be written back, and 'modified'
+# was cleared, so unsaved work vanished with nothing said.  bufadd('') always
+# makes a *new* buffer, which can collide with nothing.
+def NewHealthBuffer(): number
+  var nr = bufadd('')
+  bufload(nr)
+  setbufvar(nr, '&buftype', 'nofile')
+  setbufvar(nr, '&bufhidden', 'hide')
+  setbufvar(nr, '&swapfile', 0)
+  setbufvar(nr, '&buflisted', 0)
+  return nr
+enddef
+
 # The report is a scratch buffer rather than a wall of :echom, because it is
 # read, scrolled and pasted into bug reports — none of which the message area
 # supports, and the last of which is the whole point of the command.
@@ -795,11 +813,22 @@ export def Health()
     ? win_findbuf(s_health_bufnr) : []
   if !empty(windows)
     win_gotoid(windows[0])
-  elseif s_health_bufnr > 0 && bufexists(s_health_bufnr)
-    execute 'silent keepalt botright sbuffer ' .. s_health_bufnr
   else
-    execute 'silent keepalt botright split ' .. fnameescape(HEALTH_BUFNAME)
-    s_health_bufnr = bufnr('%')
+    if s_health_bufnr <= 0 || !bufexists(s_health_bufnr)
+      s_health_bufnr = NewHealthBuffer()
+    endif
+    execute 'silent keepalt botright sbuffer ' .. s_health_bufnr
+    if bufname('%') ==# ''
+      # A name is what makes the window recognisable in :ls! and in the status
+      # line, but it is worth having only when it is free: :file on a name some
+      # other buffer already holds fails with E95, and an unnamed report reads
+      # exactly the same.  'buftype' is already nofile here, so the name binds
+      # no file and :w still refuses.
+      try
+        execute 'silent keepalt file ' .. fnameescape(HEALTH_BUFNAME)
+      catch /^Vim\%((\a\+)\)\=:E95:/
+      endtry
+    endif
   endif
   setlocal buftype=nofile bufhidden=hide noswapfile nobuflisted nowrap
   setlocal modifiable

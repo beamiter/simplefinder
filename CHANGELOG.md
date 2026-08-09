@@ -2,6 +2,22 @@
 
 ## Unreleased - 2026-08-09
 
+### health 报告不再霸占一个同名文件的 buffer
+
+- 报告一直是用名字打开的：`:split SimpleFinderHealth`。可这条命令绑定的是那个**文件
+  名**，于是在一个碰巧有 `SimpleFinderHealth` 这个文件的目录里，`:SimpleFinderHealth`
+  接管的是正在编辑它的那个 buffer——内容被清空，`buftype` 被按成 `nofile`（于是再也写
+  不回磁盘），`modified` 被清掉，未保存的修改就这么无声无息地没了，连一句警告都没有。
+  磁盘上的文件没被覆盖（`:w!` 会以 E382 拒绝），但这一个会话里的改动是真丢了。
+- 现在报告先用 `bufadd('')` 建一个全新的空 buffer——空名字每次都建新的，撞不到任何
+  东西——设好 `nofile` 之后再命名成 `SimpleFinderHealth`。名字已经被别的 buffer 占着
+  时 `:file` 会报 E95，那就不要这个名字：一份不带名字的报告读起来一模一样，而别人的
+  buffer 一个字都不该动。
+- `tests/vim_health.vim` 新增一段：在一个放着 `SimpleFinderHealth` 文件的目录里打开
+  它、改一行不存盘，再跑 `:SimpleFinderHealth`——报告必须落在另一个 buffer 上，原来那
+  个的内容、`buftype` 和 `modified` 必须原封不动。这段必须跑在最前面，因为出事的是
+  "第一次创建"那条路。
+
 ### 三个插件其实会 clamp 的下限，不再被报成 `[ERROR]`
 
 - `[ERROR]` 的含义是"这个值根本用不上"，而且只有 `[ERROR]` 会在一次会话第一次搜索前
