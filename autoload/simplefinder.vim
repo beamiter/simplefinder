@@ -2724,7 +2724,12 @@ export def Marks()
     endif
     var buf = pos[0]
     var file = AsString(get(entry, 'file', ''))
-    var path = file ==# '' ? '' : fnamemodify(expand(file), ':p')
+    # No expand() on a file name, for the same reason the preview does not use
+    # one: it is a wildcard, environment-variable, %/#-special and backtick
+    # expander, so a mark on a file called `lit$HOME.txt` resolved to a path
+    # that does not exist.  fnamemodify(':p') resolves '~' and relative names,
+    # which is all a getmarklist() 'file' value ever needs.
+    var path = file ==# '' ? '' : fnamemodify(file, ':p')
     if buf <= 0 && path !=# ''
       buf = bufnr(path)
     endif

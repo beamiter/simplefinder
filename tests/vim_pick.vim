@@ -117,6 +117,30 @@ normal! 1G
 call feedkeys("\<CR>", 'xt')
 call assert_equal(2, line('.'), 'opening a mark jumps to it')
 
+" A mark's file name is a name, not an expression.  Marks() ran it through
+" expand() -- a wildcard, environment-variable, %/#-special and backtick
+" expander -- so a mark set in `lit$HOME.txt` was listed, previewed and
+" exported to quickfix under `lit/home/you.txt`, a path nothing can open.
+let s:magic = fnamemodify(s:file, ':h') .. '/lit$HOME.txt'
+call writefile(['one', 'marked line', 'three'], s:magic)
+call assert_notequal(s:magic, expand(s:magic),
+      \ 'the fixture is a name expand() really does mangle')
+execute 'edit! ' .. fnameescape(s:magic)
+normal! 2G
+normal! mC
+let s:magic_bufnr = bufnr('%')
+execute 'edit! ' .. fnameescape(s:file)
+" Marks on a file with no loaded buffer are the normal cross-session case, and
+" the one where only the name is left to go on.
+execute 'bdelete! ' .. s:magic_bufnr
+SimpleFinderMarks
+call assert_match('C .*lit\$HOME\.txt:2', s:Panel(),
+      \ 'a mark is listed under the file name it was set in')
+call assert_notmatch('lit/', s:Panel(),
+      \ 'and that name is not run through an environment-variable expander')
+call feedkeys("\<Esc>", 'xt')
+call delete(s:magic)
+
 " ------------------------------------------------------------------ jumps ---
 
 execute 'edit! ' .. fnameescape(s:file)

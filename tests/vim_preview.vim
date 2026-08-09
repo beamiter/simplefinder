@@ -101,13 +101,29 @@ call feedkeys("\<Esc>", 'xt')
 " The path is resolved with fnamemodify(':p'), which handles '~' and relative
 " names and nothing else.  expand() is a wildcard, environment-variable and
 " %/#-special expander aimed at a file name; a name is not an expression.
-let s:odd = s:dir .. '/od#d %file.txt'
+"
+" '$' is the character that discriminates.  expand() rewrites 'lit$HOME.txt'
+" into 'lit/home/you.txt', a path nothing can read, so the preview went blank.
+" '#' and '%' are file specials on a command line, not mid-string in expand(),
+" so a fixture carrying only those passes against the old code too: they stay
+" in the name, but they are not what proves anything.
+"
+" The name has to be previewed from disk for this to prove anything: a result
+" carrying a live buffer number is read out of that buffer and never touches
+" the path at all, so the buffer is wiped before the picker is opened.
+let s:odd = s:dir .. '/lit$HOME od#d %file.txt'
 call writefile(['odd name content'], s:odd)
+call assert_notequal(s:odd, expand(s:odd),
+      \ 'the fixture is a name expand() really does mangle')
 execute 'edit! ' .. fnameescape(s:odd)
-SimpleFinderLines
-sleep 100m
+let s:odd_bufnr = bufnr('%')
+execute 'edit! ' .. fnameescape(s:file)
+execute 'bwipeout! ' .. s:odd_bufnr
+SimpleFinderRecent
+call feedkeys('lit', 'xt')
+sleep 150m
 call assert_match('odd name content', join(s:PreviewLines(), "\n"),
-      \ 'a file name holding # or % is previewed as itself')
+      \ 'a file name holding $, # or % is previewed as itself')
 call feedkeys("\<Esc>", 'xt')
 
 " ------------------------------------------------------------- disk reads ---
