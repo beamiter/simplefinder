@@ -107,9 +107,13 @@ edit SimpleFinderHealth
 call setline(2, 'UNSAVED EDIT')
 let s:decoy = bufnr('%')
 SimpleFinderHealth
-call assert_notequal(s:decoy, bufnr('%'),
+let s:report = bufnr('%')
+call assert_notequal(s:decoy, s:report,
       \ 'the report opens a buffer of its own, not whatever the name resolved to')
 call assert_equal('nofile', &buftype, 'and that buffer is still the scratch report')
+call assert_equal('', bufname('%'),
+      \ 'the name is that other buffer''s, so :file fails with E95 and the report '
+      \ . 'stays unnamed rather than take it -- which reads exactly the same')
 call assert_match('SimpleFinder health', getline(1), 'holding the report itself')
 call assert_equal(['important note', 'UNSAVED EDIT'], getbufline(s:decoy, 1, '$'),
       \ 'a file that happens to be called SimpleFinderHealth keeps its contents')
@@ -120,11 +124,20 @@ call assert_true(getbufvar(s:decoy, '&modified'),
 close
 execute 'lcd ' . fnameescape(s:cwd)
 execute 'bwipeout! ' . s:decoy
+" The report above is kept for the rest of the session, and it is the one that
+" had to go unnamed; wipe it so the next :SimpleFinderHealth builds a report on
+" the ordinary path, where the name is free.
+execute 'bwipeout! ' . s:report
 call delete(s:decoy_dir, 'rf')
 
 " ── A fresh session is not a broken one ──
 let s:lines = s:Report()
 call assert_equal('nofile', &buftype, 'the report is a scratch buffer')
+" Naming is the last step of building the report -- the buffer is created
+" empty and unnamed precisely so it can collide with nothing -- and the name is
+" what makes the window recognisable in :ls! and in the status line.
+call assert_equal('SimpleFinderHealth', bufname('%'),
+      \ 'a report that can have the documented name takes it')
 call assert_false(&modifiable, 'the report is not editable')
 for s:title in ['ENVIRONMENT', 'BINARY', 'CONFIG', 'RUNTIME', 'CONTEXT']
   call assert_notequal(-1, index(s:lines, s:title), s:title .. ' is always reported')
