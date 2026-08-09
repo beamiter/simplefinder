@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-09
 
+### `g:simplefinder_grep_cache = 0` 真的变回不遍历列表
+
+- 这个开关的承诺是"回到 0.5.0 之前那样每次都走遍历"，可 `grep_by_walk()` 无论如何都
+  会把走到的每个路径丢进 mpsc channel、收成 `Vec<String>` 再排序，而 `serve()` 在关掉
+  开关时把整份列表直接丢掉。结果是这条"省事"的路比它要恢复的旧行为**更贵**：10 万文件
+  的仓库里，每一次真正打到 daemon 的按键都要多分配 10 万个 String 并排一次序。老插件
+  不发这个字段，走的也是同一条路。
+- `file_cache` 现在进了 `GrepOptions`：没要列表就不建 channel、不收集、不排序，直接
+  返回 `None`。`serve()` 那边的 `&& use_file_cache` 也就成了多余，去掉。
+- 新增 `a_grep_that_opted_out_of_the_cache_builds_no_list`：关掉开关的 grep 结果不变，
+  但不许带回列表。
+
 ### `:SimpleFinderHealth` 变成真的诊断，配置会被校验一次
 
 - 全新会话里打开 health，头两行是 `[ERROR] daemon` 和 `[ERROR] state: not running`

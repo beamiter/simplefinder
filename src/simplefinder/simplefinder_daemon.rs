@@ -591,6 +591,12 @@ struct GrepOptions {
     no_ignore: bool,
     include_globs: Vec<String>,
     exclude_globs: Vec<String>,
+    /// Whether the caller wants this walk's file list back, to share with the
+    /// file finder's cache.  False is the opt-out (`g:simplefinder_grep_cache
+    /// = 0`, and every plugin too old to send the field), and it has to make
+    /// the walk *cheaper*: nothing consumes the list on that path, so building
+    /// one is pure overhead the option exists to avoid.
+    file_cache: bool,
     /// 0 means one worker per core; see worker_threads().
     threads: usize,
 }
@@ -816,10 +822,10 @@ impl GrepScan {
 
 /// Grep by walking the tree, returning every file the walk saw.
 ///
-/// The returned list is `None` unless the walk ran to completion: a scan that
-/// a cancelled keystroke or the ceiling cut short has seen only part of the
-/// tree, and caching that as the project's file list would make every later
-/// search blind to the rest of it.
+/// The returned list is `None` unless the caller asked for it *and* the walk
+/// ran to completion: a scan that a cancelled keystroke or the ceiling cut
+/// short has seen only part of the tree, and caching that as the project's
+/// file list would make every later search blind to the rest of it.
 fn grep_by_walk(
     scan: &Arc<GrepScan>,
     root_path: &std::path::Path,
@@ -844,7 +850,17 @@ fn grep_by_walk(
     // A channel rather than a shared Vec behind a mutex: this fires for every
     // file in the tree, including the great majority with no match at all,
     // which used to touch no lock whatsoever.
-    let (file_tx, file_rx) = std::sync::mpsc::channel::<String>();
+    //
+    // And no channel at all when the caller did not ask for the list: with
+    // `file_cache` off nobody reads it, so sending, buffering and sorting one
+    // String per file in the tree would make the documented escape hatch
+    // strictly more expensive than the behaviour it restores.
+    let (file_tx, file_rx) = if options.file_cache {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     builder.build_parallel().run(|| {
         let matcher = scan.matcher_for_worker();
         let scan = Arc::clone(scan);
@@ -871,12 +887,17 @@ fn grep_by_walk(
                 .to_string_lossy()
                 .into_owned();
             scan.visit(&mut searcher, &matcher, &path, &rel, &token);
-            let _ = file_tx.send(rel);
+            if let Some(file_tx) = &file_tx {
+                let _ = file_tx.send(rel);
+            }
             ignore::WalkState::Continue
         })
     });
     drop(file_tx);
 
+    let Some(file_rx) = file_rx else {
+        return Ok(None);
+    };
     let mut walked: Vec<String> = file_rx.into_iter().collect();
     if !scan.running(token) {
         return Ok(None);
@@ -1304,6 +1325,7 @@ async fn serve() -> std::io::Result<()> {
                                 no_ignore,
                                 include_globs,
                                 exclude_globs,
+                                file_cache: use_file_cache,
                                 threads,
                             },
                             cached,
@@ -1318,10 +1340,9 @@ async fn serve() -> std::io::Result<()> {
                             // A grep that had to walk has produced exactly the
                             // list the file finder walks for, so publish it and
                             // spare the next keystroke its own walk.  `walked`
-                            // is None unless the walk ran to completion.
-                            if let Some(walked) = outcome.walked.take()
-                                && use_file_cache
-                            {
+                            // is None unless this request asked for the shared
+                            // cache and the walk ran to completion.
+                            if let Some(walked) = outcome.walked.take() {
                                 let (include_globs, exclude_globs) = globs_for_cache;
                                 store_files(
                                     &cache,
@@ -1485,6 +1506,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                file_cache: true,
                 threads: 0,
             },
             None,
@@ -1503,6 +1525,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                file_cache: true,
                 threads: 0,
             },
             None,
@@ -1536,6 +1559,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                file_cache: true,
                 threads: 0,
             },
             None,
@@ -1586,6 +1610,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                file_cache: true,
                 threads: 0,
             },
             None,
@@ -1624,6 +1649,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: Vec::new(),
                 exclude_globs: Vec::new(),
+                file_cache: true,
                 threads: 0,
             },
             None,
@@ -1692,6 +1718,7 @@ mod tests {
                     no_ignore: false,
                     include_globs: Vec::new(),
                     exclude_globs: Vec::new(),
+                    file_cache: true,
                     threads: 0,
                 },
                 None,
@@ -1747,6 +1774,7 @@ mod tests {
             no_ignore: false,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
+            file_cache: true,
             threads: 0,
         }
     }
@@ -1816,6 +1844,39 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             walked.as_ref()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `g:simplefinder_grep_cache = 0` opts out of the shared list, and an
+    /// older plugin never sends the field at all.  Both promise the pre-0.5
+    /// behaviour, so a walk made for such a request must not build a list:
+    /// serve() drops it unread, and sending, buffering and sorting one String
+    /// per file in the tree — 100k of them on every keystroke that reaches a
+    /// monorepo daemon — is exactly the cost the opt-out exists to avoid.
+    #[test]
+    fn a_grep_that_opted_out_of_the_cache_builds_no_list() {
+        let root = temp_project();
+        fs::write(root.join("a.txt"), "needle\n").unwrap();
+        fs::write(root.join("b.txt"), "nothing\n").unwrap();
+
+        let mut options = grep_options(20);
+        options.file_cache = false;
+        let outcome = handle_grep_sync(
+            root.to_str().unwrap(),
+            "needle",
+            options,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.total, 1, "the grep itself is unaffected");
+        assert!(
+            outcome.walked.is_none(),
+            "a walk nobody asked to share must not collect and sort the tree"
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -1971,6 +2032,7 @@ mod tests {
                 no_ignore: false,
                 include_globs: include,
                 exclude_globs: exclude,
+                file_cache: true,
                 threads: 0,
             },
             None,
