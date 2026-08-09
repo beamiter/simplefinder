@@ -18,6 +18,14 @@
   `Cargo.toml` 里的版本——升级只换了 Vim 文件、没重跑 `./install.sh` 的那种破法，只有
   这里看得出来。版本用 `job_start()` 异步问：这条命令正是因为二进制卡住才跑的，
   `system()` 会把命令本身一起挂死。第一份报告写 `probing…`，答案到了就地重画。
+- 版本探测带 3 秒期限。异步本身还不够：真正卡死的二进制正是 `job_start()` 看不见的
+  那一种——它成功返回，子进程就那么杵着，`exit_cb` 永远不来，于是这行会 `probing…`
+  一整个会话，那个因为二进制卡住才跑这条命令的人一条事实都拿不到，和当初的
+  `[ERROR] daemon` 一样是死胡同。现在到点就停掉子进程，这行写成
+  `[ERROR] version: the binary did not answer --version within 3s`，同样就地重画
+  （健康的 `--version` 只要几毫秒，3 秒是任何能用的二进制都不会错过的期限）。
+  超时之后再跑一次 `:SimpleFinderHealth` 会重试一次——只有显式命令重试，就地重画不
+  重试，否则报告开着的时候会每 3 秒重探一次。换二进制时还在飞的那次探测会被一并停掉。
 - 新增 `simplefinder#ValidateConfig()`：选项全集声明在一张表里，校验类型、取值集合、
   数值下限、列表元素、glob 的 `!` 前缀、`root` 是不是目录、`daemon_path` 能不能执行、
   `ignore_case` 与 `smart_case` 撞车，以及任何不在表里的 `g:simplefinder_` 名字。
@@ -30,7 +38,9 @@
 - 新增 `tests/vim_health.vim`：默认配置必须是干净的；全新会话的 `RUNTIME` 只有一条且
   不能带 `ERROR`；版本探测必须从 `probing…` 收敛到 `[OK] version: x.y.z`；daemon 起来
   之后必须报 running；每一类配置错误都要被点名并带上导致它的那个值；拼错的选项必须在
-  第一次搜索时被说出来，而且只说一次。
+  第一次搜索时被说出来，而且只说一次；对着一个 `sleep 600` 的假 daemon，报告必须自己
+  从 `probing…` 走到那条超时的 `[ERROR]`（读的是 buffer，所以就地重画也一并被验），
+  再跑一次命令必须重新回到 `probing…`。
 
 ### 预览弹窗不再画到没有面板的那个 tab 上
 

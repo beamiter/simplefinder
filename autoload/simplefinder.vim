@@ -539,7 +539,25 @@ enddef
 # using to diagnose it.  The answer is cached per binary — path *and* mtime, so
 # a rebuild is probed again — and the report redraws itself when the answer
 # lands, so the first one says `probing…` and then fills itself in.
-var s_probe: dict<any> = {key: '', state: 'idle', version: ''}
+#
+# Asynchrony alone is not enough, though.  The failure this command is most
+# often run for is a binary that answers nothing at all, and that is precisely
+# the one the probe cannot see by itself: job_start() succeeds, the child sits
+# there, and exit_cb never arrives — so without a deadline the line reads
+# `probing…` for the rest of the session and the user gets no fact whatsoever,
+# which is the same dead end as the `[ERROR] daemon` red herring.
+var s_probe: dict<any> = {key: '', state: 'idle', version: '', timer: -1}
+
+# A healthy `--version` answers in single-digit milliseconds; three seconds is
+# a deadline no working binary can miss and no wedged one can hide behind.
+const PROBE_TIMEOUT_MS: number = 3000
+
+def StopProbe()
+  if s_probe.timer >= 0
+    timer_stop(s_probe.timer)
+    s_probe.timer = -1
+  endif
+enddef
 
 def ProbeVersion(exe: string)
   if exe ==# '' || !has('job')
@@ -549,7 +567,15 @@ def ProbeVersion(exe: string)
   if s_probe.key ==# key && s_probe.state !=# 'idle'
     return
   endif
-  s_probe = {key: key, state: 'running', version: ''}
+  # A probe still in flight when a newer one starts no longer owns s_probe, so
+  # its deadline would never fire and its child would outlive the report.
+  if s_probe.state ==# 'running'
+    StopProbe()
+    if has_key(s_probe, 'job') && job_status(s_probe.job) ==# 'run'
+      job_stop(s_probe.job)
+    endif
+  endif
+  s_probe = {key: key, state: 'running', version: '', timer: -1}
   var output: list<string> = []
   var job = job_start([exe, '--version'], {
     out_cb: (_, msg: string) => {
@@ -557,10 +583,13 @@ def ProbeVersion(exe: string)
     },
     exit_cb: (_, status: number) => {
       # A rebuild, or a different binary, may have started a newer probe while
-      # this one was still running: the newest key owns the answer.
-      if s_probe.key !=# key
+      # this one was still running: the newest key owns the answer.  A state
+      # that is no longer `running` is the deadline having already ruled, and
+      # the exit this very job_stop() caused must not overwrite its verdict.
+      if s_probe.key !=# key || s_probe.state !=# 'running'
         return
       endif
+      StopProbe()
       s_probe.version = matchstr(join(output, ' '), '\d\+\.\d\+\.\d\+')
       s_probe.state = status == 0 && s_probe.version !=# '' ? 'done' : 'failed'
       RefreshHealthBuffer()
@@ -572,6 +601,33 @@ def ProbeVersion(exe: string)
   # the rest of the session.
   if job_status(job) ==# 'fail'
     s_probe.state = 'failed'
+    return
+  endif
+  s_probe.job = job
+  if !has('timers')
+    return
+  endif
+  s_probe.timer = timer_start(PROBE_TIMEOUT_MS, (_) => {
+    if s_probe.key !=# key || s_probe.state !=# 'running'
+      return
+    endif
+    s_probe.timer = -1
+    s_probe.state = 'timeout'
+    job_stop(job)
+    RefreshHealthBuffer()
+  })
+enddef
+
+# A deadline that fired is a verdict, not an answer: the user who runs the
+# command again is asking for another attempt, and a machine that was merely
+# thrashing for a moment should not carry a red line for the rest of the
+# session.  Only :SimpleFinderHealth itself retries — RefreshHealthBuffer()
+# must not, or the report, being redrawn by the very timeout it is showing,
+# would re-probe a wedged binary every three seconds for as long as it is on
+# screen.
+def RetryTimedOutProbe()
+  if s_probe.state ==# 'timeout'
+    s_probe = {key: '', state: 'idle', version: '', timer: -1}
   endif
 enddef
 
@@ -606,6 +662,10 @@ def BinaryLines(): list<string>
     add(lines, '[INFO] version: probing…')
   elseif s_probe.state ==# 'idle'
     add(lines, '[INFO] version: not probed — this Vim has no +job')
+  elseif s_probe.state ==# 'timeout'
+    add(lines, printf('[ERROR] version: the binary did not answer --version '
+      .. 'within %ds — it looks wedged; run ./install.sh, then '
+      .. ':SimpleFinderRestart', PROBE_TIMEOUT_MS / 1000))
   elseif s_probe.state ==# 'failed'
     add(lines, '[ERROR] version: the binary did not answer --version — '
       .. 'run ./install.sh, then :SimpleFinderRestart')
@@ -726,6 +786,7 @@ enddef
 # read, scrolled and pasted into bug reports — none of which the message area
 # supports, and the last of which is the whole point of the command.
 export def Health()
+  RetryTimedOutProbe()
   var report = HealthReport()
   var windows = s_health_bufnr > 0 && bufexists(s_health_bufnr)
     ? win_findbuf(s_health_bufnr) : []

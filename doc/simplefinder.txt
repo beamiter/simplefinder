@@ -577,6 +577,16 @@ What it guarantees:
         report therefore says `probing…` on that line and rewrites itself in
         place when the answer arrives.
 
+        A binary that never answers gets a verdict all the same, because that
+        is the failure the command exists for: |job_start()| succeeds against
+        a wedged binary and its exit callback simply never comes. The probe
+        has a three-second deadline; when it expires the child is stopped and
+        the line becomes `[ERROR] version: the binary did not answer
+        --version within 3s`, redrawn in place like any other answer. Running
+        :SimpleFinderHealth again after that tries once more, so a machine
+        that was thrashing for one moment does not carry the red line for the
+        rest of the session.
+
                                                       *:SimpleFinderRestart*
 :SimpleFinderRestart
         Stop the daemon and start a fresh one. Clears the crash-loop breaker,

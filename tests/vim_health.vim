@@ -53,8 +53,10 @@ function! s:Section(lines, title) abort
   return l:out
 endfunction
 
-function! s:WaitFor(Cond, label) abort
-  for l:attempt in range(300)
+" The optional third argument is a longer budget, for the waits that are
+" waiting on a deadline in the plugin rather than on a binary that answers.
+function! s:WaitFor(Cond, label, ...) abort
+  for l:attempt in range(a:0 ? a:1 : 300)
     if call(a:Cond, [])
       return 1
     endif
@@ -129,6 +131,44 @@ call assert_match('\[ERROR\] version: daemon 0\.0\.1, plugin \d\+\.\d\+\.\d\+',
 let g:simplefinder_daemon_path = s:daemon
 call delete(s:shim)
 call s:WaitFor({-> join(s:Report(), "\n") !~# 'probing'}, 'the real binary answers again')
+
+" ── A binary that answers nothing still has to end in a verdict ──
+"
+" This is the failure the whole command was written for, and the one the async
+" probe cannot see by itself: against a wedged binary job_start() succeeds and
+" exit_cb never arrives, so without a deadline the line reads `probing…` for
+" the rest of the session and the one user who is certain something is wrong
+" gets no fact at all.  The report is read straight out of the buffer here, so
+" the redraw-in-place is on trial as well as the deadline.
+function! s:Buffer() abort
+  return join(getline(1, '$'), "\n")
+endfunction
+
+let s:wedged = s:root .. '/tests/wedged-daemon.sh'
+call writefile(['#!/bin/sh', 'sleep 600'], s:wedged)
+call setfperm(s:wedged, 'rwxr-xr-x')
+let g:simplefinder_daemon_path = s:wedged
+call s:Report()
+call assert_match('\[INFO\] version: probing…', s:Buffer(),
+      \ 'the probe is asynchronous, so the command itself never hangs')
+call s:WaitFor({-> s:Buffer() !~# 'probing'}, 'the wedged binary is given up on', 800)
+call assert_match('\[ERROR\] version: the binary did not answer --version within \d\+s',
+      \ join(s:Section(split(s:Buffer(), "\n"), 'BINARY'), "\n"),
+      \ 'a binary that never answers has to end in a verdict, not in probing…')
+
+" A deadline that fired is a verdict, not an answer: running the command again
+" is asking for another attempt, and it has to get one -- otherwise a machine
+" that was thrashing for one moment carries the red line until Vim restarts.
+call assert_match('\[INFO\] version: probing…', join(s:Report(), "\n"),
+      \ 'a timed-out probe is tried again when the user asks again')
+
+let g:simplefinder_daemon_path = s:daemon
+call delete(s:wedged)
+call s:WaitFor({-> join(s:Report(), "\n") !~# 'probing'},
+      \ 'the real binary answers after the wedged one', 800)
+call assert_match('\[OK\] version: \d\+\.\d\+\.\d\+',
+      \ join(s:Section(s:Report(), 'BINARY'), "\n"),
+      \ 'a probe still in flight does not own the report once the binary changes')
 
 " ── Once the daemon is up, the report says so ──
 "
