@@ -273,30 +273,477 @@ export def ShowLog()
   simplefinder#core#ShowLog()
 enddef
 
-export def Health()
-  SetupCore()
-  var lines = ['SimpleFinder health', repeat('─', 40)]
-  extend(lines, simplefinder#core#HealthLines())
-  var caps = simplefinder#core#Caps()
-  if simplefinder#core#Ready() && empty(caps)
-    add(lines, '[WARN] daemon predates the capability handshake; rerun ./install.sh')
+# =============================================================
+# Configuration validation
+#
+# A mistyped option is the one failure with no symptom at all: every reader
+# goes through get(g:, ...), so the misspelled name is simply never read and
+# the line the user did write does nothing, for ever.  Nothing in the plugin
+# was in a position to notice, because noticing means knowing the whole set of
+# names — which is what the table below is.
+# =============================================================
+
+# Every documented option, declared once.  A table beats a wall of ifs for the
+# reason that matters here: an option added to plugin/simplefinder.vim and not
+# added below is reported as an *unknown* g:simplefinder_ name, so forgetting
+# to describe an option fails loudly instead of quietly.
+#
+#   type      one of v:t_number / v:t_string / v:t_list / v:t_dict
+#   flag      a number read as a truth value; v:true/v:false are fine too
+#   allowed   the permitted strings
+#   min       the smallest value the plugin actually honours
+#   min_note  what the plugin does with a smaller one.  Its presence is what
+#             makes an out-of-range value a WARN rather than an ERROR: the
+#             behaviour is still defined, just not the one that was asked for.
+#   items     'string' when a list may hold only non-empty strings
+#   no_bang   list entries must not start with '!' — see ReadPathGlobList()
+const CONFIG_SPEC: list<dict<any>> = [
+  {name: 'debug', type: v:t_number, flag: true},
+  {name: 'daemon_path', type: v:t_string},
+  {name: 'max_results', type: v:t_number, min: 1},
+  {name: 'threads', type: v:t_number, min: 0,
+   min_note: 'the daemon runs one worker per core'},
+  {name: 'grep_cache', type: v:t_number, flag: true},
+  {name: 'debounce_ms', type: v:t_number, min: 0},
+  {name: 'panel_width', type: v:t_number, min: 24,
+   min_note: 'the panel opens at 24 columns'},
+  {name: 'position', type: v:t_string, allowed: ['left', 'right']},
+  {name: 'close_on_select', type: v:t_number, flag: true},
+  {name: 'preview', type: v:t_number, flag: true},
+  {name: 'preview_syntax', type: v:t_number, flag: true},
+  {name: 'preview_width', type: v:t_number, min: 0},
+  {name: 'preview_max_bytes', type: v:t_number, min: 0},
+  {name: 'preview_cache', type: v:t_number, min: 1,
+   min_note: 'one previewed file is always kept'},
+  {name: 'hidden', type: v:t_number, flag: true},
+  {name: 'no_ignore', type: v:t_number, flag: true},
+  {name: 'regex', type: v:t_number, flag: true},
+  {name: 'ignore_case', type: v:t_number, flag: true},
+  {name: 'smart_case', type: v:t_number, flag: true},
+  {name: 'recent_files_max', type: v:t_number, min: 1},
+  {name: 'history_max', type: v:t_number, min: 0},
+  {name: 'lines_max', type: v:t_number, min: 1},
+  {name: 'root', type: v:t_string},
+  {name: 'root_markers', type: v:t_list, items: 'string'},
+  {name: 'include_globs', type: v:t_list, items: 'string', no_bang: true},
+  {name: 'exclude_globs', type: v:t_list, items: 'string', no_bang: true},
+  {name: 'symbol_keywords', type: v:t_dict},
+  {name: 'symbol_all_languages', type: v:t_number, flag: true},
+]
+
+def TypeName(want: number): string
+  if want == v:t_number
+    return 'a number'
+  elseif want == v:t_string
+    return 'a string'
+  elseif want == v:t_list
+    return 'a list'
   endif
-  add(lines, printf('[%s] popup preview: %s',
-    has('popupwin') ? 'OK' : 'WARN',
-    has('popupwin') ? 'available' : 'missing +popupwin — preview disabled'))
+  return 'a dictionary'
+enddef
+
+# A value short enough to name in a diagnostic without swamping it.
+def Brief(value: any): string
+  var text = type(value) == v:t_string ? value : string(value)
+  return strchars(text) > 40 ? strcharpart(text, 0, 40) .. '…' : text
+enddef
+
+def CheckList(spec: dict<any>, name: string, value: list<any>): list<string>
+  if get(spec, 'items', '') !=# 'string'
+    return []
+  endif
+  for entry in value
+    if type(entry) != v:t_string || entry ==# ''
+      return [printf('[ERROR] %s contains %s; every entry must be a non-empty string',
+        name, Brief(entry))]
+    endif
+    # ReadPathGlobList() throws on a leading ! rather than guess which way the
+    # user meant to invert the filter, so the search fails before it starts.
+    if get(spec, 'no_bang', false) && entry[0] ==# '!'
+      return [printf('[ERROR] %s contains %s; an exclusion belongs in '
+        .. 'g:simplefinder_exclude_globs, not behind a leading !', name, Brief(entry))]
+    endif
+  endfor
+  return []
+enddef
+
+def CheckOption(spec: dict<any>, value: any): list<string>
+  var name = 'g:simplefinder_' .. spec.name
+  var want: number = spec.type
+  # A flag is read with `!= 0`, so v:true and v:false serve as well as 1 and 0.
+  var is_bool = type(value) == v:t_bool && get(spec, 'flag', false)
+  if type(value) != want && !is_bool
+    # No claim about what happens next, because it differs per option: some
+    # readers fall back to the default, while g:simplefinder_panel_width goes
+    # through max() and aborts the panel with E1030.  The fact is enough.
+    return [printf('[ERROR] %s = %s is not %s', name, Brief(value), TypeName(want))]
+  endif
+  if is_bool
+    return []
+  endif
+
+  var problems: list<string> = []
+  if want == v:t_number
+    if has_key(spec, 'min') && value < spec.min
+      add(problems, has_key(spec, 'min_note')
+        ? printf('[WARN] %s = %d is below the minimum %d; %s',
+            name, value, spec.min, spec.min_note)
+        : printf('[ERROR] %s = %d is below the minimum %d', name, value, spec.min))
+    endif
+    if get(spec, 'flag', false) && value != 0 && value != 1
+      add(problems, printf('[WARN] %s = %d is an on/off flag; anything but 0 means on',
+        name, value))
+    endif
+  elseif want == v:t_string && has_key(spec, 'allowed')
+    if index(spec.allowed, value) < 0
+      add(problems, printf('[ERROR] %s = %s is not one of %s',
+        name, Brief(value), join(spec.allowed, '/')))
+    endif
+  elseif want == v:t_list
+    extend(problems, CheckList(spec, name, value))
+  endif
+  return problems
+enddef
+
+# Facts about the configuration that no single option can express on its own.
+def CrossCheck(): list<string>
+  var problems: list<string> = []
+
+  var daemon_path = get(g:, 'simplefinder_daemon_path', '')
+  if type(daemon_path) == v:t_string && daemon_path !=# '' && !executable(daemon_path)
+    add(problems, printf('[ERROR] g:simplefinder_daemon_path = %s is not executable — '
+      .. 'the usual lookup (runtimepath lib/, a target/ build, then $PATH) is used instead',
+      Brief(daemon_path)))
+  endif
+
+  var root = get(g:, 'simplefinder_root', '')
+  if type(root) == v:t_string && root !=# '' && !isdirectory(expand(root))
+    add(problems, printf('[ERROR] g:simplefinder_root = %s is not a directory — '
+      .. 'the root is detected from the markers instead', Brief(root)))
+  endif
+
+  # Both are legal and one simply wins; saying which one saves the user the
+  # experiment of grepping for a capital letter and not understanding why.
+  if get(g:, 'simplefinder_ignore_case', 0) != 0
+      && get(g:, 'simplefinder_smart_case', 1) != 0
+    add(problems, '[WARN] g:simplefinder_ignore_case overrides '
+      .. 'g:simplefinder_smart_case; set only one')
+  endif
+
+  # The preview popup is never opened narrower than 30 columns, so a width
+  # between 1 and 29 does something other than what it says.
+  var preview_width = get(g:, 'simplefinder_preview_width', 0)
+  if type(preview_width) == v:t_number && preview_width > 0 && preview_width < 30
+    add(problems, printf('[WARN] g:simplefinder_preview_width = %d is below the '
+      .. 'minimum 30; the preview opens at 30 columns', preview_width))
+  endif
+
+  var keywords = get(g:, 'simplefinder_symbol_keywords', {})
+  if type(keywords) == v:t_dict
+    for [filetype, list] in items(keywords)
+      if type(list) != v:t_list
+        add(problems, printf('[ERROR] g:simplefinder_symbol_keywords[%s] is not a list — '
+          .. "the built-in keywords for that filetype are used instead", filetype))
+        continue
+      endif
+      for keyword in list
+        if type(keyword) != v:t_string || keyword ==# ''
+          add(problems, printf('[ERROR] g:simplefinder_symbol_keywords[%s] contains %s; '
+            .. 'every keyword must be a non-empty string', filetype, Brief(keyword)))
+          break
+        endif
+      endfor
+    endfor
+  endif
+  return problems
+enddef
+
+# Everything wrong with the configuration as it stands, as `[LEVEL] fact —
+# remedy` lines.  An empty list means there is nothing to say.
+#
+# Nothing here throws and nothing here changes anything: a bad option is
+# reported and then left alone by the code that reads it, because a finder that
+# refuses to open is a worse answer to a typo than one that opens on defaults.
+export def ValidateConfig(): list<string>
+  var problems: list<string> = []
+  var known: dict<bool> = {}
+  for spec in CONFIG_SPEC
+    var key = 'simplefinder_' .. spec.name
+    known[key] = true
+    if has_key(g:, key)
+      extend(problems, CheckOption(spec, g:[key]))
+    endif
+  endfor
+  extend(problems, CrossCheck())
+
+  # Only names this plugin owns are considered: g:loaded_simplefinder is the
+  # load guard and a bare g:simplefinder belongs to whoever set it, so neither
+  # is ours to complain about.
+  for key in sort(keys(g:))
+    if key =~# '^simplefinder_' && !has_key(known, key)
+      add(problems, printf('[ERROR] g:%s is not a SimpleFinder option — check the '
+        .. 'spelling against :help simplefinder-config', key))
+    endif
+  endfor
+  return problems
+enddef
+
+# Validation runs once, on the first panel of the session, and echoes only the
+# ERROR lines: a warning is a value the plugin still honours, and belongs in
+# :SimpleFinderHealth where the user went looking for it, rather than in front
+# of a search they just asked for.
+var s_config_checked: bool = false
+
+def CheckConfigOnce()
+  if s_config_checked
+    return
+  endif
+  s_config_checked = true
+  for line in ValidateConfig()
+    if line =~# '^\[ERROR\]'
+      echohl WarningMsg | echom '[SimpleFinder] ' .. line | echohl NONE
+    endif
+  endfor
+enddef
+
+# =============================================================
+# Health report
+# =============================================================
+
+# The plugin's own directory, resolved once from this very script rather than
+# from &runtimepath, which may hold several checkouts.  Everything about
+# versions is relative to it: Cargo.toml for the version the Vim files shipped
+# with, src/ for whether the binary predates them.
+const PLUGIN_ROOT: string = expand('<sfile>:p:h:h')
+
+def PluginVersion(): string
+  var manifest = PLUGIN_ROOT .. '/Cargo.toml'
+  if !filereadable(manifest)
+    return ''
+  endif
+  # [package] comes first, so the first bare `version =` is the crate's; the
+  # 20-line budget keeps `rust-version` and the dependency table out of it.
+  for line in readfile(manifest, '', 20)
+    var version = matchstr(line, '^version\s*=\s*"\zs[^"]\+\ze"')
+    if version !=# ''
+      return version
+    endif
+  endfor
+  return ''
+enddef
+
+# The daemon's own --version, probed with job_start().
+#
+# Never system(): this report is what you run *because* something is wedged,
+# and a synchronous probe of a wedged binary hangs the very command you are
+# using to diagnose it.  The answer is cached per binary — path *and* mtime, so
+# a rebuild is probed again — and the report redraws itself when the answer
+# lands, so the first one says `probing…` and then fills itself in.
+var s_probe: dict<any> = {key: '', state: 'idle', version: ''}
+
+def ProbeVersion(exe: string)
+  if exe ==# '' || !has('job')
+    return
+  endif
+  var key = exe .. '@' .. getftime(exe)
+  if s_probe.key ==# key && s_probe.state !=# 'idle'
+    return
+  endif
+  s_probe = {key: key, state: 'running', version: ''}
+  var output: list<string> = []
+  var job = job_start([exe, '--version'], {
+    out_cb: (_, msg: string) => {
+      add(output, msg)
+    },
+    exit_cb: (_, status: number) => {
+      # A rebuild, or a different binary, may have started a newer probe while
+      # this one was still running: the newest key owns the answer.
+      if s_probe.key !=# key
+        return
+      endif
+      s_probe.version = matchstr(join(output, ' '), '\d\+\.\d\+\.\d\+')
+      s_probe.state = status == 0 && s_probe.version !=# '' ? 'done' : 'failed'
+      RefreshHealthBuffer()
+    },
+    err_io: 'null',
+  })
+  # job_start() hands back a job even when the exec failed, and then no
+  # exit callback ever arrives; without this the report says `probing…` for
+  # the rest of the session.
+  if job_status(job) ==# 'fail'
+    s_probe.state = 'failed'
+  endif
+enddef
+
+def BinaryLines(): list<string>
+  var lines: list<string> = []
+  var exe = simplefinder#core#ExePath()
+  if exe ==# ''
+    exe = simplefinder#core#FindExe()
+  endif
+  if exe ==# ''
+    add(lines, '[ERROR] binary: not found — run ./install.sh in ' .. PLUGIN_ROOT)
+    return lines
+  endif
+  add(lines, printf('[OK] binary: %s', exe))
+
+  # The classic upgrade failure: a plugin manager pulls new Vim files and new
+  # Rust sources, nothing rebuilds lib/, and everything then looks healthy
+  # while a capability the help documents is quietly missing.
+  var built = getftime(exe)
+  var newest = 0
+  for source in glob(PLUGIN_ROOT .. '/src/**/*.rs', true, true)
+    newest = max([newest, getftime(source)])
+  endfor
+  if built > 0 && newest > built
+    add(lines, '[WARN] binary is older than src/ — run ./install.sh, '
+      .. 'then :SimpleFinderRestart')
+  endif
+
+  ProbeVersion(exe)
+  var plugin_version = PluginVersion()
+  if s_probe.state ==# 'running'
+    add(lines, '[INFO] version: probing…')
+  elseif s_probe.state ==# 'idle'
+    add(lines, '[INFO] version: not probed — this Vim has no +job')
+  elseif s_probe.state ==# 'failed'
+    add(lines, '[ERROR] version: the binary did not answer --version — '
+      .. 'run ./install.sh, then :SimpleFinderRestart')
+  elseif plugin_version !=# '' && s_probe.version !=# plugin_version
+    add(lines, printf('[ERROR] version: daemon %s, plugin %s — an upgrade left the '
+      .. 'old binary behind; run ./install.sh, then :SimpleFinderRestart',
+      s_probe.version, plugin_version))
+  else
+    add(lines, printf('[OK] version: %s', s_probe.version))
+  endif
+  return lines
+enddef
+
+# Nothing here is optional: the daemon is a job, its replies arrive on a
+# channel, every debounce is a timer, the panel highlights matches with text
+# properties and the preview is a popup.  None of those calls is guarded, so a
+# Vim missing any of them does not degrade — it throws.
+const REQUIRED_FEATURES: list<string> = ['job', 'channel', 'timers', 'textprop', 'popupwin']
+
+def EnvironmentLines(): list<string>
+  var lines: list<string> = []
+  add(lines, printf('[%s] vim: %d.%d (needs 9.0 or later, with :vim9script)',
+    has('vim9script') ? 'OK' : 'ERROR', v:version / 100, v:version % 100))
+  var missing = filter(copy(REQUIRED_FEATURES), (_, f) => !has(f))
+  if empty(missing)
+    add(lines, printf('[OK] features: %s',
+      join(mapnew(REQUIRED_FEATURES, (_, f) => '+' .. f), ', ')))
+  else
+    add(lines, printf('[ERROR] features: missing %s — rebuild Vim with them',
+      join(mapnew(missing, (_, f) => '+' .. f), ', ')))
+  endif
+  add(lines, printf('[%s] encoding: %s',
+    &encoding ==# 'utf-8' ? 'OK' : 'WARN', &encoding))
+  return lines
+enddef
+
+def RuntimeLines(): list<string>
+  var lines: list<string> = []
+  var core = simplefinder#core#Health()
+  if !core.running && core.starts == 0
+    # The daemon starts with the first search, so before then `not running` is
+    # the expected state and not a fault.  Reporting it as an error opened the
+    # one command a user runs when something is wrong with a red herring, and
+    # sent every bug report that quoted it down the same blind alley.
+    add(lines, '[INFO] daemon: not started yet — it starts with the first search')
+    return lines
+  endif
+  extend(lines, simplefinder#core#HealthLines())
+  if simplefinder#core#Ready() && empty(simplefinder#core#Caps())
+    add(lines, '[WARN] daemon predates the capability handshake — '
+      .. 'run ./install.sh, then :SimpleFinderRestart')
+  endif
+  return lines
+enddef
+
+def ContextLines(): list<string>
+  var lines: list<string> = []
   add(lines, printf('[INFO] project root: %s',
-    s_project_root ==# '' ? '(not resolved yet)' : s_project_root))
+    s_project_root ==# '' ? '(resolved on the first search)' : s_project_root))
   try
     var includes = ReadPathGlobList('simplefinder_include_globs')
     var excludes = ReadPathGlobList('simplefinder_exclude_globs')
     add(lines, printf('[INFO] path globs: %d include, %d exclude',
       len(includes), len(excludes)))
   catch
-    add(lines, '[WARN] path globs: ' .. v:exception)
+    # A glob list this file refuses to read is not cosmetic: the panel opens
+    # on the error instead of on results.
+    add(lines, '[ERROR] path globs: ' .. v:exception)
   endtry
-  for line in lines
-    echom line
-  endfor
+  add(lines, printf('[INFO] preview: %s',
+    get(g:, 'simplefinder_preview', 1) != 0
+      ? 'on by default' : 'off (g:simplefinder_preview = 0)'))
+  return lines
+enddef
+
+# Fixed sections, always in this order and always present, so two reports from
+# two machines can be read side by side and a missing fact reads as a missing
+# fact rather than as a shorter report.
+def AddSection(lines: list<string>, title: string, body: list<string>)
+  add(lines, '')
+  add(lines, title)
+  extend(lines, body)
+enddef
+
+def HealthReport(): list<string>
+  SetupCore()
+  var lines = ['SimpleFinder health', repeat('─', 60)]
+  AddSection(lines, 'ENVIRONMENT', EnvironmentLines())
+  AddSection(lines, 'BINARY', BinaryLines())
+  var config = ValidateConfig()
+  AddSection(lines, 'CONFIG', empty(config)
+    ? ['[OK] every option holds a value this plugin understands']
+    : config)
+  AddSection(lines, 'RUNTIME', RuntimeLines())
+  AddSection(lines, 'CONTEXT', ContextLines())
+  return lines
+enddef
+
+const HEALTH_BUFNAME = 'SimpleFinderHealth'
+var s_health_bufnr: number = -1
+
+# Redraw the report in place, without stealing focus, when the version probe
+# lands after the buffer was already on screen.
+def RefreshHealthBuffer()
+  if s_health_bufnr <= 0 || !bufloaded(s_health_bufnr)
+      || empty(win_findbuf(s_health_bufnr))
+    return
+  endif
+  var report = HealthReport()
+  setbufvar(s_health_bufnr, '&modifiable', 1)
+  deletebufline(s_health_bufnr, 1, '$')
+  setbufline(s_health_bufnr, 1, report)
+  setbufvar(s_health_bufnr, '&modifiable', 0)
+  setbufvar(s_health_bufnr, '&modified', 0)
+enddef
+
+# The report is a scratch buffer rather than a wall of :echom, because it is
+# read, scrolled and pasted into bug reports — none of which the message area
+# supports, and the last of which is the whole point of the command.
+export def Health()
+  var report = HealthReport()
+  var windows = s_health_bufnr > 0 && bufexists(s_health_bufnr)
+    ? win_findbuf(s_health_bufnr) : []
+  if !empty(windows)
+    win_gotoid(windows[0])
+  elseif s_health_bufnr > 0 && bufexists(s_health_bufnr)
+    execute 'silent keepalt botright sbuffer ' .. s_health_bufnr
+  else
+    execute 'silent keepalt botright split ' .. fnameescape(HEALTH_BUFNAME)
+    s_health_bufnr = bufnr('%')
+  endif
+  setlocal buftype=nofile bufhidden=hide noswapfile nobuflisted nowrap
+  setlocal modifiable
+  silent deletebufline('%', 1, '$')
+  setline(1, report)
+  setlocal nomodifiable nomodified
+  execute 'resize ' .. min([len(report) + 1, max([10, &lines / 2])])
+  normal! gg
 enddef
 
 # =============================================================
@@ -524,6 +971,10 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   EnsurePanel()
   SetupSyntax()
   PanelRender()
+  # After the render, not before it: a message echoed first is painted over by
+  # the panel and the user never sees the one thing that explains why their
+  # setting is not taking effect.
+  CheckConfigOnce()
 enddef
 
 def EnsurePanel()

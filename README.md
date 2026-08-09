@@ -20,6 +20,8 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 - 文件、最近文件、缓冲区、光标词和可视选择搜索
 - 编辑、水平/垂直分屏和新标签页打开；缓冲区模式可直接关闭 buffer
 - 清晰的加载、错误、耗时、结果上限和空状态反馈
+- `:SimpleFinderHealth` 是一份可读、可粘贴的诊断报告，并会校验配置：拼错的
+  `g:simplefinder_` 选项、类型写错的值、指不到的路径都会被点名
 
 ## 要求与安装
 
@@ -172,6 +174,35 @@ let g:simplefinder_exclude_globs = ['*.generated.rs', 'fixtures/**']
 被排除的文件不会再被全文读取。配置会在面板打开时快照，`Resume` 保留该快照；
 无效 glob 会成为可见错误。此能力使用协议 v3，旧 daemon 会 fail closed 并提示
 重新运行 `./install.sh`，不会静默忽略排除规则。
+
+## 诊断
+
+`:SimpleFinderHealth` 把诊断写进一个 scratch buffer——它是拿来读、拿来滚、拿来贴进
+issue 的，消息区这三件事都做不到。固定五段，顺序固定，所以两份报告能并排看，缺一
+条事实读起来就是缺一条事实：
+
+- `ENVIRONMENT`：Vim 版本、插件不做保护直接调用的那几个特性（`+job`、`+channel`、
+  `+timers`、`+textprop`、`+popupwin`）、`encoding`
+- `BINARY`：找到的是哪个 daemon、它是不是比旁边的 Rust 源码还旧、它的版本对不对得上
+  `Cargo.toml`——插件管理器拉了新的 Vim 文件却没重新构建 `lib/` 的那种升级，只有这里
+  看得出来。版本用 `job_start()` 问，不用 `system()`：你正是因为它卡住才跑这条命令，
+  同步探测会把命令本身一起挂死。第一份报告在这行写 `probing…`，答案到了就地重画
+- `CONFIG`：配置校验结果，没问题时是一行"每个选项都拿着插件认得的值"
+- `RUNTIME`：运行状态、协商到的协议与能力、uptime、崩溃/重启计数、熔断器。第一次搜索
+  之前根本还没有 daemon，这里就照实说是"还没启动"，而不是报错——daemon 本来就随第一次
+  搜索启动，把预期状态写成 `[ERROR]` 会让每一份引用它的 bug report 走进死胡同
+- `CONTEXT`：项目根、include/exclude glob 数量、预览默认开关
+
+配置校验单独也能调用：`simplefinder#ValidateConfig()` 返回一个诊断列表，空列表表示
+没有问题。`[ERROR]` 表示这个值根本用不上（名字不是选项、类型不对、路径不存在），
+`[WARN]` 表示会用，但不是按你写的用（低于插件自己会 clamp 的下限，或被另一个选项
+覆盖）。其中 `[ERROR]` 会在一次会话里的第一个面板打开后 echo 一次——一个永远不会
+生效的设置，不该等着谁想起来跑健康检查才被发现。
+
+拼错的选项是最没有症状的那种故障：所有读取都走 `get(g:, ..., 默认值)`，名字写错就永远
+读不到，插件用默认值继续跑，而你写的那一行什么都不做。所以插件把选项全集声明在一处，
+任何其它 `g:simplefinder_` 名字都按拼写错误报出来（`g:loaded_simplefinder` 和裸的
+`g:simplefinder` 不算）。
 
 ## 自定义来源
 

@@ -301,6 +301,53 @@ The project root is found by walking up from the current file looking for a
 root marker, falling back to |getcwd()|. Scanning honours `.ignore`,
 `.gitignore`, the global git ignore and `.git/info/exclude`.
 
+VALIDATION                                           *simplefinder-validation*
+
+Every option above is read through |get()| with its default as the fallback,
+which makes a misspelled name the one failure with no symptom at all: the
+setting is never read, the default is used, and nothing says so. The whole set
+of names is therefore declared once inside the plugin and checked against what
+you actually set.
+
+                                                *simplefinder#ValidateConfig()*
+simplefinder#ValidateConfig()
+        Returns a list of `[LEVEL] fact -- remedy` lines describing everything
+        wrong with the configuration as it stands right now, empty when there
+        is nothing to say. It never throws and never changes anything.
+
+        [ERROR] means the value cannot be used as written: the name is not an
+        option, the type is wrong, or the value names something that is not
+        there. [WARN] means it is used, but not as written -- a value below a
+        floor the plugin clamps, or a setting another setting overrides.
+
+The same list is the CONFIG section of |:SimpleFinderHealth|. The [ERROR]
+lines are additionally echoed once per session, after the first panel opens,
+because a setting that will never do anything should not wait to be found by
+someone who thought to run a health check. [WARN] lines stay in the report.
+
+What is checked:
+
+- The type of every option, including that `g:simplefinder_position` is
+  "left" or "right". Flags accept |v:true| and |v:false| as well as 1 and 0.
+- Numeric floors, reported with what the plugin does instead where it clamps:
+  `max_results` 1, `threads` 0 (one worker per core below that),
+  `debounce_ms` 0, `panel_width` 24 (the panel opens at 24 columns),
+  `preview_width` 0, and 30 for any non-zero width (the preview opens at 30),
+  `preview_max_bytes` 0, `preview_cache` 1 (one file is always kept),
+  `recent_files_max` 1, `history_max` 0, `lines_max` 1.
+- That `g:simplefinder_root_markers`, `g:simplefinder_include_globs` and
+  `g:simplefinder_exclude_globs` hold only non-empty strings, and that no glob
+  starts with `!` -- |g:simplefinder_include_globs| rejects those, rather than
+  guess which way you meant to invert the filter.
+- That `g:simplefinder_symbol_keywords` maps a filetype to a list of non-empty
+  strings; a value that is not a list leaves the built-in keywords in place.
+- That `g:simplefinder_root`, when set, is a directory, and that
+  `g:simplefinder_daemon_path`, when set, is executable.
+- That `g:simplefinder_ignore_case` and `g:simplefinder_smart_case` are not
+  both on, since the first one wins.
+- Any other `g:simplefinder_` name, which is a typo by definition.
+  `g:loaded_simplefinder` and a plain `g:simplefinder` are left alone.
+
 					*g:simplefinder_max_results*
 g:simplefinder_max_results
 	How many results one query returns. Default 200.
@@ -500,9 +547,35 @@ What it guarantees:
 
                                                       *:SimpleFinderHealth*
 :SimpleFinderHealth
-        Report daemon path, run state, negotiated protocol and capabilities,
-        uptime, crash and restart counts, and whether the crash-loop breaker
-        has tripped, alongside this plugin's own diagnostics.
+        Open the diagnosis in a scratch buffer -- it is meant to be read,
+        scrolled and pasted into a bug report, none of which the message area
+        does. Five sections, always present and always in this order, so two
+        reports can be read side by side and a missing fact reads as one:
+
+        ENVIRONMENT  Vim version, the features this plugin calls without a
+                     guard (+job, +channel, +timers, +textprop, +popupwin),
+                     and 'encoding'.
+        BINARY       Which daemon was found, whether it is older than the
+                     Rust sources next to it, and its version against the
+                     version in the plugin's own Cargo.toml -- the upgrade
+                     that pulls new Vim files over a stale lib/ binary shows
+                     up here and nowhere else.
+        CONFIG       |simplefinder#ValidateConfig()|, or one line saying every
+                     option holds a value the plugin understands.
+        RUNTIME      Daemon run state, negotiated protocol and capabilities,
+                     uptime, crash and restart counts, and whether the
+                     crash-loop breaker has tripped. Before the first search
+                     there is no daemon yet and this says so, as information:
+                     the daemon starts with the first search, and reporting
+                     the expected state as an error sends every bug report
+                     that quotes it down a blind alley.
+        CONTEXT      Project root, path glob counts, preview default.
+
+        The daemon's version is asked for with |job_start()|, never
+        |system()|: this is the command you run because something is wedged,
+        and a synchronous probe of a wedged binary would hang it. The first
+        report therefore says `probing…` on that line and rewrites itself in
+        place when the answer arrives.
 
                                                       *:SimpleFinderRestart*
 :SimpleFinderRestart

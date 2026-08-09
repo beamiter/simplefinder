@@ -2,6 +2,36 @@
 
 ## Unreleased - 2026-08-09
 
+### `:SimpleFinderHealth` 变成真的诊断，配置会被校验一次
+
+- 全新会话里打开 health，头两行是 `[ERROR] daemon` 和 `[ERROR] state: not running`
+  ——两句都是真的，也都毫无意义：daemon 本来就随第一次搜索启动。用户唯一会在"出问题
+  了"时跑的那条命令，第一眼给的是一条假线索，引用它的 bug report 全都走进死胡同。
+  与此同时，真正会发生的两种故障它一句都没说：插件管理器升级后留在 `lib/` 里的旧
+  二进制，和写错的 `g:` 选项——后者是纯粹的沉默，因为每个读取点都是
+  `get(g:, ..., 默认值)`，名字错了就永远读不到。
+- 现在报告写进一个 scratch buffer（可读、可滚、可粘进 issue），固定五段：
+  `ENVIRONMENT` / `BINARY` / `CONFIG` / `RUNTIME` / `CONTEXT`，顺序固定且永远都在，
+  两份报告能并排看，少一条事实读起来就是少一条事实。`RUNTIME` 在 daemon 从未启动过
+  时只说一句 `not started yet`，级别是 `[INFO]`。
+- `BINARY` 会比对二进制与 `src/**/*.rs` 的 mtime，并把 `--version` 的结果对上
+  `Cargo.toml` 里的版本——升级只换了 Vim 文件、没重跑 `./install.sh` 的那种破法，只有
+  这里看得出来。版本用 `job_start()` 异步问：这条命令正是因为二进制卡住才跑的，
+  `system()` 会把命令本身一起挂死。第一份报告写 `probing…`，答案到了就地重画。
+- 新增 `simplefinder#ValidateConfig()`：选项全集声明在一张表里，校验类型、取值集合、
+  数值下限、列表元素、glob 的 `!` 前缀、`root` 是不是目录、`daemon_path` 能不能执行、
+  `ignore_case` 与 `smart_case` 撞车，以及任何不在表里的 `g:simplefinder_` 名字。
+  下限取的是插件自己 clamp 的那个数（`panel_width` 是 24，不是随手写的数字），否则
+  报告会在描述一个插件根本不会打开的宽度。`[ERROR]` 表示这个值用不上，`[WARN]` 表示
+  会用、但不是按你写的用。`g:loaded_simplefinder` 和裸的 `g:simplefinder` 不归我们管。
+- 同一份列表就是 health 的 `CONFIG` 段；其中 `[ERROR]` 另外在一次会话的第一个面板
+  打开后 echo 一次（在 `PanelRender()` 之后，否则消息会被面板盖掉），`[WARN]` 只留在
+  报告里——搜索不是挨训的地方。
+- 新增 `tests/vim_health.vim`：默认配置必须是干净的；全新会话的 `RUNTIME` 只有一条且
+  不能带 `ERROR`；版本探测必须从 `probing…` 收敛到 `[OK] version: x.y.z`；daemon 起来
+  之后必须报 running；每一类配置错误都要被点名并带上导致它的那个值；拼错的选项必须在
+  第一次搜索时被说出来，而且只说一次。
+
 ### 预览弹窗不再画到没有面板的那个 tab 上
 
 - `PanelRender()` 改成 tabpage 无关是对的(面板待在另一个 tab 时也该收结果),

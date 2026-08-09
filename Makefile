@@ -25,6 +25,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_cache.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_tabs.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_negotiate.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_health.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
