@@ -304,7 +304,8 @@ const CONFIG_SPEC: list<dict<any>> = [
   {name: 'threads', type: v:t_number, min: 0,
    min_note: 'the daemon runs one worker per core'},
   {name: 'grep_cache', type: v:t_number, flag: true},
-  {name: 'debounce_ms', type: v:t_number, min: 0},
+  {name: 'debounce_ms', type: v:t_number, min: 0,
+   min_note: 'the search fires as soon as the timer can run, as 0 does'},
   {name: 'panel_width', type: v:t_number, min: 24,
    min_note: 'the panel opens at 24 columns'},
   {name: 'position', type: v:t_string, allowed: ['left', 'right']},
@@ -322,10 +323,12 @@ const CONFIG_SPEC: list<dict<any>> = [
   {name: 'regex', type: v:t_number, flag: true},
   {name: 'ignore_case', type: v:t_number, flag: true},
   {name: 'smart_case', type: v:t_number, flag: true},
-  {name: 'recent_files_max', type: v:t_number, min: 1},
+  {name: 'recent_files_max', type: v:t_number, min: 1,
+   min_note: 'the list is not trimmed'},
   {name: 'history_max', type: v:t_number, min: 0,
    min_note: 'no query is remembered, as 0 does'},
-  {name: 'lines_max', type: v:t_number, min: 1},
+  {name: 'lines_max', type: v:t_number, min: 1,
+   min_note: 'only the first line is listed, exactly as 1 does'},
   {name: 'root', type: v:t_string},
   {name: 'root_markers', type: v:t_list, items: 'string'},
   {name: 'include_globs', type: v:t_list, items: 'string', no_bang: true},
@@ -2312,7 +2315,11 @@ def DebouncedSearch()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
   endif
-  var ms = get(g:, 'simplefinder_debounce_ms', 50)
+  # A negative wait is honoured today only because timer_start() happens to
+  # treat a due time in the past as due now; nothing documents that.  Clamping
+  # is what makes "below 0 the search fires as soon as the timer can run" —
+  # which the health report says out loud — true by construction.
+  var ms = max([0, get(g:, 'simplefinder_debounce_ms', 50)])
   s_debounce_timer = timer_start(ms, (id) => {
     s_debounce_timer = 0
     DispatchSearch()
@@ -3143,7 +3150,11 @@ export def RecentFiles()
     endif
   endfor
   var mx = get(g:, 'simplefinder_recent_files_max', 100)
-  if len(combined) > mx
+  # `list[: mx - 1]` is a Vim slice, not a Python one: at mx = 0 the end index
+  # is -1, the *last* entry, so it keeps everything, and at mx = -1 it is -2,
+  # which quietly drops the oldest entry every time.  A value below the floor
+  # means "not trimmed", which is what the health report promises for it.
+  if mx > 0 && len(combined) > mx
     combined = combined[: mx - 1]
   endif
   s_all_recent = mapnew(combined, (_, f) => ({path: fnamemodify(f, ':~:.')}))
@@ -3173,7 +3184,9 @@ export def TrackRecentFile()
   filter(s_recent_files, (_, v) => v !=# f)
   insert(s_recent_files, f, 0)
   var mx = get(g:, 'simplefinder_recent_files_max', 100)
-  if len(s_recent_files) > mx
+  # Same slice, same reason as in RecentFiles(): below the floor the list is
+  # kept whole rather than losing an entry per file visited.
+  if mx > 0 && len(s_recent_files) > mx
     s_recent_files = s_recent_files[: mx - 1]
   endif
 enddef

@@ -267,23 +267,85 @@ let g:simplefinder_panel_width = 50
 " as written, and those are the lines CheckConfigOnce() echoes in WarningMsg in
 " front of the first search of the session.  A floor the plugin simply clamps
 " is the documented [WARN] case, so reporting one as an [ERROR] nags a user
-" whose setting is doing precisely what they asked for.  Each pair below is the
-" clamp in the plugin, quoted: `max([0, ...])` for history_max, `if wanted > 0`
-" for preview_width and `max_bytes > 0 &&` for preview_max_bytes -- in all
-" three a value below the floor behaves exactly as 0 does.
+" whose setting is doing precisely what they asked for.  Each case below is the
+" clamp in the plugin, quoted: `max([0, ...])` for history_max and debounce_ms,
+" `if wanted > 0` for preview_width, `max_bytes > 0 &&` for preview_max_bytes,
+" `mx > 0 &&` for recent_files_max and `len(s_all_lines) >= mx` for lines_max --
+" in every one of them a value below the floor is used, just not as written.
+"
+" g:simplefinder_max_results is the one floor that stays an [ERROR], and it is
+" not an oversight: an empty query takes `max` results off the front of the
+" list, so 0 lists nothing at all and there is no behaviour to describe.
 for s:case in [
-      \ ['history_max', -1, 50, 'no query is remembered'],
-      \ ['preview_width', -5, 0, 'the preview picks its own width'],
-      \ ['preview_max_bytes', -1, 2097152, 'no size limit is applied']]
+      \ ['history_max', -1, 50, 0, 'no query is remembered'],
+      \ ['preview_width', -5, 0, 0, 'the preview picks its own width'],
+      \ ['preview_max_bytes', -1, 2097152, 0, 'no size limit is applied'],
+      \ ['debounce_ms', -1, 50, 0, 'the search fires as soon as the timer can run'],
+      \ ['recent_files_max', -1, 100, 1, 'the list is not trimmed'],
+      \ ['lines_max', 0, 50000, 1, 'only the first line is listed']]
   execute 'let g:simplefinder_' . s:case[0] . ' = ' . s:case[1]
   let s:text = s:ProblemText()
   call assert_notmatch('\[ERROR\] g:simplefinder_' . s:case[0], s:text,
         \ s:case[0] . ': a value the plugin clamps is used, so it is not an error')
   call assert_match('\[WARN\] g:simplefinder_' . s:case[0] . ' = ' . s:case[1]
-        \ . ' is below the minimum 0; ' . s:case[3], s:text,
+        \ . ' is below the minimum ' . s:case[3] . '; ' . s:case[4], s:text,
         \ s:case[0] . ': a clamped value is a warning that says what it was clamped to')
   execute 'let g:simplefinder_' . s:case[0] . ' = ' . s:case[2]
 endfor
+
+" ── ...and the note has to be what the plugin really does ──
+"
+" A [WARN] note is a claim about behaviour, and a claim nothing checks is how
+" three of the floors above came to be reported as errors in the first place.
+" So the three whose notes are new are made to happen here, through the
+" commands a user reaches them by.
+function! s:Panel() abort
+  let l:buf = bufnr('SimpleFinder')
+  return l:buf > 0 ? join(getbufline(l:buf, 1, '$'), "\n") : ''
+endfunction
+
+" lines_max: the walk stops the moment the list is as long as the ceiling, and
+" it tests that after adding a line, so below 1 exactly one line is listed.
+new
+call setline(1, ['alpha line', 'bravo line', 'charlie line'])
+let g:simplefinder_lines_max = 0
+SimpleFinderLines
+call assert_match('1 results', s:Panel(),
+      \ 'lines_max below the floor lists the first line, exactly as 1 does')
+call feedkeys("\<Esc>", 'xt')
+let g:simplefinder_lines_max = 50000
+
+" debounce_ms: a search that never fires would leave the panel showing the
+" unfiltered list for ever, so type a query and watch it narrow.
+let g:simplefinder_debounce_ms = -1
+SimpleFinderLines
+call feedkeys('charlie', 'xt')
+call s:WaitFor({-> s:Panel() =~# '1 results'}, 'a debounced search below the floor fires')
+call assert_notmatch('alpha line', s:Panel(),
+      \ 'debounce_ms below the floor searches as soon as the timer can run')
+call feedkeys("\<Esc>", 'xt')
+let g:simplefinder_debounce_ms = 50
+bwipeout!
+
+" recent_files_max: `combined[: mx - 1]` is a Vim slice, so at -1 it used to
+" quietly drop an entry -- both when a file was visited and when the list was
+" read.  Below the floor nothing is trimmed, so every file visited is there.
+let s:recent_dir = s:root . '/tests/health-recent'
+call delete(s:recent_dir, 'rf')
+call mkdir(s:recent_dir, 'p')
+let g:simplefinder_recent_files_max = -1
+for s:name in ['recent-alpha.txt', 'recent-bravo.txt', 'recent-charlie.txt']
+  call writefile(['x'], s:recent_dir . '/' . s:name)
+  execute 'edit ' . fnameescape(s:recent_dir . '/' . s:name)
+endfor
+SimpleFinderRecent
+for s:name in ['recent-alpha.txt', 'recent-bravo.txt', 'recent-charlie.txt']
+  call assert_match(s:name, s:Panel(),
+        \ 'recent_files_max below the floor trims nothing, so ' . s:name . ' is listed')
+endfor
+call feedkeys("\<Esc>", 'xt')
+let g:simplefinder_recent_files_max = 100
+call delete(s:recent_dir, 'rf')
 
 let g:simplefinder_root_markers = ['.git', 42]
 call assert_match('every entry must be a non-empty string',

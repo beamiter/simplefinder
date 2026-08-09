@@ -208,6 +208,13 @@ issue 的，消息区这三件事都做不到。固定五段，顺序固定，�
 覆盖）。其中 `[ERROR]` 会在一次会话里的第一个面板打开后 echo 一次——一个永远不会
 生效的设置，不该等着谁想起来跑健康检查才被发现。
 
+数值下限按这条界线分：插件真的会 clamp 的那些——`threads`、`debounce_ms`、
+`panel_width`、`preview_width`、`preview_max_bytes`、`preview_cache`、
+`recent_files_max`、`history_max`、`lines_max`——报 `[WARN]`，并且写清楚插件实际会怎
+么做（`:help simplefinder-validation` 那份清单里括号中的话就是这个）。只有
+`max_results` 报 `[ERROR]`：空查询是从列表头部取 `max` 条，0 条就是什么都不列，这个
+值确实用不上。
+
 拼错的选项是最没有症状的那种故障：所有读取都走 `get(g:, ..., 默认值)`，名字写错就永远
 读不到，插件用默认值继续跑，而你写的那一行什么都不做。所以插件把选项全集声明在一处，
 任何其它 `g:simplefinder_` 名字都按拼写错误报出来（`g:loaded_simplefinder` 和裸的

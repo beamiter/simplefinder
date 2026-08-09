@@ -2,6 +2,22 @@
 
 ## Unreleased - 2026-08-09
 
+### 另外三个会 clamp 的下限，也不再被报成 `[ERROR]`
+
+- 上一条把 `history_max`、`preview_width`、`preview_max_bytes` 降级成了 `[WARN]`，可
+  同一张表里 `lines_max`、`recent_files_max`、`debounce_ms` 三个的下限依旧没有
+  `min_note`，于是照样报 `[ERROR]`——而这三个值插件同样在用：`lines_max = 0` 时
+  `if len(s_all_lines) >= mx` 是在 add 完一行之后才判断的，结果跟 1 完全一样；
+  `recent_files_max = 0` 走的是 `combined[: -1]`，Vim 的切片里 -1 指最后一个元素，整
+  张表原样留下；`debounce_ms = -1` 交给 `timer_start()` 也照样得到一个有效的 timer 并
+  如期触发。三个都补上 `min_note`，降级为 `[WARN]` 并说明插件实际会怎么做。
+- 两处"用得上但不是你写的那样"顺带钉死，免得报告讲的是巧合：`recent_files_max` 低于
+  下限时不再依赖切片的偶然——`combined[: mx - 1]` 在 -1 时是 `[: -2]`，每访问一个文件
+  就悄悄丢掉一条，读列表时再丢一条——现在明确地不裁剪；`debounce_ms` 低于下限时 clamp
+  到 0，不再指望 `timer_start()` 对"已经过去的到期时间"的未文档化的宽容。
+- `max_results` 是唯一仍报 `[ERROR]` 的下限，这不是漏网：空查询是从列表头部取 `max`
+  条，0 条就是什么都不列，这个值确实用不上。
+
 ### health 报告不再霸占一个同名文件的 buffer
 
 - 报告一直是用名字打开的：`:split SimpleFinderHealth`。可这条命令绑定的是那个**文件

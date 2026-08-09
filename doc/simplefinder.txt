@@ -333,12 +333,17 @@ What is checked:
   -- a note in brackets below is exactly what makes that floor a [WARN] rather
   than an [ERROR]:
   `max_results` 1, `threads` 0 (one worker per core below that),
-  `debounce_ms` 0, `panel_width` 24 (the panel opens at 24 columns),
+  `debounce_ms` 0 (below it the search fires as soon as the timer can run),
+  `panel_width` 24 (the panel opens at 24 columns),
   `preview_width` 0 (below it the preview picks its own width), and 30 for any
   non-zero width (the preview opens at 30), `preview_max_bytes` 0 (below it no
   size limit is applied), `preview_cache` 1 (one file is always kept),
-  `recent_files_max` 1, `history_max` 0 (below it no query is remembered),
-  `lines_max` 1.
+  `recent_files_max` 1 (below it the list is not trimmed), `history_max` 0
+  (below it no query is remembered), `lines_max` 1 (below it only the first
+  line is listed).
+  `max_results` is the one floor with no such note, and that is deliberate:
+  there is no behaviour to describe, because an empty query takes that many
+  paths off the front of the list, so 0 lists nothing at all.
 - That `g:simplefinder_root_markers`, `g:simplefinder_include_globs` and
   `g:simplefinder_exclude_globs` hold only non-empty strings, and that no glob
   starts with `!` -- |g:simplefinder_include_globs| rejects those, rather than
