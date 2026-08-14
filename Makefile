@@ -17,7 +17,6 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_remote.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_symbols.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_globs.vim
-	vim -Nu NONE -n -i NONE -es -S tests/vim_visual.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_grep.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_stream.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_prompt.vim

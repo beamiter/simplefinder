@@ -17,6 +17,7 @@ var s_next_id: number = 0
 
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
+var s_panel_snapshot: list<string> = []
 var s_source_winid: number = 0
 var s_source_bufnr: number = 0
 var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'symbols' | 'recent' | 'buffers' | 'lines' | 'help'
@@ -1160,7 +1161,10 @@ def EnsurePanel()
   s_eff_height = winheight(0)
   setlocal nowrap nonumber norelativenumber signcolumn=no foldcolumn=0
   setlocal nobuflisted noswapfile buftype=nofile bufhidden=hide
-  setlocal cursorline nomodifiable
+  # Terminal bracketed paste bypasses Normal mappings and writes literally.
+  # Keep the scratch buffer writable so the delta can be captured below; all
+  # ordinary printable keys are still consumed by buffer-local mappings.
+  setlocal cursorline modifiable
   setlocal winfixwidth
   if empty(prop_type_get('sf_match', {bufnr: s_panel_bufnr}))
     prop_type_add('sf_match', {bufnr: s_panel_bufnr, highlight: 'SFinderMatch', combine: true})
@@ -1435,7 +1439,8 @@ def PanelRender()
   if last >= extra_start
     deletebufline(s_panel_bufnr, extra_start, last)
   endif
-  setbufvar(s_panel_bufnr, '&modifiable', 0)
+  s_panel_snapshot = getbufline(s_panel_bufnr, 1, '$')
+  setbufvar(s_panel_bufnr, '&modified', 0)
 
   # Highlight matched characters on the visible rows
   try
@@ -1599,7 +1604,8 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
   if new_idx >= 0 && new_idx < len(s_items)
     setbufline(s_panel_bufnr, new_bufline, FormatItemLine(new_idx, width))
   endif
-  setbufvar(s_panel_bufnr, '&modifiable', 0)
+  s_panel_snapshot = getbufline(s_panel_bufnr, 1, '$')
+  setbufvar(s_panel_bufnr, '&modified', 0)
   if old_idx >= 0 && old_idx < len(s_items)
     AddItemProps(old_idx)
   endif
@@ -1608,6 +1614,51 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
   endif
   SyncCursorLine()
   PreviewUpdate()
+enddef
+
+# Return the text added by a pure insertion, or an empty string for any other
+# kind of edit.  The comparison is character-based so a pasted CJK identifier
+# can never be split in the middle of its UTF-8 bytes.
+def InsertedText(before: string, after: string): string
+  var old_chars = split(before, '\zs')
+  var new_chars = split(after, '\zs')
+  var added = len(new_chars) - len(old_chars)
+  if added <= 0
+    return ''
+  endif
+
+  var prefix = 0
+  while prefix < len(old_chars) && old_chars[prefix] ==# new_chars[prefix]
+    prefix += 1
+  endwhile
+  if old_chars[prefix :] !=# new_chars[prefix + added :]
+    return ''
+  endif
+  return join(new_chars[prefix : prefix + added - 1], '')
+enddef
+
+# Capture text inserted directly by Vim's bracketed-paste/middle-mouse path.
+# The paste may have landed on any result row because cursorline follows the
+# selected item; only the inserted delta matters, not that temporary location.
+export def OnPanelTextChanged()
+  if s_panel_bufnr <= 0 || bufnr() != s_panel_bufnr
+    return
+  endif
+  var current = getbufline(s_panel_bufnr, 1, '$')
+  if current ==# s_panel_snapshot
+    return
+  endif
+
+  var pasted = InsertedText(join(s_panel_snapshot, "\n"), join(current, "\n"))
+  # A query is one line.  Match register paste: discard linewise trailing
+  # newlines and join internal line breaks with a single space.
+  pasted = substitute(pasted, '[\r\n]\+$', '', '')
+  pasted = substitute(pasted, '[\r\n]\+', ' ', 'g')
+  if pasted ==# ''
+    PanelRender()
+    return
+  endif
+  ReplaceQueryRange(s_query_cursor, s_query_cursor, pasted)
 enddef
 
 def SetupSyntax()
@@ -2047,6 +2098,13 @@ enddef
 # ─────────────────── Panel key handling ───────────────────
 
 def PanelHandleKey(winid: number, key: string): bool
+  # TextChanged is normally delivered before the next key, but command
+  # mappings can run first on some Vim builds.  Never let that key's render
+  # overwrite a literal paste that is still sitting in the scratch buffer.
+  if s_panel_bufnr > 0
+      && getbufline(s_panel_bufnr, 1, '$') !=# s_panel_snapshot
+    OnPanelTextChanged()
+  endif
   # :wincmd T recreates the window with a new ID while keeping this buffer and
   # its mappings. Rebind before rendering/closing so follow-up keys never act
   # through a stale panel handle.

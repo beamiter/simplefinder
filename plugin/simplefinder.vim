@@ -134,6 +134,7 @@ augroup SimpleFinder
   autocmd VimLeavePre * try | simplefinder#Stop() | catch | endtry
   autocmd BufEnter * simplefinder#TrackRecentFile()
   autocmd VimResized * simplefinder#Reflow()
+  autocmd TextChanged,TextChangedI SimpleFinder simplefinder#OnPanelTextChanged()
   autocmd User SimpleRemoteConnected,SimpleRemoteWorkspaceChanged,SimpleRemoteDisconnected
     \ simplefinder#OnRemoteWorkspace()
 augroup END

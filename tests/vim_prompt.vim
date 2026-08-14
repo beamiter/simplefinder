@@ -79,6 +79,18 @@ call assert_equal("one two▁", s:Prompt(), 'a multi-line register is joined')
 call feedkeys("\<C-u>keep\<C-y>\<Esc>", 'xt')
 call assert_equal("keep▁", s:Prompt(), 'cancelling the register prompt changes nothing')
 
+" Terminal bracketed paste bypasses mappings and asks Vim to insert the whole
+" payload literally.  It must still become query text even though the cursor
+" currently follows a result row rather than sitting on the prompt line.
+call feedkeys("\<C-u>pre ", 'xt')
+let s:paste_line = line('.')
+let s:paste_tail = getline(s:paste_line)
+call setline(s:paste_line, '中文 target')
+call append(s:paste_line, 'two' .. s:paste_tail)
+call simplefinder#OnPanelTextChanged()
+call assert_equal("pre 中文 target two▁", s:Prompt(),
+      \ 'direct terminal paste is spliced into the query and joined to one line')
+
 " ------------------------------------------------------------------ history ---
 
 call feedkeys("\<C-u>delta\<Esc>", 'xt')
