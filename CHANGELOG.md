@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-08-09
 
+### SimpleRemote virtual workspace 现在可直接使用完整项目查找
+
+- 活动 SimpleRemote workspace 会覆盖本地 root 探测；投影工作区继续使用本地 daemon，
+  virtual SSH/Docker 工作区则通过共享传输异步运行 Files、Grep/IGrep、GrepWord、
+  GrepVisual、Symbols 和 GitFiles，不要求远端额外安装 simplefinder-daemon。
+- 远端文件列表只跨连接枚举一次，查询继续在本地模糊过滤；全文搜索支持取消和增量渲染。
+  `rg` 可用时 hidden、ignore 和 include/exclude glob 保持一致，缺少时降级到
+  Git/find/grep。
+- 远端结果可以 edit/split/vsplit/tabedit、导出 quickfix/location list；预览通过新增的
+  SimpleRemote 异步读 API 获取，已打开且修改过的 remote buffer 仍优先使用内存内容。
+- SimpleRemote 的 connected/workspace-changed/disconnected 事件会令活动面板停止旧请求并
+  跟随新根；远端会话中的 `:SimpleFinderRoot` 会反向切换真实远端 workspace。
+- 新增 `g:simplefinder_remote`（默认 1）作为总开关，并加入 virtual Files/Grep/Symbols/
+  GitFiles、预览、打开和换根的端到端回归测试。
+
 ### 另外三个会 clamp 的下限，也不再被报成 `[ERROR]`
 
 - 上一条把 `history_max`、`preview_width`、`preview_max_bytes` 降级成了 `[WARN]`，可

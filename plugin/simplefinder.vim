@@ -37,6 +37,10 @@ g:simplefinder_preview_syntax = get(g:, 'simplefinder_preview_syntax', 1)
 g:simplefinder_preview_width = get(g:, 'simplefinder_preview_width', 0)
 g:simplefinder_preview_max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
 g:simplefinder_preview_cache = get(g:, 'simplefinder_preview_cache', 4)
+# Follow an active SimpleRemote workspace.  Virtual workspaces search through
+# its SSH/Docker transport; mounted/local-map workspaces use the projected root
+# with the normal local daemon.
+g:simplefinder_remote = get(g:, 'simplefinder_remote', 1)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
 # Native path filters for daemon-backed files, grep, and symbol searches.
 # Includes are positive ignore-style globs; excludes are kept separate so a
@@ -130,4 +134,6 @@ augroup SimpleFinder
   autocmd VimLeavePre * try | simplefinder#Stop() | catch | endtry
   autocmd BufEnter * simplefinder#TrackRecentFile()
   autocmd VimResized * simplefinder#Reflow()
+  autocmd User SimpleRemoteConnected,SimpleRemoteWorkspaceChanged,SimpleRemoteDisconnected
+    \ simplefinder#OnRemoteWorkspace()
 augroup END

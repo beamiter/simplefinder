@@ -51,6 +51,26 @@ var s_include_globs: list<string> = []
 var s_exclude_globs: list<string> = []
 var s_glob_error: string = ''
 
+# Snapshot of the SimpleRemote workspace owned by the current panel.  An empty
+# local_root means the workspace is virtual and search I/O must cross the
+# transport; a projection can use the ordinary local daemon unchanged.
+var s_remote_workspace: dict<any> = {}
+var s_remote_job: job = null_job
+var s_remote_job_id: number = 0
+var s_remote_job_kind: string = ''
+var s_remote_job_key: string = ''
+var s_remote_stdout: list<string> = []
+var s_remote_stderr: list<string> = []
+var s_remote_started: list<number> = []
+var s_remote_grep_format: string = ''
+var s_remote_match_count: number = 0
+var s_remote_cap_stopped: bool = false
+var s_remote_render_timer: number = 0
+var s_remote_file_cache: dict<any> = {key: '', items: []}
+var s_remote_preview_cache: list<dict<any>> = []
+var s_remote_preview_path: string = ''
+var s_remote_preview_epoch: number = 0
+
 # ─────────────────── Recent files ───────────────────
 
 var s_recent_files: list<string> = []
@@ -318,6 +338,7 @@ const CONFIG_SPEC: list<dict<any>> = [
    min_note: 'no size limit is applied, exactly as 0 does'},
   {name: 'preview_cache', type: v:t_number, min: 1,
    min_note: 'one previewed file is always kept'},
+  {name: 'remote', type: v:t_number, flag: true},
   {name: 'hidden', type: v:t_number, flag: true},
   {name: 'no_ignore', type: v:t_number, flag: true},
   {name: 'regex', type: v:t_number, flag: true},
@@ -731,6 +752,14 @@ def ContextLines(): list<string>
   var lines: list<string> = []
   add(lines, printf('[INFO] project root: %s',
     s_project_root ==# '' ? '(resolved on the first search)' : s_project_root))
+  var remote = ActiveRemoteWorkspace()
+  if !empty(remote)
+    add(lines, printf('[INFO] remote workspace: %s:%s:%s (%s)',
+      remote.kind, remote.target, remote.root,
+      empty(get(remote, 'local_root', '')) ? 'virtual transport' : remote.local_root))
+  else
+    add(lines, '[INFO] remote workspace: inactive')
+  endif
   try
     var includes = ReadPathGlobList('simplefinder_include_globs')
     var excludes = ReadPathGlobList('simplefinder_exclude_globs')
@@ -928,7 +957,32 @@ enddef
 # Project root detection
 # =============================================================
 
+def ActiveRemoteWorkspace(): dict<any>
+  if get(g:, 'simplefinder_remote', 1) == 0
+    return {}
+  endif
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict
+      || index(['ssh', 'docker'], get(workspace, 'kind', '')) < 0
+      || empty(get(workspace, 'target', ''))
+      || get(workspace, 'root', '') !~# '^/'
+    return {}
+  endif
+  return copy(workspace)
+enddef
+
+def IsVirtualRemote(): bool
+  return !empty(s_remote_workspace)
+    && empty(get(s_remote_workspace, 'local_root', ''))
+enddef
+
 def FindProjectRoot(): string
+  var remote = ActiveRemoteWorkspace()
+  if !empty(remote)
+    var projected = get(remote, 'local_root', '')
+    return empty(projected) ? remote.root
+      : substitute(fnamemodify(projected, ':p'), '/$', '', '')
+  endif
   var configured = get(g:, 'simplefinder_root', '')
   if configured !=# ''
     var root = fnamemodify(expand(configured), ':p')
@@ -1062,6 +1116,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   endif
   s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
   s_preview_scroll = 0
+  s_remote_workspace = ActiveRemoteWorkspace()
   s_project_root = FindProjectRoot()
 
   EnsurePanel()
@@ -1117,12 +1172,17 @@ def PanelClose()
   RecordHistory()
   PreviewClose()
   PreviewCacheClear()
+  s_remote_preview_epoch += 1
+  s_remote_preview_path = ''
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
     s_debounce_timer = 0
   endif
   # Cancel running request
-  if s_current_id > 0
+  if s_remote_job_id > 0
+    CancelRemoteJob()
+    s_current_id = 0
+  elseif s_current_id > 0
     Send({type: 'cancel', id: s_current_id})
     s_current_id = 0
   endif
@@ -1290,6 +1350,10 @@ def PanelRender()
   endif
   if s_no_ignore
     flags ..= ' [all]'
+  endif
+  if IsVirtualRemote()
+    flags ..= ' [' .. get(s_remote_workspace, 'kind', 'remote') .. ':'
+      .. get(s_remote_workspace, 'target', '?') .. ']'
   endif
   if !empty(s_include_globs) || !empty(s_exclude_globs)
     flags ..= printf(' [glob +%d/-%d]', len(s_include_globs), len(s_exclude_globs))
@@ -1579,6 +1643,7 @@ var s_preview_cache: list<dict<any>> = []
 
 def PreviewCacheClear()
   s_preview_cache = []
+  s_remote_preview_cache = []
 enddef
 
 def CachedFileLines(path: string): list<string>
@@ -1614,6 +1679,14 @@ def LoadedBufferFor(path: string): number
   if path ==# ''
     return 0
   endif
+  if path =~# '^remote://'
+    for info in getbufinfo({bufloaded: 1})
+      if info.name ==# path
+        return info.bufnr
+      endif
+    endfor
+    return 0
+  endif
   var full = fnamemodify(path, ':p')
   for info in getbufinfo({bufloaded: 1})
     if info.name !=# '' && fnamemodify(info.name, ':p') ==# full
@@ -1621,6 +1694,72 @@ def LoadedBufferFor(path: string): number
     endif
   endfor
   return 0
+enddef
+
+def RemotePreviewKey(path: string): string
+  return json_encode([
+    get(s_remote_workspace, 'kind', ''),
+    get(s_remote_workspace, 'target', ''),
+    get(s_remote_workspace, 'root', ''),
+    path,
+  ])
+enddef
+
+def CacheRemotePreview(key: string, lines: list<string>)
+  insert(s_remote_preview_cache, {key: key, lines: lines}, 0)
+  var maximum = max([1, get(g:, 'simplefinder_preview_cache', 4)])
+  if len(s_remote_preview_cache) > maximum
+    s_remote_preview_cache = s_remote_preview_cache[: maximum - 1]
+  endif
+enddef
+
+def RemotePreview(path: string): dict<any>
+  var key = RemotePreviewKey(path)
+  var hit = indexof(s_remote_preview_cache, (_, entry) => entry.key ==# key)
+  if hit >= 0
+    if hit > 0
+      insert(s_remote_preview_cache, remove(s_remote_preview_cache, hit), 0)
+    endif
+    return {ready: true, lines: s_remote_preview_cache[0].lines}
+  endif
+  if s_remote_preview_path ==# key
+    return {ready: false, lines: ['── loading remote preview… ──']}
+  endif
+  s_remote_preview_epoch += 1
+  var epoch = s_remote_preview_epoch
+  s_remote_preview_path = key
+  if exists('*g:SimpleRemoteReadFile') != 1
+    s_remote_preview_path = ''
+    CacheRemotePreview(key, ['── SimpleRemote preview API unavailable ──'])
+    return {ready: true, lines: s_remote_preview_cache[0].lines}
+  endif
+  var Reader = function('g:SimpleRemoteReadFile')
+  call(Reader, [path, (ok, body) => {
+    if epoch != s_remote_preview_epoch || key !=# s_remote_preview_path
+      return
+    endif
+    s_remote_preview_path = ''
+    var lines: list<string> = []
+    if !ok
+      lines = ['── remote preview failed: ' .. body .. ' ──']
+    else
+      var maximum = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+      if maximum > 0 && strlen(body) > maximum
+        lines = ['── file too large to preview ──']
+      else
+        lines = split(body, "\n", 1)
+        if body =~# "\n$" && len(lines) > 1 && lines[-1] ==# ''
+          remove(lines, -1)
+        endif
+        if empty(lines)
+          lines = ['']
+        endif
+      endif
+    endif
+    CacheRemotePreview(key, lines)
+    PreviewUpdate()
+  }])
+  return {ready: false, lines: ['── loading remote preview… ──']}
 enddef
 
 # What the preview should show, and where it should come from.
@@ -1670,11 +1809,12 @@ def PreviewFiletype(path: string, buf: number): string
   if buf > 0 && bufloaded(buf)
     return getbufvar(buf, '&filetype')
   endif
-  var name = fnamemodify(path, ':t')
+  var inspect_path = substitute(path, '^remote://', '', '')
+  var name = fnamemodify(inspect_path, ':t')
   if name ==# 'Makefile' || name ==# 'makefile'
     return 'make'
   endif
-  return get(s_preview_filetypes, tolower(fnamemodify(path, ':e')), '')
+  return get(s_preview_filetypes, tolower(fnamemodify(inspect_path, ':e')), '')
 enddef
 
 def PreviewClose()
@@ -1725,12 +1865,13 @@ def PreviewUpdate()
   # fnamemodify(':p') resolves '~' and relative paths, which is all that is
   # wanted.
   var raw_path = ResolvePath(item)
-  var path = raw_path ==# '' ? '' : fnamemodify(raw_path, ':p')
+  var remote_path = raw_path =~# '^remote://'
+  var path = raw_path ==# '' || remote_path ? raw_path : fnamemodify(raw_path, ':p')
   var buf = get(item, 'bufnr', 0)
   if buf <= 0 || !bufloaded(buf)
     buf = LoadedBufferFor(path)
   endif
-  if buf <= 0 && (path ==# '' || !filereadable(path))
+  if buf <= 0 && !remote_path && (path ==# '' || !filereadable(path))
     PreviewClose()
     return
   endif
@@ -1762,9 +1903,29 @@ def PreviewUpdate()
   var syntax = ''
   # An unsaved buffer is read from memory, so its size on disk says nothing
   # about the cost of previewing it.
-  var fsize = buf > 0 && bufloaded(buf) ? 0 : getfsize(path)
+  var fsize = buf > 0 && bufloaded(buf) ? 0
+    : remote_path ? 0 : getfsize(path)
   var max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
-  if fsize < 0 || (max_bytes > 0 && fsize > max_bytes)
+  if remote_path && buf <= 0
+    var preview = RemotePreview(path)
+    lines = preview.lines
+    if get(preview, 'ready', false)
+      var total = len(lines)
+      var start = 1
+      if lnum > 0
+        start = max([1, lnum - height / 2])
+      endif
+      var lowest = 1 - start
+      var highest = max([lowest, total - height + 1 - start])
+      s_preview_scroll = max([lowest, min([s_preview_scroll, highest])])
+      start += s_preview_scroll
+      lines = lines[start - 1 : start + height - 2]
+      syntax = PreviewFiletype(path, 0)
+      if lnum > 0 && lnum >= start && lnum < start + height
+        hl_line = lnum - start + 1
+      endif
+    endif
+  elseif fsize < 0 || (max_bytes > 0 && fsize > max_bytes)
     lines = ['── file too large to preview ──']
     s_preview_scroll = 0
   else
@@ -2376,8 +2537,431 @@ def RequestFileCache(): bool
     && simplefinder#core#HasCap('grep_cache')
 enddef
 
+# ─────────────────── SimpleRemote transport ───────────────────
+
+def ShellJoin(argv: list<string>): string
+  return join(mapnew(argv, (_, value) => shellescape(value)), ' ')
+enddef
+
+def RemoteShellCommand(script: string): list<string>
+  if !IsVirtualRemote() || exists('*g:SimpleRemoteShellCommand') != 1
+    return []
+  endif
+  var Wrapper = function('g:SimpleRemoteShellCommand')
+  var command = call(Wrapper, [script])
+  return type(command) == v:t_list ? command : []
+enddef
+
+def CancelRemoteRender()
+  if s_remote_render_timer > 0
+    timer_stop(s_remote_render_timer)
+    s_remote_render_timer = 0
+  endif
+enddef
+
+def CancelRemoteJob()
+  CancelRemoteRender()
+  var running = s_remote_job
+  s_remote_job = null_job
+  s_remote_job_id = 0
+  s_remote_job_kind = ''
+  s_remote_job_key = ''
+  if running != null_job && job_status(running) ==# 'run'
+    job_stop(running)
+  endif
+enddef
+
+def RemotePathAllowed(path: string): bool
+  if path ==# '' || path ==# '.' || path =~# '^/'
+    return false
+  endif
+  if path ==# '.git' || path =~# '^\.git/'
+    return false
+  endif
+  if !s_hidden && path =~# '\(^\|/\)\.[^/]'
+    return false
+  endif
+  for glob in s_exclude_globs
+    var pattern = glob2regpat(glob)
+    if path =~# pattern || (glob !~# '/' && fnamemodify(path, ':t') =~# pattern)
+      return false
+    endif
+  endfor
+  if empty(s_include_globs)
+    return true
+  endif
+  for glob in s_include_globs
+    var pattern = glob2regpat(glob)
+    if path =~# pattern || (glob !~# '/' && fnamemodify(path, ':t') =~# pattern)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def RemoteFlags(argv: list<string>): list<string>
+  var result = copy(argv)
+  if s_hidden
+    add(result, '--hidden')
+  endif
+  if s_no_ignore
+    add(result, '--no-ignore')
+  endif
+  for glob in s_include_globs
+    extend(result, ['--glob', glob])
+  endfor
+  for glob in s_exclude_globs
+    extend(result, ['--glob', '!' .. glob])
+  endfor
+  return result
+enddef
+
+def RemoteFileCommand(): string
+  var rg = ShellJoin(RemoteFlags(['rg', '--files', '--color', 'never']))
+  var fallback = s_no_ignore
+    ? "find . -type f -print | sed 's#^\\./##'"
+    : "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard; else find . -type f -print | sed 's#^\\./##'; fi"
+  return 'if command -v rg >/dev/null 2>&1; then ' .. rg
+    .. '; status=$?; [ "$status" -le 1 ]; else ' .. fallback .. '; fi'
+enddef
+
+def RemoteGrepCommand(pattern: string, force_regex: bool = false,
+    case_query: string = ''): string
+  var rg = RemoteFlags(['rg', '--json', '--color', 'never', '--no-heading'])
+  if !s_regex && !force_regex
+    add(rg, '--fixed-strings')
+  endif
+  var ignore_case = s_case_mode ==# 'ignore'
+    || (s_case_mode ==# 'smart'
+      && (!force_regex || case_query !=# '')
+      && match(force_regex ? case_query : pattern, '\u') < 0)
+  add(rg, ignore_case ? '--ignore-case' : '--case-sensitive')
+  extend(rg, ['--', pattern, '.'])
+
+  var grep = ['grep', '-R', '-n', '-H']
+  add(grep, s_regex || force_regex ? '-E' : '-F')
+  if ignore_case
+    add(grep, '-i')
+  endif
+  add(grep, '--exclude-dir=.git')
+  for glob in s_include_globs
+    add(grep, '--include=' .. glob)
+  endfor
+  for glob in s_exclude_globs
+    add(grep, '--exclude=' .. glob)
+  endfor
+  extend(grep, ['--', pattern, '.'])
+
+  return "if command -v rg >/dev/null 2>&1; then printf '%s\\n' SIMPLEFINDER_RG_JSON; "
+    .. ShellJoin(rg) .. '; status=$?; [ "$status" -le 1 ]; '
+    .. "else printf '%s\\n' SIMPLEFINDER_GREP; " .. ShellJoin(grep)
+    .. '; status=$?; [ "$status" -le 1 ]; fi'
+enddef
+
+def RemoteFileKey(kind: string): string
+  return json_encode({
+    kind: kind,
+    transport: get(s_remote_workspace, 'kind', ''),
+    target: get(s_remote_workspace, 'target', ''),
+    root: get(s_remote_workspace, 'root', ''),
+    hidden: s_hidden,
+    no_ignore: s_no_ignore,
+    includes: s_include_globs,
+    excludes: s_exclude_globs,
+  })
+enddef
+
+def CompareRemoteLocation(left: dict<any>, right: dict<any>): number
+  if left.path !=# right.path
+    return left.path <# right.path ? -1 : 1
+  endif
+  if get(left, 'lnum', 0) != get(right, 'lnum', 0)
+    return get(left, 'lnum', 0) - get(right, 'lnum', 0)
+  endif
+  return get(left, 'col', 0) - get(right, 'col', 0)
+enddef
+
+def RenderRemoteGrep(id: number)
+  if id != s_remote_job_id
+    return
+  endif
+  sort(s_items, CompareRemoteLocation)
+  s_total = s_remote_match_count
+  s_capped = s_total > len(s_items) || s_remote_cap_stopped
+  s_total_exact = !s_remote_cap_stopped
+  PanelRender()
+enddef
+
+def QueueRemoteGrepRender(id: number)
+  if s_remote_render_timer > 0
+    return
+  endif
+  s_remote_render_timer = timer_start(50, (_) => {
+    s_remote_render_timer = 0
+    RenderRemoteGrep(id)
+  })
+enddef
+
+def AddRemoteGrepMatch(id: number, item: dict<any>)
+  s_remote_match_count += 1
+  var maximum = max([1, get(g:, 'simplefinder_max_results', 200)])
+  if len(s_items) < maximum
+    add(s_items, item)
+  endif
+  if s_remote_match_count >= maximum * 50
+    s_remote_cap_stopped = true
+    if s_remote_job != null_job && job_status(s_remote_job) ==# 'run'
+      job_stop(s_remote_job)
+    endif
+  endif
+  QueueRemoteGrepRender(id)
+enddef
+
+def OnRemoteStdout(id: number, _channel: channel, line: string)
+  if id != s_remote_job_id || line ==# ''
+    return
+  endif
+  if s_remote_job_kind ==# 'files'
+    var path = substitute(line, '^\./', '', '')
+    if RemotePathAllowed(path)
+      add(s_remote_stdout, path)
+    endif
+    return
+  endif
+  if s_remote_job_kind ==# 'gitfiles'
+    var path = substitute(line, '^\./', '', '')
+    if path !=# '' && path !~# '^\.git/'
+      add(s_remote_stdout, path)
+    endif
+    return
+  endif
+  if s_remote_job_kind !=# 'grep'
+    return
+  endif
+  if line ==# 'SIMPLEFINDER_RG_JSON'
+    s_remote_grep_format = 'json'
+    return
+  elseif line ==# 'SIMPLEFINDER_GREP'
+    s_remote_grep_format = 'grep'
+    return
+  endif
+  if s_remote_grep_format ==# 'json'
+    try
+      var event = json_decode(line)
+      if type(event) != v:t_dict || get(event, 'type', '') !=# 'match'
+        return
+      endif
+      var data = get(event, 'data', {})
+      var path = substitute(get(get(data, 'path', {}), 'text', ''), '^\./', '', '')
+      if !RemotePathAllowed(path)
+        return
+      endif
+      var text = substitute(get(get(data, 'lines', {}), 'text', ''), '\r\?\n$', '', '')
+      var matches = get(data, 'submatches', [])
+      var first = empty(matches) ? {} : matches[0]
+      AddRemoteGrepMatch(id, {
+        path: path,
+        lnum: get(data, 'line_number', 0),
+        col: get(first, 'start', 0) + 1,
+        col_end: get(first, 'end', 0) + 1,
+        text: text,
+      })
+    catch
+      add(s_remote_stderr, 'invalid remote rg output: ' .. v:exception)
+    endtry
+    return
+  endif
+  var fields = matchlist(line, '^\(.\{-}\):\(\d\+\):\(.*\)$')
+  if !empty(fields)
+    var path = substitute(fields[1], '^\./', '', '')
+    if RemotePathAllowed(path)
+      AddRemoteGrepMatch(id, {
+        path: path, lnum: str2nr(fields[2]), col: 0, col_end: 0,
+        text: fields[3],
+      })
+    endif
+  endif
+enddef
+
+def OnRemoteStderr(id: number, _channel: channel, line: string)
+  if id == s_remote_job_id && line !=# ''
+    add(s_remote_stderr, line)
+    if len(s_remote_stderr) > 20
+      remove(s_remote_stderr, 0)
+    endif
+  endif
+enddef
+
+def FilterRemoteFiles(query: string)
+  var matched = FuzzyFilterLocal(s_remote_file_cache.items, query)
+  s_total = len(matched)
+  var maximum = max([1, get(g:, 'simplefinder_max_results', 200)])
+  s_capped = len(matched) > maximum
+  s_total_exact = true
+  s_items = len(matched) > maximum ? matched[: maximum - 1] : matched
+  s_loading = false
+  s_error = ''
+  s_current_id = 0
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  PanelRender()
+enddef
+
+def FinishRemoteFiles(id: number, key: string)
+  var seen: dict<bool> = {}
+  var items: list<dict<any>> = []
+  for path in sort(s_remote_stdout)
+    if !has_key(seen, path)
+      seen[path] = true
+      add(items, {path: path})
+    endif
+  endfor
+  s_remote_file_cache = {key: key, items: items}
+  FilterRemoteFiles(s_query)
+enddef
+
+def FinishRemoteGitFiles()
+  var seen: dict<bool> = {}
+  s_all_gitfiles = []
+  for path in sort(s_remote_stdout)
+    if !has_key(seen, path)
+      seen[path] = true
+      add(s_all_gitfiles, {path: path})
+    endif
+  endfor
+  AssignItemIdentities(s_all_gitfiles)
+  s_loading = false
+  s_error = ''
+  s_current_id = 0
+  FilterGitFiles()
+enddef
+
+def OnRemoteExit(id: number, _job: job, status: number)
+  if id != s_remote_job_id
+    return
+  endif
+  CancelRemoteRender()
+  var kind = s_remote_job_kind
+  var key = s_remote_job_key
+  s_remote_job = null_job
+  s_remote_job_id = 0
+  s_remote_job_kind = ''
+  s_remote_job_key = ''
+  s_elapsed_ms = empty(s_remote_started) ? 0
+    : float2nr(reltimefloat(reltime(s_remote_started)) * 1000.0)
+  if status != 0 && !s_remote_cap_stopped
+    s_loading = false
+    s_current_id = 0
+    s_error = empty(s_remote_stderr)
+      ? printf('remote %s exited with code %d', kind, status)
+      : s_remote_stderr[-1]
+    PanelRender()
+    return
+  endif
+  if kind ==# 'files'
+    FinishRemoteFiles(id, key)
+  elseif kind ==# 'gitfiles'
+    FinishRemoteGitFiles()
+  elseif kind ==# 'grep'
+    sort(s_items, CompareRemoteLocation)
+    s_total = s_remote_match_count
+    s_capped = s_total > len(s_items) || s_remote_cap_stopped
+    s_total_exact = !s_remote_cap_stopped
+    s_loading = false
+    s_error = ''
+    s_current_id = 0
+    s_stream_id = 0
+    PanelRender()
+  endif
+enddef
+
+def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
+  var command = RemoteShellCommand(script)
+  if empty(command)
+    s_loading = false
+    s_current_id = 0
+    s_error = 'SimpleRemote transport is unavailable'
+    PanelRender()
+    return false
+  endif
+  CancelRemoteJob()
+  s_remote_job_id = id
+  s_remote_job_kind = kind
+  s_remote_job_key = key
+  s_remote_stdout = []
+  s_remote_stderr = []
+  s_remote_started = reltime()
+  s_remote_grep_format = ''
+  s_remote_match_count = 0
+  s_remote_cap_stopped = false
+  s_remote_job = job_start(command, {
+    in_io: 'null', out_io: 'pipe', err_io: 'pipe',
+    out_mode: 'nl', err_mode: 'nl',
+    out_cb: (channel, line) => OnRemoteStdout(id, channel, line),
+    err_cb: (channel, line) => OnRemoteStderr(id, channel, line),
+    exit_cb: (job, status) => OnRemoteExit(id, job, status),
+  })
+  if job_status(s_remote_job) ==# 'fail'
+    s_remote_job = null_job
+    s_remote_job_id = 0
+    s_remote_job_kind = ''
+    s_loading = false
+    s_current_id = 0
+    s_error = 'could not start SimpleRemote search transport'
+    PanelRender()
+    return false
+  endif
+  return true
+enddef
+
+def SendRemoteFilesRequest(query: string)
+  var key = RemoteFileKey('files')
+  if get(s_remote_file_cache, 'key', '') ==# key
+    if s_remote_job_id > 0
+      CancelRemoteJob()
+    endif
+    FilterRemoteFiles(query)
+    return
+  endif
+  if s_remote_job_id > 0 && s_remote_job_kind ==# 'files'
+      && s_remote_job_key ==# key
+    s_loading = true
+    PanelRender()
+    return
+  endif
+  var id = NextId()
+  s_current_id = id
+  s_loading = true
+  s_error = ''
+  PanelRender()
+  StartRemoteJob('files', id, key, RemoteFileCommand())
+enddef
+
+def SendRemoteGrepRequest(pattern: string, force_regex: bool = false,
+    case_query: string = '')
+  if s_remote_job_id > 0
+    CancelRemoteJob()
+  endif
+  var id = NextId()
+  s_current_id = id
+  s_stream_id = id
+  s_items = []
+  s_total = 0
+  s_loading = true
+  s_error = ''
+  s_capped = false
+  s_total_exact = true
+  PanelRender()
+  StartRemoteJob('grep', id, '',
+    RemoteGrepCommand(pattern, force_regex, case_query))
+enddef
+
 def SendFilesRequest(query: string)
   if !PathGlobsReady()
+    return
+  endif
+  if IsVirtualRemote()
+    SendRemoteFilesRequest(query)
     return
   endif
   if !EnsureBackend()
@@ -2414,7 +2998,9 @@ def SendGrepRequest(pattern: string)
     return
   endif
   if pattern ==# ''
-    if s_current_id > 0
+    if IsVirtualRemote() && s_remote_job_id > 0
+      CancelRemoteJob()
+    elseif s_current_id > 0
       Send({type: 'cancel', id: s_current_id})
     endif
     s_current_id = 0
@@ -2427,6 +3013,10 @@ def SendGrepRequest(pattern: string)
     s_stream_id = 0
     s_elapsed_ms = 0
     PanelRender()
+    return
+  endif
+  if IsVirtualRemote()
+    SendRemoteGrepRequest(pattern)
     return
   endif
   if !EnsureBackend()
@@ -2498,6 +3088,16 @@ enddef
 # Resolve an item's path against the project root when relative.
 def ResolvePath(item: dict<any>): string
   var path = get(item, 'path', '')
+  if IsVirtualRemote()
+      && index(['files', 'gitfiles', 'grep', 'igrep', 'symbols'], s_mode) >= 0
+    if path =~# '^remote://'
+      return path
+    endif
+    var root = substitute(get(s_remote_workspace, 'root', ''), '/\+$', '', '')
+    var absolute = path =~# '^/' ? path
+      : (root ==# '' ? '/' : root .. '/') .. substitute(path, '^/', '', '')
+    return 'remote://' .. absolute
+  endif
   if s_mode ==# 'gitfiles' && s_git_root !=# ''
     if path !=# '' && path[0] !=# '/' && path[0] !=# '~'
       return s_git_root .. '/' .. path
@@ -2771,6 +3371,33 @@ export def ProjectRoot(path: string = '')
     echom '[SimpleFinder] root: ' .. FindProjectRoot()
     return
   endif
+  var remote = ActiveRemoteWorkspace()
+  if !empty(remote)
+    var requested = substitute(path, '^remote://', '', '')
+    var local_root = get(remote, 'local_root', '')
+    if !empty(local_root) && exists('*g:SimpleRemoteRemotePath') == 1
+      var Mapper = function('g:SimpleRemoteRemotePath')
+      var mapped = call(Mapper, [fnamemodify(expand(requested), ':p')])
+      if !empty(mapped)
+        requested = mapped
+      endif
+    endif
+    if requested !~# '^/'
+      requested = substitute(remote.root, '/\+$', '', '') .. '/'
+        .. substitute(requested, '^/', '', '')
+    endif
+    if exists('*g:SimpleRemoteTreeSetRoot') != 1
+      echohl ErrorMsg
+      echom '[SimpleFinder] SimpleRemote root API is unavailable'
+      echohl None
+      return
+    endif
+    var SetRoot = function('g:SimpleRemoteTreeSetRoot')
+    if call(SetRoot, [requested])
+      echom '[SimpleFinder] remote root: ' .. requested
+    endif
+    return
+  endif
   var root = fnamemodify(expand(path), ':p')
   if !isdirectory(root)
     echohl ErrorMsg
@@ -3009,6 +3636,10 @@ def SendSymbolRequest(query: string)
     PanelRender()
     return
   endif
+  if IsVirtualRemote()
+    SendRemoteGrepRequest(pattern, true, query)
+    return
+  endif
   if !EnsureBackend()
     return
   endif
@@ -3066,12 +3697,6 @@ enddef
 var s_all_gitfiles: list<dict<any>> = []
 var s_git_root: string = ''
 
-# systemlist() is typed as taking a string in Vim9, so argv is escaped here
-# rather than passed as a list.
-def ShellJoin(argv: list<string>): string
-  return join(mapnew(argv, (_, a) => shellescape(a)), ' ')
-enddef
-
 def GitRootFor(dir: string): string
   if !executable('git')
     return ''
@@ -3084,6 +3709,20 @@ def GitRootFor(dir: string): string
 enddef
 
 export def GitFiles()
+  var remote = ActiveRemoteWorkspace()
+  if !empty(remote) && empty(get(remote, 'local_root', ''))
+    PanelOpen('gitfiles')
+    s_git_root = remote.root
+    var id = NextId()
+    s_current_id = id
+    s_loading = true
+    s_error = ''
+    PanelRender()
+    StartRemoteJob('gitfiles', id, RemoteFileKey('gitfiles'),
+      'git -c core.quotepath=false ls-files --cached --others '
+        .. '--exclude-standard --deduplicate')
+    return
+  endif
   var start = expand('%:p:h')
   if start ==# '' || !isdirectory(start)
     start = getcwd()
@@ -3492,5 +4131,39 @@ enddef
 export def Reflow()
   if s_panel_winid > 0 && win_id2win(s_panel_winid) > 0
     PanelRender()
+  endif
+enddef
+
+export def OnRemoteWorkspace()
+  var previous = s_remote_workspace
+  var current = ActiveRemoteWorkspace()
+  s_remote_preview_epoch += 1
+  s_remote_preview_path = ''
+  s_remote_preview_cache = []
+  s_remote_file_cache = {key: '', items: []}
+  if s_remote_job_id > 0
+    CancelRemoteJob()
+  elseif s_current_id > 0 && simplefinder#core#IsRunning()
+    Send({type: 'cancel', id: s_current_id})
+  endif
+  s_current_id = 0
+  s_remote_workspace = current
+  if s_panel_winid <= 0 || empty(getwininfo(s_panel_winid))
+    return
+  endif
+  if index(['files', 'grep', 'igrep', 'symbols', 'gitfiles'], s_mode) < 0
+    return
+  endif
+  if empty(current) && !empty(previous)
+    s_loading = false
+    s_error = 'remote workspace disconnected'
+    PanelRender()
+    return
+  endif
+  s_project_root = FindProjectRoot()
+  if s_mode ==# 'gitfiles'
+    GitFiles()
+  else
+    DispatchSearch()
   endif
 enddef

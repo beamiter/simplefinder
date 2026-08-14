@@ -14,6 +14,7 @@ test:
 vim-test:
 	cargo build --locked
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_remote.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_symbols.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_globs.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_visual.vim

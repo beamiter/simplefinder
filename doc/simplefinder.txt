@@ -162,6 +162,29 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
 
                                                            *:SimpleFinderRoot*
 :SimpleFinderRoot [dir]      Show, or pin, the search root directory.
+                             With an active SimpleRemote workspace, {dir}
+                             changes that remote workspace root instead.
+
+SIMPLEREMOTE INTEGRATION                              *simplefinder-remote*
+
+An active g:simpleremote_workspace becomes the project automatically. A
+mounted, Docker-bind, or explicitly mapped workspace uses the ordinary local
+daemon against local_root. A virtual SSH/Docker workspace runs Files, Grep,
+IGrep, GrepWord, GrepVisual, Symbols, and GitFiles through
+g:SimpleRemoteShellCommand(). Results open as remote:// buffers and previews
+use g:SimpleRemoteReadFile() asynchronously.
+
+When `rg` exists remotely it supplies ignore, hidden, and path-glob semantics.
+Without it, file search falls back to Git/find and text search to grep. File
+names are enumerated across the transport and fuzzy-filtered locally, so each
+keystroke does not start a new SSH traversal. Grep requests are cancellable
+and paint results asynchronously.
+
+SimpleRemoteConnected, SimpleRemoteWorkspaceChanged, and
+SimpleRemoteDisconnected events invalidate old requests and previews. A live
+panel follows the new root. |:SimpleFinderRoot| goes the other direction and
+asks SimpleRemote to change its real workspace root. Set
+|g:simplefinder_remote| to 0 to disable all of this integration.
 
 ==============================================================================
 3. PANEL KEYS                                              *simplefinder-keys*
@@ -280,6 +303,7 @@ Set before the plugin loads; defaults shown. >
   g:simplefinder_preview_width = 0       preview width (0 = all that is free)
   g:simplefinder_preview_max_bytes = 2097152   largest file read for preview
   g:simplefinder_preview_cache = 4       files kept from previous previews
+  g:simplefinder_remote = 1              follow the active SimpleRemote workspace
   g:simplefinder_hidden = 0              include hidden files
   g:simplefinder_no_ignore = 0           ignore the ignore files
   g:simplefinder_regex = 0               grep starts in regex mode
@@ -299,7 +323,13 @@ Set before the plugin loads; defaults shown. >
 <
 The project root is found by walking up from the current file looking for a
 root marker, falling back to |getcwd()|. Scanning honours `.ignore`,
-`.gitignore`, the global git ignore and `.git/info/exclude`.
+`.gitignore`, the global git ignore and `.git/info/exclude`. An enabled active
+SimpleRemote workspace takes precedence; see |simplefinder-remote|.
+
+                                                *g:simplefinder_remote*
+g:simplefinder_remote
+        Boolean, default 1. Follow an active SimpleRemote workspace. Set to 0
+        to keep project-root detection and every search local.
 
 VALIDATION                                           *simplefinder-validation*
 
