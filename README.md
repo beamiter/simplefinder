@@ -185,7 +185,12 @@ workspace 的 mode：
 - SimpleRemote 换 workspace/root 时，已打开的查找面板会取消旧请求并自动切到新根。切换过程
   （Disconnected reason `reconnect` → Connecting → Connected）不当作断开：面板保留旧标题、
   显示 `searching…`，间隙里敲出的搜索等到 Connected 自动重发；真正的断开仍提示
-  "remote workspace disconnected"，重连后恢复。
+  "remote workspace disconnected"，重连后恢复。切换也可能半途夭折——SimpleRemote 先发
+  Disconnected 再启动传输，传输起不来（没有 ssh/docker、目标被拒）时它只清全局变量、不再
+  发事件，Connected 永远不会来。这时靠 `g:simpleremote_status` 区分：进行中的切换是
+  `connecting kind:target`，夭折的已回到 `disconnected`。查找在下一次用到 workspace 时
+  读它并结束切换，面板报一次 "remote workspace disconnected"，之后的搜索和
+  `:SimpleFinderRoot` 都恢复本地，不会永远停在 `searching…`。
 - 在远端会话中执行 `:SimpleFinderRoot {dir}` 反向切换 SimpleRemote workspace。SimpleRemote
   的 `g:simpleremote_sync_tree_root` 关闭时不重连、只移动树的 view root
   （`SimpleRemoteTreeRootChanged`），查找跟着它走：远端脚本先 `cd` 进子目录，结果解析回
@@ -197,10 +202,15 @@ workspace 的 mode：
   不需要已有 workspace，也不受 `g:simplefinder_remote` 影响。
 - `:SimpleFinderHealth` 的 CONTEXT 段列出 workspace 的 mode、搜索引擎与目录、分离的 tree
   root、SimpleRemote runtime/protocol、API 是否齐全；没有 workspace 时说明原因，并且两种
-  情况都会说明 workspace 选择器是否可用。
+  情况都会说明 workspace 选择器是否可用——除非既没有 workspace、选择器 API 也一个都没定义：
+  那是压根没装 SimpleRemote，报告里不再出现三个读者从没听过的函数名。
 
-设 `g:simplefinder_remote = 0` 可关闭以上联动（选择器除外），恢复只按本地文件和 cwd 判断
-项目根。
+设 `g:simplefinder_remote = 0` 关闭「跟随 workspace」：搜索和项目根判断都回到本地。面板每次
+确定要搜哪个 workspace 时都会重新读它，所以运行期改在下一个面板就生效，不必重启——之后
+到来的 connect/reconnect 也不会把关掉之前的 workspace 快照又拉回来。两件事不属于「跟随 workspace」，因此保留：`:SimpleFinderRemoteWorkspaces`
+（它是用来打开 workspace 的，不是搜索 workspace），以及已经打开的 `remote://` buffer 仍会
+出现在 `:SimpleFinderBuffers` 和 `:SimpleFinderRecent` 里——buffer 开着就是开着，把它从这
+两个列表里藏起来只会让用户找不到眼前的文件。
 
 匹配数超过 `g:simplefinder_max_results` 时，grep 保留 (path, lnum, col) 排序中最靠前
 的那一批——与完整排序后截断的结果集相同——所以只要走完整棵树，同一查询每次返回同一批

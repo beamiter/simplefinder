@@ -248,10 +248,18 @@ the panel keeps the old host in its title, says `searching…`, and a search
 typed during the gap waits for Connected too, which re-dispatches it. A
 panel opened during the gap follows the connection being replaced the same
 way rather than searching the local cwd, and |:SimpleFinderRoot| {dir}
-refuses to pin a local root until the switch is over. A
-WorkspaceChanged or SimpleRemoteTreeRootChanged that changes nothing a
-running search depends on (same connection, same search directory, same
-engine) leaves that search running rather than restarting it.
+refuses to pin a local root until the switch is over. A switch can also be
+abandoned: SimpleRemote emits Disconnected before it starts the new
+transport, and a transport that fails to start (no ssh or docker binary, a
+target it refuses) leaves no further event, so the Connected that would end
+the switch never arrives. `g:simpleremote_status` tells the two apart -- a
+switch in flight is `connecting kind:target`, an abandoned one is back to
+`disconnected` -- and the finder reads it on the way to every question the
+switch would otherwise hold up: the panel reports `remote workspace
+disconnected` once, and the next search and |:SimpleFinderRoot| are local
+again. A WorkspaceChanged or SimpleRemoteTreeRootChanged that changes
+nothing a running search depends on (same connection, same search directory,
+same engine) leaves that search running rather than restarting it.
 
                                                    *simplefinder-remote-root*
 Root~
@@ -274,13 +282,28 @@ does depends on SimpleRemote's g:simpleremote_sync_tree_root:
         says so and searches stay in the workspace root. This applies to the
         remote tree's own re-rooting keys as well as to |:SimpleFinderRoot|.
 
-Set |g:simplefinder_remote| to 0 to disable all of this integration except
-|:SimpleFinderRemoteWorkspaces|. |:SimpleFinderHealth| names the active
-workspace, its mode, which engine searches it and where, the SimpleRemote
-runtime and protocol in use, and whether the SimpleRemote functions this
-plugin calls are present -- or, with no workspace, why there is none. Either
-way it reports whether |:SimpleFinderRemoteWorkspaces| has the API it needs,
-because with no workspace that is the way to get one.
+Set |g:simplefinder_remote| to 0 to stop following the workspace: searches
+and project-root detection stay local. It is read every time a panel resolves
+which workspace to search, so switching it off at runtime takes effect on the
+next panel rather than at the next restart -- and a connect or reconnect
+arriving afterwards does not revive the workspace the finder was following.
+
+Two things are not workspace-following and stay. One is
+|:SimpleFinderRemoteWorkspaces|, which opens a workspace rather than
+searching one. The other is the remote:// buffers that are already open,
+which |:SimpleFinderBuffers| and |:SimpleFinderRecent| go on listing -- an
+open buffer is an open buffer whatever this option says, and dropping it from
+those two lists would only hide a file the user has in front of them.
+
+|:SimpleFinderHealth| names the active workspace, its mode, which engine
+searches it and where, the SimpleRemote runtime and protocol in use, and
+whether the SimpleRemote functions this plugin calls are present -- or, with
+no workspace, why there is none. It also reports whether
+|:SimpleFinderRemoteWorkspaces| has the API it needs, because with no
+workspace that is the way to get one. With no workspace and none of that API
+defined there is no SimpleRemote installed at all, and the report says
+nothing about the picker rather than naming three functions the reader has
+never heard of.
 
 ==============================================================================
 3. PANEL KEYS                                              *simplefinder-keys*
@@ -427,9 +450,12 @@ SimpleRemote workspace takes precedence; see |simplefinder-remote|.
                                                 *g:simplefinder_remote*
 g:simplefinder_remote
         Boolean, default 1. Follow an active SimpleRemote workspace. Set to 0
-        to keep project-root detection and every search local
+        to keep project-root detection and every search local; it is read
+        whenever a panel resolves the workspace to search, so changing it at
+        runtime takes effect on the next panel, not only at startup
         (|:SimpleFinderRemoteWorkspaces| still works: it opens workspaces
-        rather than searching one).
+        rather than searching one, and open remote:// buffers stay in
+        |:SimpleFinderBuffers| and |:SimpleFinderRecent|).
 
                                 *g:simplefinder_remote_search_projected*
 g:simplefinder_remote_search_projected

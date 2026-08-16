@@ -25,6 +25,7 @@ call writefile(['beta workspace'], s:second .. '/beta.txt')
 let g:simpleremote_workspace = {
       \ 'id': 1, 'kind': 'ssh', 'target': 'fixture-target',
       \ 'root': s:first, 'tree_root': s:first, 'local_root': '', 'mode': 'virtual'}
+let g:simpleremote_status = 'ssh:fixture-target'
 let g:remote_preview_reads = 0
 let g:remote_shell_calls = 0
 
@@ -96,12 +97,18 @@ function! g:SimpleRemoteTreeSetRoot(path) abort
   return 1
 endfunction
 
+" SimpleRemote clears its globals -- g:simpleremote_status included -- before
+" it emits Disconnected, and only then sets 'connecting kind:target' and emits
+" Connecting.  The fixture reproduces that order, because the status is how
+" SimpleFinder tells a switch in flight from one that was abandoned.
 function! s:BeginSwitch(timer) abort
   let s:switch_saved = copy(g:simpleremote_workspace)
   unlet g:simpleremote_workspace
+  let g:simpleremote_status = 'disconnected'
   let g:simpleremote_event = {'event': 'SimpleRemoteDisconnected',
-        \ 'reason': 'reconnect', 'status': 'ssh:fixture-target', 'time': localtime()}
+        \ 'reason': 'reconnect', 'status': 'disconnected', 'time': localtime()}
   doautocmd <nomodeline> User SimpleRemoteDisconnected
+  let g:simpleremote_status = 'connecting ssh:fixture-target'
   let g:simpleremote_event = {'event': 'SimpleRemoteConnecting',
         \ 'kind': s:switch_saved.kind, 'target': s:switch_saved.target,
         \ 'root': g:remote_switch_pending, 'status': 'connecting ssh:fixture-target',
@@ -116,6 +123,7 @@ function! s:FinishSwitch() abort
   let l:ws.tree_root = g:remote_switch_pending
   let l:ws.id += 1
   let g:simpleremote_workspace = l:ws
+  let g:simpleremote_status = 'ssh:fixture-target'
   let g:simpleremote_event = {'event': 'SimpleRemoteConnected',
         \ 'status': 'ssh:fixture-target', 'time': localtime()}
   doautocmd <nomodeline> User SimpleRemoteConnected
@@ -313,6 +321,32 @@ unlet g:simpleremote_workspace.protocol
 let s:health = join(s:HealthLines(), "\n")
 call assert_match('\[INFO\] remote transport: ssh/docker fallback', s:health)
 
+" ── Health does not name an API that was never installed ──
+"
+" With no workspace and not one of the picker functions defined, SimpleRemote
+" is simply absent -- which is the case for most users -- and three unfamiliar
+" function names in a report meant to be pasted into a bug report send its
+" reader down a blind alley.  A partially present API is a different thing:
+" something is installed and the missing half is worth naming.
+let s:saved_workspace = copy(g:simpleremote_workspace)
+let s:saved_status = g:simpleremote_status
+unlet g:simpleremote_workspace
+unlet g:simpleremote_status
+let s:health = join(s:HealthLines(), "\n")
+call assert_match('remote workspace: inactive (no SimpleRemote workspace)', s:health)
+call assert_notmatch('remote workspace picker', s:health,
+      \ 'no workspace and no picker API at all: SimpleRemote is not installed')
+function! g:SimpleRemoteRecentWorkspaces(...) abort
+  return []
+endfunction
+let s:health = join(s:HealthLines(), "\n")
+call assert_match('remote workspace picker: unavailable, missing '
+      \ .. 'g:SimpleRemoteProfiles, g:SimpleRemoteOpenWorkspace', s:health,
+      \ 'half an API is an installed SimpleRemote with the rest missing')
+delfunction g:SimpleRemoteRecentWorkspaces
+let g:simpleremote_workspace = s:saved_workspace
+let g:simpleremote_status = s:saved_status
+
 " ── Tree root without workspace sync: the finder follows the tree ──
 "
 " With g:simpleremote_sync_tree_root = 0 re-rooting the tree does not
@@ -416,16 +450,65 @@ call assert_notmatch('src/alpha.rs', s:Panel())
 " panel resumes when the workspace comes back.
 let s:saved_workspace = copy(g:simpleremote_workspace)
 unlet g:simpleremote_workspace
+let g:simpleremote_status = 'disconnected'
 let g:simpleremote_event = {'event': 'SimpleRemoteDisconnected', 'reason': 'disconnect',
       \ 'status': 'disconnected', 'time': localtime()}
 doautocmd <nomodeline> User SimpleRemoteDisconnected
 call assert_match('remote workspace disconnected', s:Panel())
 let g:simpleremote_workspace = s:saved_workspace
+let g:simpleremote_status = 'ssh:fixture-target'
 let g:simpleremote_event = {'event': 'SimpleRemoteConnected',
       \ 'status': 'ssh:fixture-target', 'time': localtime()}
 doautocmd <nomodeline> User SimpleRemoteConnected
 call s:WaitFor({-> s:SearchDone('beta.txt')}, 'finder resumes after reconnect')
 call feedkeys("\<Esc>", 'xt')
+
+" ── A switch that never completes must not wedge the finder ──
+"
+" SimpleRemote emits Disconnected(reason 'reconnect') *before* it starts the
+" new transport.  When job_start fails -- no ssh or docker binary, a target
+" the transport refuses -- it clears its globals and returns without another
+" event, so the Connecting and Connected that would end the switch never
+" arrive.  Its status is back to 'disconnected' (an in-flight switch says
+" 'connecting kind:target'), and that is what ends the switch here; otherwise
+" every search for the rest of the session waits on `searching…`.
+SimpleFinderFiles beta
+call s:WaitFor({-> s:SearchDone('beta.txt')}, 'listing before the abandoned switch')
+let s:saved_workspace = copy(g:simpleremote_workspace)
+unlet g:simpleremote_workspace
+let g:simpleremote_status = 'disconnected'
+let g:simpleremote_event = {'event': 'SimpleRemoteDisconnected',
+      \ 'reason': 'reconnect', 'status': 'disconnected', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteDisconnected
+call assert_match('searching…', s:Panel(), 'a reconnect starts like any other switch')
+call assert_notmatch('disconnected', s:Panel())
+" No Connecting follows, and the transport is gone: the open panel gives up
+" instead of waiting for a connection that is not coming.
+call feedkeys('bet', 'xt')
+call s:WaitFor({-> s:Panel() =~# 'remote workspace disconnected'},
+      \ 'an abandoned switch ends on the panel that was waiting for it')
+call feedkeys("\<Esc>", 'xt')
+" And the next panel is a plain local search rather than another wait.
+let g:simplefinder_root = s:second
+SimpleFinderFiles beta
+call s:WaitFor({-> s:SearchDone('beta.txt')}, 'a local search after an abandoned switch')
+call assert_true(simplefinder#core#IsRunning(),
+      \ 'the local daemon serves searches once the switch is abandoned')
+call assert_notmatch('\[ssh:fixture-target\]', s:Panel(),
+      \ 'the dead host is gone from the title')
+call feedkeys("\<Esc>", 'xt')
+" :SimpleFinderRoot pins a local root again instead of refusing for ever.
+let s:said = execute('call simplefinder#ProjectRoot(s:first)')
+call assert_notmatch('switching workspaces', s:said)
+call assert_equal(s:first, get(g:, 'simplefinder_root', ''),
+      \ 'a local root can be pinned again once the switch is over')
+let g:simplefinder_root = ''
+call simplefinder#Stop()
+let g:simpleremote_workspace = s:saved_workspace
+let g:simpleremote_status = 'ssh:fixture-target'
+let g:simpleremote_event = {'event': 'SimpleRemoteConnected',
+      \ 'status': 'ssh:fixture-target', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteConnected
 
 " ── The workspace picker ──
 function! g:SimpleRemoteRecentWorkspaces(...) abort
@@ -560,11 +643,48 @@ call assert_true(simplefinder#core#IsRunning(),
 call feedkeys("\<CR>", 'xt')
 call assert_equal(s:first .. '/src/alpha.rs', bufname())
 
-" A SimpleRemote event about a workspace the finder is not following (the
-" integration switched off) must not touch a local search.
+" ── Switching the integration off at runtime also stops the following ──
+"
+" The finder keeps a snapshot of the workspace it was following while the flag
+" was still on.  A reconnect arriving after the flag is switched off must not
+" revive that snapshot through the mid-switch fallback: following a remote
+" workspace is exactly what the flag turns off.
+call feedkeys("\<Esc>", 'xt')
+let s:saved_workspace = copy(g:simpleremote_workspace)
+let g:simpleremote_workspace = {
+      \ 'id': 120, 'kind': 'ssh', 'target': 'fixture-target',
+      \ 'root': s:first, 'tree_root': s:first, 'local_root': '', 'mode': 'virtual'}
+let g:simpleremote_event = {'event': 'SimpleRemoteWorkspaceChanged',
+      \ 'status': 'ssh:fixture-target', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteWorkspaceChanged
+call simplefinder#Stop()
+SimpleFinderFiles alpha
+call s:WaitFor({-> s:SearchDone('src/alpha.rs')}, 'virtual listing while the flag is on')
+call assert_false(simplefinder#core#IsRunning())
 call feedkeys("\<Esc>", 'xt')
 let g:simplefinder_remote = 0
 let g:simplefinder_root = s:first
+unlet g:simpleremote_workspace
+let g:simpleremote_status = 'connecting ssh:fixture-target'
+let g:simpleremote_event = {'event': 'SimpleRemoteConnecting',
+      \ 'kind': 'ssh', 'target': 'fixture-target', 'root': s:second,
+      \ 'status': 'connecting ssh:fixture-target', 'time': localtime()}
+doautocmd <nomodeline> User SimpleRemoteConnecting
+SimpleFinderFiles alpha
+call s:WaitFor({-> s:SearchDone('src/alpha.rs')},
+      \ 'a reconnect with the integration off does not make the finder wait')
+call assert_true(simplefinder#core#IsRunning(),
+      \ 'the local daemon searches g:simplefinder_root, not the workspace')
+call assert_notmatch('\[ssh:fixture-target\]', s:Panel())
+let s:said = execute('call simplefinder#ProjectRoot()')
+call assert_match('root: ' .. s:first, s:said,
+      \ 'the pinned local root wins over the workspace being reconnected')
+call feedkeys("\<Esc>", 'xt')
+let g:simpleremote_workspace = s:saved_workspace
+let g:simpleremote_status = 'ssh:fixture-target'
+
+" A SimpleRemote event about a workspace the finder is not following (the
+" integration switched off) must not touch a local search.
 SimpleFinderFiles alpha
 call s:WaitFor({-> s:SearchDone('src/alpha.rs')}, 'local search with the integration off')
 let g:simpleremote_event = {'event': 'SimpleRemoteWorkspaceChanged',

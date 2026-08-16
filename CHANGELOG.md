@@ -50,6 +50,33 @@
   的输入、workspace 选择器、未知 kind、tree root 跟随与 view-only reveal、sshfs 经传输搜索
   与本地打开、`mounting → sshfs` 不重跑、联动关闭时事件不打扰本地搜索。
 
+### 切换中断与运行期关闭联动的修正
+
+- 夭折的 workspace 切换不再把查找卡死。SimpleRemote 是先发 Disconnected(reason
+  `reconnect`)、再 `job_start` 启动传输的；传输起不来（没有 ssh/docker、目标被拒）时它只
+  `ClearGlobals()` 并返回，Connecting/Connected 都不会再来，而 SimpleFinder 的
+  `s_remote_switching` 永远留在 true：此后每一次搜索都停在 `searching…`，
+  `:SimpleFinderRoot` 一直回答 "SimpleRemote is switching workspaces"，整个会话都废了。
+  新增 `RemoteSwitchPending()`/`RemoteSwitchInProgress()`：切换状态改为每次用到时按
+  `g:simpleremote_status` 复核——进行中的切换是 `connecting kind:target`，夭折的已回到
+  `disconnected` 且没有 `g:simpleremote_workspace`——于是切换就地结束，面板报一次
+  "remote workspace disconnected"，之后的搜索和 `:SimpleFinderRoot` 恢复本地。
+- 运行期把 `g:simplefinder_remote` 设为 0 现在真的会停下跟随。`ActiveRemoteWorkspace()`
+  一直有这个判断，但切换期的兜底 `CurrentRemoteWorkspace()` 没有：关掉联动之后再来一个
+  Connecting/reconnect，查找又会拿关掉之前的旧快照去跟随远端 workspace，面板停在
+  `searching…`、`:SimpleFinderRoot` 报的是远端根而不是钉住的本地根。现在
+  `RemoteSwitchInProgress()` 和 `OnRemoteWorkspace()` 的 Connecting 分支都尊重该开关。
+- `:SimpleFinderHealth` 在既没有 workspace、`g:SimpleRemoteRecentWorkspaces`/`Profiles`/
+  `OpenWorkspace` 也一个都没有时，不再打印 workspace 选择器那一行——那是压根没装
+  SimpleRemote，而这份报告是要贴进 issue 的，不该给读者三个从没听过的函数名。有 workspace
+  时，或者 API 只缺一部分时，照旧打印。
+- 文档修正：`g:simplefinder_remote = 0` 关的是「跟随 workspace」（搜索与项目根判断），
+  不是「除选择器外的全部联动」——已打开的 `remote://` buffer 仍会出现在
+  `:SimpleFinderBuffers` 和 `:SimpleFinderRecent` 里，这是刻意的。
+- `tests/vim_remote.vim` 的切换桩改为像真的 SimpleRemote 那样发布 `g:simpleremote_status`，
+  并新增三组用例：夭折的切换、运行期关闭联动后到来的 reconnect、没有 SimpleRemote 时的
+  health 输出（以及 API 只有一半时仍然打印）。
+
 ## Unreleased - 2026-08-09
 
 ### SimpleRemote virtual workspace 现在可直接使用完整项目查找

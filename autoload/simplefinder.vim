@@ -775,15 +775,26 @@ def MissingFunctions(names: list<string>): list<string>
   return filter(copy(names), (_, name) => exists('*' .. name) != 1)
 enddef
 
-# Whether :SimpleFinderRemoteWorkspaces has the API it needs.  It is reported
-# with or without an active workspace, because with none it is the answer to
-# the question the report just raised: how do I get one.
-def RemotePickerLine(): string
+# Whether :SimpleFinderRemoteWorkspaces has the API it needs -- or nothing at
+# all.  With a workspace open the picker is part of the picture; with none it
+# is the answer to the question the report just raised: how do I get one.
+#
+# Unless there is no SimpleRemote to pick from.  With no workspace and not one
+# of these functions defined, the plugin is simply not installed, and three
+# unfamiliar names in a report meant to be pasted into a bug report send its
+# reader down a blind alley -- the same reason a daemon that has not started
+# yet is not reported as an error.  Any of them existing means a SimpleRemote
+# is there and its picker's state is worth a line.
+def RemotePickerLines(active: bool): list<string>
   var missing = MissingFunctions(REMOTE_PICKER_API)
-  return empty(missing)
-    ? '[INFO] remote workspace picker: :SimpleFinderRemoteWorkspaces available'
-    : printf('[INFO] remote workspace picker: unavailable, missing %s',
-        join(missing, ', '))
+  if !active && len(missing) == len(REMOTE_PICKER_API)
+    return []
+  endif
+  if empty(missing)
+    return ['[INFO] remote workspace picker: :SimpleFinderRemoteWorkspaces available']
+  endif
+  return [printf('[INFO] remote workspace picker: unavailable, missing %s',
+    join(missing, ', '))]
 enddef
 
 def RemoteContextLines(): list<string>
@@ -797,7 +808,7 @@ def RemoteContextLines(): list<string>
         ? 'SimpleRemote status: ' .. status
         : 'no SimpleRemote workspace'
     add(lines, printf('[INFO] remote workspace: inactive (%s)', reason))
-    add(lines, RemotePickerLine())
+    extend(lines, RemotePickerLines(false))
     return lines
   endif
   var local_root = get(remote, 'local_root', '')
@@ -840,7 +851,7 @@ def RemoteContextLines(): list<string>
       .. 'published by a SimpleRemote too old for this SimpleFinder; update it',
       join(missing, ', ')))
   endif
-  add(lines, RemotePickerLine())
+  extend(lines, RemotePickerLines(true))
   return lines
 enddef
 
@@ -1142,6 +1153,49 @@ def RemoteTransportActive(): bool
   return RemoteTransportFor(s_remote_workspace)
 enddef
 
+# Whether SimpleRemote is still working on the switch this file is waiting
+# for.
+#
+# The switch opens on Disconnected(reason 'reconnect') or Connecting and
+# normally closes on the Connected that follows.  It can also never close:
+# SimpleRemote emits Disconnected *before* it starts the transport, and a
+# transport that fails to start (no ssh or docker binary, a target the
+# transport refuses) clears its globals and returns without another event.
+# Nothing would then end the switch, and every later search would sit on
+# `searching…` for the rest of the session.
+#
+# SimpleRemote's own status says which of the two happened: a switch in
+# flight is 'connecting kind:target', set before Connecting is emitted, while
+# an abandoned one is back to 'disconnected'.  A status this file cannot read
+# -- absent, not a string -- is an older SimpleRemote (or a test firing the
+# event by hand) and the switch is taken at its word.
+def RemoteSwitchPending(): bool
+  if !empty(get(g:, 'simpleremote_workspace', {}))
+    return true
+  endif
+  var status = get(g:, 'simpleremote_status', '')
+  return type(status) != v:t_string || status !=# 'disconnected'
+enddef
+
+# Whether the finder is between two connections and waiting for the new one.
+#
+# Nothing pushes the end of an abandoned switch, so it is resolved here, on
+# the way to every question whose answer depends on it: what to search, where
+# the project root is, and whether |:SimpleFinderRoot| may pin a local one.
+def RemoteSwitchInProgress(): bool
+  if !s_remote_switching
+    return false
+  endif
+  # The switching fallback follows a remote workspace, so it answers to the
+  # setting that governs workspace-following: turning the integration off at
+  # runtime must not leave the finder chasing the snapshot it took before.
+  if get(g:, 'simplefinder_remote', 1) == 0 || !RemoteSwitchPending()
+    s_remote_switching = false
+    return false
+  endif
+  return !empty(s_remote_workspace)
+enddef
+
 # The workspace a panel opened now should search.  Normally what SimpleRemote
 # publishes; during a workspace switch nothing is published, and the panel
 # opened in that gap keeps following the connection being replaced -- its
@@ -1150,7 +1204,7 @@ enddef
 # whatever the cwd happens to be.
 def CurrentRemoteWorkspace(): dict<any>
   var workspace = ActiveRemoteWorkspace()
-  if empty(workspace) && s_remote_switching && !empty(s_remote_workspace)
+  if empty(workspace) && RemoteSwitchInProgress()
     return s_remote_workspace
   endif
   return workspace
@@ -3130,13 +3184,27 @@ enddef
 def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
   var command = RemoteShellCommand(script)
   if empty(command)
-    if s_remote_switching
+    if RemoteSwitchInProgress()
       # SimpleRemote is between two connections and answers with no argv until
       # the next one is ready.  The search is not lost: SimpleRemoteConnected
       # re-dispatches whatever the panel is showing, so keep it on
       # `searching…` rather than flash an error the user cannot act on.
       s_loading = true
       s_error = ''
+      PanelRender()
+      return false
+    endif
+    if !empty(s_remote_workspace) && empty(ActiveRemoteWorkspace())
+      # The switch this panel was following was abandoned or the workspace is
+      # gone (see RemoteSwitchPending): there is no connection left to search
+      # and none coming.  Drop the dead snapshot so the panel says so once and
+      # the next search runs locally instead of waiting for ever.
+      ClearRemoteCaches()
+      s_remote_workspace = {}
+      s_project_root = FindProjectRoot()
+      s_loading = false
+      s_current_id = 0
+      s_error = 'remote workspace disconnected'
       PanelRender()
       return false
     endif
@@ -3643,7 +3711,7 @@ export def ProjectRoot(path: string = '')
     return
   endif
   var remote = ActiveRemoteWorkspace()
-  if empty(remote) && s_remote_switching && !empty(s_remote_workspace)
+  if empty(remote) && RemoteSwitchInProgress()
     # Between two connections there is no workspace to re-root and no local
     # project either; pinning a local root now would outlive the switch.
     echohl WarningMsg
@@ -4647,8 +4715,11 @@ export def OnRemoteWorkspace()
   if event ==# 'SimpleRemoteConnecting'
       || (event ==# 'SimpleRemoteDisconnected'
         && get(payload, 'reason', '') ==# 'reconnect')
-    if empty(previous)
+    if empty(previous) || get(g:, 'simplefinder_remote', 1) == 0
       # Nothing was being followed; a first connection is plain Connected.
+      # And with the integration switched off at runtime, `previous` is a
+      # snapshot from before it was switched off: following its replacement
+      # would revive exactly the behaviour the user just turned off.
       return
     endif
     s_remote_switching = true
