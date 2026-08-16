@@ -20,8 +20,9 @@ SimpleFinder 是一个面向 Vim 9 的轻量、快速项目查找器。Vim9 负�
 - 文件、最近文件、缓冲区、光标词和可视选择搜索
 - 编辑、水平/垂直分屏和新标签页打开；缓冲区模式可直接关闭 buffer
 - 清晰的加载、错误、耗时、结果上限和空状态反馈
-- 自动跟随 SimpleRemote workspace；虚拟 SSH/Docker 工作区无需挂载即可使用文件、
-  全文、符号和 Git 文件搜索，并支持远端预览与 `remote://` 打开
+- 自动跟随 SimpleRemote workspace；虚拟工作区无需挂载即可使用文件、全文、符号和
+  Git 文件搜索，并支持远端预览与 `remote://` 打开；sshfs 挂载也在远端搜索、本地打开；
+  buffers/recent 认得远端 buffer；`:SimpleFinderRemoteWorkspaces` 选择并连接 workspace
 - `:SimpleFinderHealth` 是一份可读、可粘贴的诊断报告，并会校验配置：拼错的
   `g:simplefinder_` 选项、类型写错的值、指不到的路径都会被点名
 
@@ -62,6 +63,7 @@ Plug 'your-name/simplefinder', { 'do': './install.sh' }
 | `:SimpleFinderJumps` | 模糊搜索跳转表 |
 | `:SimpleFinderQuickfix` / `:SimpleFinderLoclist` | 在 quickfix / location list 里模糊查找 |
 | `:SimpleFinderRoot [dir]` | 查看或设置固定搜索根目录 |
+| `:SimpleFinderRemoteWorkspaces` | 模糊选择 SimpleRemote 最近 workspace / profile 并连接 |
 
 每个命令都有对应的 `<Plug>` 目标,推荐绑定 `<Plug>` 而不是命令名:
 
@@ -75,7 +77,7 @@ xmap <leader>fg <Plug>(simplefinder-grep-visual)
 ```
 
 其余可用目标:`-gitfiles`、`-grep`、`-recent`、`-lines`、`-help`、`-symbols`、
-`-marks`、`-jumps`、`-quickfix`、`-loclist`。
+`-marks`、`-jumps`、`-quickfix`、`-loclist`、`-remote-workspaces`。
 
 可视模式请用 `<Plug>(simplefinder-grep-visual)`,不要自行绑定。它必须在可视模式
 仍然生效时运行才能读到当前选区：`'<` / `'>` 标记要等选区结束才写入,自己写的
@@ -136,6 +138,7 @@ let g:simplefinder_preview_width = 0        " 0 = 用满面板旁边的列
 let g:simplefinder_preview_max_bytes = 2097152
 let g:simplefinder_preview_cache = 4        " 缓存最近几个文件的内容
 let g:simplefinder_remote = 1               " 自动跟随活动 SimpleRemote workspace
+let g:simplefinder_remote_search_projected = 1  " sshfs 挂载在远端搜索而不是本地遍历
 let g:simplefinder_history_max = 50         " 每个来源保留的历史查询条数
 let g:simplefinder_lines_max = 50000        " :SimpleFinderLines 读取的行数上限
 let g:simplefinder_hidden = 0
@@ -156,21 +159,48 @@ let g:simplefinder_debug = 0
 
 ## SimpleRemote 联动
 
-当 `g:simpleremote_workspace` 存在时，SimpleFinder 默认把它当成当前项目：
+当 `g:simpleremote_workspace` 存在时，SimpleFinder 默认把它当成当前项目，用哪个引擎取决于
+workspace 的 mode：
 
-- SSHFS、Docker bind 或显式 `local_root` 映射继续走本地 Rust daemon，根目录自动换成
-  映射后的本地路径。
 - virtual workspace 的 `Files`、`Grep` / `IGrep`、光标词/可视选择 grep、`Symbols`
   和 `GitFiles` 通过 `g:SimpleRemoteShellCommand()` 在远端运行。远端有 `rg` 时完整支持
   hidden、ignore、include/exclude glob；没有 `rg` 时降级到 Git/find/grep。
+- sshfs 挂载是 FUSE 文件系统，本地 daemon 遍历它等于每个 syscall 走一次 SSH，所以同样在
+  远端搜索，结果解析成挂载点下的普通本地路径：打开、分屏、预览、quickfix 都是本地文件。
+  `g:simplefinder_remote_search_projected = 0` 可改回本地 daemon 遍历挂载。挂载还没起来
+  （mode `mounting`）时已经在远端搜；挂载就绪的 WorkspaceChanged 不会取消正在进行的列举，
+  只是此后结果解析到挂载点。
+- Docker bind 或显式 `local_root` 映射继续走本地 Rust daemon，根目录自动换成映射后的本地
+  路径。
+- 传输种类（ssh、docker 或 SimpleRemote 以后新增的）不做白名单检查：所有 I/O 都经
+  SimpleRemote 的函数。经传输搜索时面板标题带 `[kind:target]`。
 - 文件结果在本地用 Vim 的 `matchfuzzypos()` 排序，因此连续输入不会为每个字符重新走
   SSH；全文结果异步流入面板，新查询会停止旧远端任务。
 - 预览通过 `g:SimpleRemoteReadFile()` 异步读取，打开、分屏、tab 和 quickfix 使用
   `remote://` buffer。
-- SimpleRemote 换 workspace/root 时，已打开的查找面板会取消旧请求并自动切到新根；
-  在远端会话中执行 `:SimpleFinderRoot {dir}` 则反向切换 SimpleRemote workspace。
+- `:SimpleFinderBuffers` 列出已打开的 `remote://` buffer（SimpleRemote 给它们设
+  `buftype=acwrite`；其它 `buftype` 照旧不列）并标 `[remote]`；`:SimpleFinderRecent` 在
+  BufEnter 和 `User SimpleRemoteBufferRead` 时记录远端 buffer，viminfo 里的 `remote://`
+  条目不再被 `filereadable()` 过滤，有活动 workspace 时该 workspace 的文件排在最前。
+- SimpleRemote 换 workspace/root 时，已打开的查找面板会取消旧请求并自动切到新根。切换过程
+  （Disconnected reason `reconnect` → Connecting → Connected）不当作断开：面板保留旧标题、
+  显示 `searching…`，间隙里敲出的搜索等到 Connected 自动重发；真正的断开仍提示
+  "remote workspace disconnected"，重连后恢复。
+- 在远端会话中执行 `:SimpleFinderRoot {dir}` 反向切换 SimpleRemote workspace。SimpleRemote
+  的 `g:simpleremote_sync_tree_root` 关闭时不重连、只移动树的 view root
+  （`SimpleRemoteTreeRootChanged`），查找跟着它走：远端脚本先 `cd` 进子目录，结果解析回
+  绝对路径；目标在 workspace 之外时给出警告并留在 workspace 根。sync 打开时（默认）
+  view-only reveal 造成的 `tree_root` 差异不影响查找。
+- `:SimpleFinderRemoteWorkspaces`（`<Plug>(simplefinder-remote-workspaces)`）用通用选择器
+  列出 `g:SimpleRemoteRecentWorkspaces()` 与不在其中的 `g:SimpleRemoteProfiles()`
+  （profile 标 `(profile)`，当前连接标 `*`），`<CR>` 交给 `g:SimpleRemoteOpenWorkspace()`。
+  不需要已有 workspace，也不受 `g:simplefinder_remote` 影响。
+- `:SimpleFinderHealth` 的 CONTEXT 段列出 workspace 的 mode、搜索引擎与目录、分离的 tree
+  root、SimpleRemote runtime/protocol、API 是否齐全；没有 workspace 时说明原因，并且两种
+  情况都会说明 workspace 选择器是否可用。
 
-设 `g:simplefinder_remote = 0` 可完全关闭联动，恢复只按本地文件和 cwd 判断项目根。
+设 `g:simplefinder_remote = 0` 可关闭以上联动（选择器除外），恢复只按本地文件和 cwd 判断
+项目根。
 
 匹配数超过 `g:simplefinder_max_results` 时，grep 保留 (path, lnum, col) 排序中最靠前
 的那一批——与完整排序后截断的结果集相同——所以只要走完整棵树，同一查询每次返回同一批
@@ -216,7 +246,8 @@ issue 的，消息区这三件事都做不到。固定五段，顺序固定，�
 - `RUNTIME`：运行状态、协商到的协议与能力、uptime、崩溃/重启计数、熔断器。第一次搜索
   之前根本还没有 daemon，这里就照实说是"还没启动"，而不是报错——daemon 本来就随第一次
   搜索启动，把预期状态写成 `[ERROR]` 会让每一份引用它的 bug report 走进死胡同
-- `CONTEXT`：项目根、SimpleRemote workspace、include/exclude glob 数量、预览默认开关
+- `CONTEXT`：项目根、SimpleRemote workspace（mode、搜索引擎与目录、tree root、
+  runtime/protocol、API 是否齐全，或未激活的原因）、include/exclude glob 数量、预览默认开关
 
 报告写在它自己新建的 buffer 里：先建空的，之后才命名成 `SimpleFinderHealth`，绝不去
 接管这个名字碰巧指到的那个 buffer。所以你目录里真有一个叫 `SimpleFinderHealth` 的

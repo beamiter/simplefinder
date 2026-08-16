@@ -163,16 +163,60 @@ Requires Vim 9.0+ with |+job|, |+channel|, |+timers|, |+textprop| and
                                                            *:SimpleFinderRoot*
 :SimpleFinderRoot [dir]      Show, or pin, the search root directory.
                              With an active SimpleRemote workspace, {dir}
-                             changes that remote workspace root instead.
+                             changes that remote workspace root instead
+                             (or, with SimpleRemote's tree-root sync off,
+                             the tree root searches follow; see
+                             |simplefinder-remote-root|).
+
+                                               *:SimpleFinderRemoteWorkspaces*
+:SimpleFinderRemoteWorkspaces
+                             Fuzzy-find SimpleRemote workspaces: the recent
+                             ones first (g:SimpleRemoteRecentWorkspaces()),
+                             then the configured profiles
+                             (g:SimpleRemoteProfiles()) that are not already
+                             among them, each listed once by kind, target
+                             and root. Rows read `kind:target root`, with
+                             the profile name in front when it has one, the
+                             local projection after `->` when it has one,
+                             and `(profile)` for a profile; the workspace
+                             connected right now is marked with `*`. <CR>
+                             hands the row to g:SimpleRemoteOpenWorkspace(),
+                             which connects and opens its tree; a profile
+                             without a root prompts for one there. Works
+                             with no workspace open -- it is how you get to
+                             one -- and does not need |g:simplefinder_remote|.
+                             Reports an error without SimpleRemote.
 
 SIMPLEREMOTE INTEGRATION                              *simplefinder-remote*
 
-An active g:simpleremote_workspace becomes the project automatically. A
-mounted, Docker-bind, or explicitly mapped workspace uses the ordinary local
-daemon against local_root. A virtual SSH/Docker workspace runs Files, Grep,
-IGrep, GrepWord, GrepVisual, Symbols, and GitFiles through
-g:SimpleRemoteShellCommand(). Results open as remote:// buffers and previews
-use g:SimpleRemoteReadFile() asynchronously.
+An active g:simpleremote_workspace becomes the project automatically. Which
+engine searches it depends on the workspace mode:
+
+  virtual        Files, Grep, IGrep, GrepWord, GrepVisual, Symbols and
+                 GitFiles run on the remote host through
+                 g:SimpleRemoteShellCommand(). Results open as remote://
+                 buffers and previews use g:SimpleRemoteReadFile()
+                 asynchronously.
+  sshfs          The mount is a FUSE filesystem, and a local daemon walking
+                 it reads every file over SSH one syscall at a time. So the
+                 search runs on the host exactly as for a virtual workspace,
+                 and its results resolve to plain local paths under
+                 local_root: they open, split and preview as ordinary
+                 files, and the quickfix list holds local names. Set
+                 |g:simplefinder_remote_search_projected| to 0 to walk the
+                 mount with the local daemon instead. While the mount is
+                 still coming up (mode `mounting`) the search already runs
+                 on the host; when SimpleRemote publishes the mount, the
+                 listing in flight is kept and its results simply resolve
+                 to the mount from then on.
+  docker-bind, local-map
+                 Real local directories; the ordinary local daemon searches
+                 local_root.
+
+The transport kind (ssh, docker, or anything SimpleRemote adds later) is not
+inspected: everything crosses through SimpleRemote's functions, so a kind
+this plugin has never heard of works like ssh. The panel title shows
+`[kind:target]` whenever a search runs through the transport.
 
 When `rg` exists remotely it supplies ignore, hidden, and path-glob semantics.
 Without it, file search falls back to Git/find and text search to grep. File
@@ -180,11 +224,63 @@ names are enumerated across the transport and fuzzy-filtered locally, so each
 keystroke does not start a new SSH traversal. Grep requests are cancellable
 and paint results asynchronously.
 
-SimpleRemoteConnected, SimpleRemoteWorkspaceChanged, and
-SimpleRemoteDisconnected events invalidate old requests and previews. A live
-panel follows the new root. |:SimpleFinderRoot| goes the other direction and
-asks SimpleRemote to change its real workspace root. Set
-|g:simplefinder_remote| to 0 to disable all of this integration.
+Buffers and recent files~
+|:SimpleFinderBuffers| lists open remote:// buffers (SimpleRemote gives them
+'buftype' acwrite so saves go through its BufWriteCmd; no other 'buftype' is
+listed) by their full remote:// name, marked `[remote]`. |:SimpleFinderRecent|
+records remote:// buffers when they are entered and when SimpleRemote reports
+that their asynchronous fill landed (User SimpleRemoteBufferRead), keeps
+remote:// entries from 'viminfo' without a filereadable() check, and, while a
+workspace is active, lists that workspace's files first, in their own recency
+order, ahead of everything else. Both open through SimpleRemote's remote://
+boundary.
+
+Events~
+The finder follows SimpleRemote's User events (see the SimpleRemote help):
+SimpleRemoteConnected and SimpleRemoteWorkspaceChanged re-snapshot the
+workspace and re-run an open Files/Grep/Symbols/GitFiles panel against the
+new root; SimpleRemoteDisconnected with reason 'disconnect' (or any reason
+but 'reconnect') reports `remote workspace disconnected` and the panel
+resumes when the workspace comes back. A workspace switch -- SimpleRemote
+fires Disconnected with reason 'reconnect', then SimpleRemoteConnecting, then
+Connected, with no workspace published in between -- is not a disconnection:
+the panel keeps the old host in its title, says `searching…`, and a search
+typed during the gap waits for Connected too, which re-dispatches it. A
+panel opened during the gap follows the connection being replaced the same
+way rather than searching the local cwd, and |:SimpleFinderRoot| {dir}
+refuses to pin a local root until the switch is over. A
+WorkspaceChanged or SimpleRemoteTreeRootChanged that changes nothing a
+running search depends on (same connection, same search directory, same
+engine) leaves that search running rather than restarting it.
+
+                                                   *simplefinder-remote-root*
+Root~
+|:SimpleFinderRoot| {dir} goes the other direction and asks SimpleRemote to
+change its workspace root through g:SimpleRemoteTreeSetRoot(). What that
+does depends on SimpleRemote's g:simpleremote_sync_tree_root:
+
+  on (SimpleRemote's default)
+        The workspace itself moves: SimpleRemote reconnects there and the
+        Connected event brings the finder along. Its `tree_root` then only
+        differs from `root` during a view-only reveal, which the finder
+        ignores -- a reveal must not narrow a search.
+  off   Nothing reconnects; only the tree's view root (`tree_root`) moves and
+        SimpleRemoteTreeRootChanged fires. Searches follow it: the remote
+        script enters the subdirectory, results are relative to it and
+        resolve back to absolute paths (remote:// or under the mount), and
+        the message says `remote search root: {dir} (workspace root {root})`.
+        A tree root outside the workspace is not followed, because
+        SimpleRemote refuses to read files outside its root; the message
+        says so and searches stay in the workspace root. This applies to the
+        remote tree's own re-rooting keys as well as to |:SimpleFinderRoot|.
+
+Set |g:simplefinder_remote| to 0 to disable all of this integration except
+|:SimpleFinderRemoteWorkspaces|. |:SimpleFinderHealth| names the active
+workspace, its mode, which engine searches it and where, the SimpleRemote
+runtime and protocol in use, and whether the SimpleRemote functions this
+plugin calls are present -- or, with no workspace, why there is none. Either
+way it reports whether |:SimpleFinderRemoteWorkspaces| has the API it needs,
+because with no workspace that is the way to get one.
 
 ==============================================================================
 3. PANEL KEYS                                              *simplefinder-keys*
@@ -304,6 +400,8 @@ Set before the plugin loads; defaults shown. >
   g:simplefinder_preview_max_bytes = 2097152   largest file read for preview
   g:simplefinder_preview_cache = 4       files kept from previous previews
   g:simplefinder_remote = 1              follow the active SimpleRemote workspace
+  g:simplefinder_remote_search_projected = 1
+                                         search sshfs mounts on the host
   g:simplefinder_hidden = 0              include hidden files
   g:simplefinder_no_ignore = 0           ignore the ignore files
   g:simplefinder_regex = 0               grep starts in regex mode
@@ -329,7 +427,19 @@ SimpleRemote workspace takes precedence; see |simplefinder-remote|.
                                                 *g:simplefinder_remote*
 g:simplefinder_remote
         Boolean, default 1. Follow an active SimpleRemote workspace. Set to 0
-        to keep project-root detection and every search local.
+        to keep project-root detection and every search local
+        (|:SimpleFinderRemoteWorkspaces| still works: it opens workspaces
+        rather than searching one).
+
+                                *g:simplefinder_remote_search_projected*
+g:simplefinder_remote_search_projected
+        Boolean, default 1. Search an sshfs-projected workspace on the host
+        through the SimpleRemote transport, with results resolved to local
+        paths under the mount, rather than walking the FUSE mount with the
+        local daemon. Set to 0 to treat sshfs like docker-bind and local-map
+        and use the local daemon. Virtual workspaces always use the
+        transport; other projections always use the local daemon. See
+        |simplefinder-remote|.
 
 VALIDATION                                           *simplefinder-validation*
 
@@ -486,6 +596,7 @@ The full set: *simplefinder-plugs*
   <Plug>(simplefinder-symbols)     <Plug>(simplefinder-marks)
   <Plug>(simplefinder-jumps)       <Plug>(simplefinder-quickfix)
   <Plug>(simplefinder-loclist)     <Plug>(simplefinder-resume)
+  <Plug>(simplefinder-remote-workspaces)
 
                                         *<Plug>(simplefinder-grep-visual)*
 Visual-mode grep is the exception, and the plugin ships the mapping: >
@@ -608,7 +719,12 @@ What it guarantees:
                      the daemon starts with the first search, and reporting
                      the expected state as an error sends every bug report
                      that quotes it down a blind alley.
-        CONTEXT      Project root, path glob counts, preview default.
+        CONTEXT      Project root, the SimpleRemote workspace (its mode,
+                     which engine searches it and where, a detached tree
+                     root, the runtime and protocol in use, and whether the
+                     SimpleRemote functions this plugin calls are present;
+                     or why it is inactive), whether the workspace picker is
+                     available, path glob counts, preview default.
 
         The daemon's version is asked for with |job_start()|, never
         |system()|: this is the command you run because something is wedged,

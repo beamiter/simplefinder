@@ -38,9 +38,14 @@ g:simplefinder_preview_width = get(g:, 'simplefinder_preview_width', 0)
 g:simplefinder_preview_max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
 g:simplefinder_preview_cache = get(g:, 'simplefinder_preview_cache', 4)
 # Follow an active SimpleRemote workspace.  Virtual workspaces search through
-# its SSH/Docker transport; mounted/local-map workspaces use the projected root
-# with the normal local daemon.
+# its SSH/Docker transport; docker-bind/local-map workspaces use the projected
+# root with the normal local daemon (sshfs: see the next option).
 g:simplefinder_remote = get(g:, 'simplefinder_remote', 1)
+# An sshfs projection is a FUSE mount: the local daemon walking it reads every
+# file over SSH.  Search such workspaces through the SimpleRemote transport
+# instead (results still open as local files under the mount); 0 walks the
+# mount with the local daemon like any other projection.
+g:simplefinder_remote_search_projected = get(g:, 'simplefinder_remote_search_projected', 1)
 g:simplefinder_root = get(g:, 'simplefinder_root', '')
 # Native path filters for daemon-backed files, grep, and symbol searches.
 # Includes are positive ignore-style globs; excludes are kept separate so a
@@ -74,6 +79,7 @@ command! SimpleFinderMarks          simplefinder#Marks()
 command! SimpleFinderJumps          simplefinder#Jumps()
 command! SimpleFinderQuickfix       simplefinder#QuickfixList()
 command! SimpleFinderLoclist        simplefinder#QuickfixList(true)
+command! SimpleFinderRemoteWorkspaces simplefinder#RemoteWorkspaces()
 command! SimpleFinderHealth         simplefinder#Health()
 command! SimpleFinderRestart        simplefinder#Restart()
 command! SimpleFinderLog            simplefinder#ShowLog()
@@ -100,6 +106,7 @@ nnoremap <silent> <Plug>(simplefinder-jumps)      <Cmd>SimpleFinderJumps<CR>
 nnoremap <silent> <Plug>(simplefinder-quickfix)   <Cmd>SimpleFinderQuickfix<CR>
 nnoremap <silent> <Plug>(simplefinder-loclist)    <Cmd>SimpleFinderLoclist<CR>
 nnoremap <silent> <Plug>(simplefinder-resume)     <Cmd>SimpleFinderResume<CR>
+nnoremap <silent> <Plug>(simplefinder-remote-workspaces) <Cmd>SimpleFinderRemoteWorkspaces<CR>
 
 # Grepping a Visual selection is the one entry point a user cannot map
 # correctly by hand: it has to run *while* Visual mode is still active, since
@@ -135,6 +142,11 @@ augroup SimpleFinder
   autocmd BufEnter * simplefinder#TrackRecentFile()
   autocmd VimResized * simplefinder#Reflow()
   autocmd TextChanged,TextChangedI SimpleFinder simplefinder#OnPanelTextChanged()
-  autocmd User SimpleRemoteConnected,SimpleRemoteWorkspaceChanged,SimpleRemoteDisconnected
-    \ simplefinder#OnRemoteWorkspace()
+  # Registered whether or not SimpleRemote is installed: a User event nothing
+  # fires costs nothing, and the handler reads g:simpleremote_event to tell a
+  # workspace switch (Connecting) from a disconnect.
+  autocmd User SimpleRemoteConnecting,SimpleRemoteConnected,
+    \SimpleRemoteWorkspaceChanged,SimpleRemoteTreeRootChanged,
+    \SimpleRemoteDisconnected simplefinder#OnRemoteWorkspace()
+  autocmd User SimpleRemoteBufferRead simplefinder#OnRemoteBufferRead()
 augroup END

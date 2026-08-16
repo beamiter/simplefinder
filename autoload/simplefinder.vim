@@ -54,8 +54,15 @@ var s_glob_error: string = ''
 
 # Snapshot of the SimpleRemote workspace owned by the current panel.  An empty
 # local_root means the workspace is virtual and search I/O must cross the
-# transport; a projection can use the ordinary local daemon unchanged.
+# transport; a projection can use the ordinary local daemon unchanged, except
+# an sshfs mount, which is searched through the transport too (see
+# RemoteTransportFor).
 var s_remote_workspace: dict<any> = {}
+# True between SimpleRemoteConnecting (or a Disconnected whose reason is
+# 'reconnect') and the event that ends the switch.  The snapshot above is kept
+# through the gap so an open panel says `searching…` rather than
+# `disconnected` while SimpleRemote swaps one connection for the next.
+var s_remote_switching: bool = false
 var s_remote_job: job = null_job
 var s_remote_job_id: number = 0
 var s_remote_job_kind: string = ''
@@ -340,6 +347,7 @@ const CONFIG_SPEC: list<dict<any>> = [
   {name: 'preview_cache', type: v:t_number, min: 1,
    min_note: 'one previewed file is always kept'},
   {name: 'remote', type: v:t_number, flag: true},
+  {name: 'remote_search_projected', type: v:t_number, flag: true},
   {name: 'hidden', type: v:t_number, flag: true},
   {name: 'no_ignore', type: v:t_number, flag: true},
   {name: 'regex', type: v:t_number, flag: true},
@@ -749,18 +757,98 @@ def RuntimeLines(): list<string>
   return lines
 enddef
 
+# The SimpleRemote functions the remote code paths call.  A missing one is not
+# fatal -- each caller degrades to a message -- but the message shows up in
+# the middle of a search, and this is where a user goes to find out why.
+const REMOTE_API: list<string> = [
+  'g:SimpleRemoteShellCommand', 'g:SimpleRemoteReadFile',
+  'g:SimpleRemoteTreeSetRoot', 'g:SimpleRemoteRemotePath',
+]
+# What :SimpleFinderRemoteWorkspaces needs; it works with no workspace open,
+# so it is reported separately and never as a fault of the active one.
+const REMOTE_PICKER_API: list<string> = [
+  'g:SimpleRemoteRecentWorkspaces', 'g:SimpleRemoteProfiles',
+  'g:SimpleRemoteOpenWorkspace',
+]
+
+def MissingFunctions(names: list<string>): list<string>
+  return filter(copy(names), (_, name) => exists('*' .. name) != 1)
+enddef
+
+# Whether :SimpleFinderRemoteWorkspaces has the API it needs.  It is reported
+# with or without an active workspace, because with none it is the answer to
+# the question the report just raised: how do I get one.
+def RemotePickerLine(): string
+  var missing = MissingFunctions(REMOTE_PICKER_API)
+  return empty(missing)
+    ? '[INFO] remote workspace picker: :SimpleFinderRemoteWorkspaces available'
+    : printf('[INFO] remote workspace picker: unavailable, missing %s',
+        join(missing, ', '))
+enddef
+
+def RemoteContextLines(): list<string>
+  var lines: list<string> = []
+  var remote = ActiveRemoteWorkspace()
+  if empty(remote)
+    var status = get(g:, 'simpleremote_status', '')
+    var reason = get(g:, 'simplefinder_remote', 1) == 0
+      ? 'g:simplefinder_remote = 0'
+      : type(status) == v:t_string && status !=# '' && status !=# 'disconnected'
+        ? 'SimpleRemote status: ' .. status
+        : 'no SimpleRemote workspace'
+    add(lines, printf('[INFO] remote workspace: inactive (%s)', reason))
+    add(lines, RemotePickerLine())
+    return lines
+  endif
+  var local_root = get(remote, 'local_root', '')
+  var mode = get(remote, 'mode', '')
+  add(lines, printf('[INFO] remote workspace: %s:%s:%s (mode %s%s)',
+    remote.kind, remote.target, remote.root, mode ==# '' ? 'unknown' : mode,
+    empty(local_root) ? '' : ', projected to ' .. local_root))
+  # Which of the two engines a search runs on, and where.  In a virtual
+  # workspace there is one answer; a projection has both and the choice is a
+  # setting, so the report says which one is in force.
+  if RemoteTransportFor(remote)
+    add(lines, printf('[INFO] remote search: through the SimpleRemote transport in %s%s',
+      RemoteSearchRoot(remote),
+      empty(local_root) ? '' : ' (g:simplefinder_remote_search_projected = 1)'))
+  else
+    add(lines, printf('[INFO] remote search: local daemon on %s%s',
+      ProjectedSearchRoot(remote),
+      mode ==# 'sshfs' ? ' (g:simplefinder_remote_search_projected = 0)' : ''))
+  endif
+  var tree_root = get(remote, 'tree_root', '')
+  if tree_root !=# '' && tree_root !=# CleanRemoteRoot(remote)
+    add(lines, printf('[INFO] remote tree root: %s (%s)', tree_root,
+      RemoteSearchSubdir(remote) !=# ''
+        ? 'searches run there; g:simpleremote_sync_tree_root = 0'
+        : get(g:, 'simpleremote_sync_tree_root', 1) != 0
+          ? 'view only; searches run in the workspace root'
+          : 'outside the workspace; searches run in the workspace root'))
+  endif
+  var runtime = get(remote, 'runtime', '')
+  var protocol = get(remote, 'protocol', '')
+  add(lines, printf('[INFO] remote transport: %s%s',
+    type(runtime) == v:t_string && runtime !=# ''
+      ? runtime : 'ssh/docker fallback (no simpleremote-daemon)',
+    type(protocol) == v:t_string && protocol !=# '' ? ' (protocol ' .. protocol .. ')' : ''))
+  var missing = MissingFunctions(REMOTE_API)
+  if empty(missing)
+    add(lines, printf('[OK] SimpleRemote API: %s present', join(REMOTE_API, ', ')))
+  else
+    add(lines, printf('[WARN] SimpleRemote API: missing %s — the workspace is '
+      .. 'published by a SimpleRemote too old for this SimpleFinder; update it',
+      join(missing, ', ')))
+  endif
+  add(lines, RemotePickerLine())
+  return lines
+enddef
+
 def ContextLines(): list<string>
   var lines: list<string> = []
   add(lines, printf('[INFO] project root: %s',
     s_project_root ==# '' ? '(resolved on the first search)' : s_project_root))
-  var remote = ActiveRemoteWorkspace()
-  if !empty(remote)
-    add(lines, printf('[INFO] remote workspace: %s:%s:%s (%s)',
-      remote.kind, remote.target, remote.root,
-      empty(get(remote, 'local_root', '')) ? 'virtual transport' : remote.local_root))
-  else
-    add(lines, '[INFO] remote workspace: inactive')
-  endif
+  extend(lines, RemoteContextLines())
   try
     var includes = ReadPathGlobList('simplefinder_include_globs')
     var excludes = ReadPathGlobList('simplefinder_exclude_globs')
@@ -963,8 +1051,13 @@ def ActiveRemoteWorkspace(): dict<any>
     return {}
   endif
   var workspace = get(g:, 'simpleremote_workspace', {})
+  # The transport kind is opaque here: every byte crosses through
+  # g:SimpleRemoteShellCommand() and g:SimpleRemoteReadFile(), so a kind this
+  # file has never heard of works exactly like ssh or docker.  Only the shape
+  # is checked -- a snapshot without a target or an absolute root cannot be
+  # searched.
   if type(workspace) != v:t_dict
-      || index(['ssh', 'docker'], get(workspace, 'kind', '')) < 0
+      || empty(get(workspace, 'kind', ''))
       || empty(get(workspace, 'target', ''))
       || get(workspace, 'root', '') !~# '^/'
     return {}
@@ -972,17 +1065,107 @@ def ActiveRemoteWorkspace(): dict<any>
   return copy(workspace)
 enddef
 
-def IsVirtualRemote(): bool
-  return !empty(s_remote_workspace)
-    && empty(get(s_remote_workspace, 'local_root', ''))
+# The workspace root without its trailing slash, '/' for the filesystem root.
+def CleanRemoteRoot(workspace: dict<any>): string
+  var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
+  return root ==# '' ? '/' : root
+enddef
+
+# The directory searches run in, relative to the workspace root: '' for the
+# root itself, 'a/b' for a subdirectory.
+#
+# SimpleRemote's tree has a view root (`tree_root`) beside the workspace root.
+# With g:simpleremote_sync_tree_root on, re-rooting the tree reconnects the
+# workspace, so root and tree_root only differ during a view-only reveal and
+# the finder keeps searching the whole workspace.  With it off, re-rooting is
+# the tree's only way to say "work here": nothing reconnects, tree_root moves
+# and SimpleRemoteTreeRootChanged fires -- so that is the root searches
+# follow.  A tree_root outside the workspace is not followed: SimpleRemote
+# refuses to read files outside the root, so results there could not be
+# previewed or opened.
+def RemoteSearchSubdir(workspace: dict<any>): string
+  if empty(workspace) || get(g:, 'simpleremote_sync_tree_root', 1) != 0
+    return ''
+  endif
+  var root = CleanRemoteRoot(workspace)
+  var tree_root = substitute(get(workspace, 'tree_root', ''), '/\+$', '', '')
+  if tree_root ==# '' || tree_root ==# root || tree_root !~# '^/'
+    return ''
+  endif
+  var prefix = root ==# '/' ? '/' : root .. '/'
+  if stridx(tree_root, prefix) != 0
+    return ''
+  endif
+  return strpart(tree_root, len(prefix))
+enddef
+
+# The absolute remote directory searches run in.
+def RemoteSearchRoot(workspace: dict<any>): string
+  var root = CleanRemoteRoot(workspace)
+  var subdir = RemoteSearchSubdir(workspace)
+  if subdir ==# ''
+    return root
+  endif
+  return (root ==# '/' ? '/' : root .. '/') .. subdir
+enddef
+
+# The local directory a projected workspace's searches run in.
+def ProjectedSearchRoot(workspace: dict<any>): string
+  var local_root = substitute(fnamemodify(get(workspace, 'local_root', ''), ':p'),
+    '/$', '', '')
+  var subdir = RemoteSearchSubdir(workspace)
+  return subdir ==# '' ? local_root : local_root .. '/' .. subdir
+enddef
+
+# Whether searches in `workspace` cross the SimpleRemote transport rather than
+# run the local daemon.
+#
+# A virtual workspace (no local_root) has nowhere else to run.  A projected
+# one usually does: docker-bind and local-map are real local directories and
+# the local daemon is the fastest thing that can read them.  sshfs is the
+# exception -- it is a FUSE mount, and a daemon walking it reads every file
+# over SSH one syscall at a time, which is slower than running `rg` on the
+# host and streaming the results back.  Its results still resolve to plain
+# local paths under the mount, so they open as ordinary buffers.
+def RemoteTransportFor(workspace: dict<any>): bool
+  if empty(workspace)
+    return false
+  endif
+  if empty(get(workspace, 'local_root', ''))
+    return true
+  endif
+  return get(workspace, 'mode', '') ==# 'sshfs'
+    && get(g:, 'simplefinder_remote_search_projected', 1) != 0
+enddef
+
+def RemoteTransportActive(): bool
+  return RemoteTransportFor(s_remote_workspace)
+enddef
+
+# The workspace a panel opened now should search.  Normally what SimpleRemote
+# publishes; during a workspace switch nothing is published, and the panel
+# opened in that gap keeps following the connection being replaced -- its
+# search waits on `searching…` and SimpleRemoteConnected re-dispatches it
+# against the new root -- rather than falling back to a local search of
+# whatever the cwd happens to be.
+def CurrentRemoteWorkspace(): dict<any>
+  var workspace = ActiveRemoteWorkspace()
+  if empty(workspace) && s_remote_switching && !empty(s_remote_workspace)
+    return s_remote_workspace
+  endif
+  return workspace
 enddef
 
 def FindProjectRoot(): string
-  var remote = ActiveRemoteWorkspace()
+  # CurrentRemoteWorkspace(), not ActiveRemoteWorkspace(): mid-switch the
+  # panel still follows the connection being replaced, and a project root
+  # taken from the local cwd in that gap would contradict everything else on
+  # screen -- the title, the search, and the health report -- for as long as
+  # the switch lasts.
+  var remote = CurrentRemoteWorkspace()
   if !empty(remote)
-    var projected = get(remote, 'local_root', '')
-    return empty(projected) ? remote.root
-      : substitute(fnamemodify(projected, ':p'), '/$', '', '')
+    return empty(get(remote, 'local_root', ''))
+      ? RemoteSearchRoot(remote) : ProjectedSearchRoot(remote)
   endif
   var configured = get(g:, 'simplefinder_root', '')
   if configured !=# ''
@@ -1117,7 +1300,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   endif
   s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
   s_preview_scroll = 0
-  s_remote_workspace = ActiveRemoteWorkspace()
+  s_remote_workspace = CurrentRemoteWorkspace()
   s_project_root = FindProjectRoot()
 
   EnsurePanel()
@@ -1355,7 +1538,7 @@ def PanelRender()
   if s_no_ignore
     flags ..= ' [all]'
   endif
-  if IsVirtualRemote()
+  if RemoteTransportActive()
     flags ..= ' [' .. get(s_remote_workspace, 'kind', 'remote') .. ':'
       .. get(s_remote_workspace, 'target', '?') .. ']'
   endif
@@ -1497,7 +1680,8 @@ def FormatItemLine(idx: number, width: number): string
   elseif s_mode ==# 'buffers'
     var path = get(item, 'path', '')
     var mod = get(item, 'modified', 0) ? ' [+]' : ''
-    line = marker .. path .. mod
+    var remote = get(item, 'remote', false) ? ' [remote]' : ''
+    line = marker .. path .. mod .. remote
   elseif s_mode ==# 'lines'
     line = marker .. string(get(item, 'lnum', 0)) .. ': ' .. get(item, 'text', '')
   elseif s_mode ==# 'help'
@@ -2601,12 +2785,21 @@ def ShellJoin(argv: list<string>): string
   return join(mapnew(argv, (_, value) => shellescape(value)), ' ')
 enddef
 
+# The argv that runs `script` in the workspace's search directory.
+#
+# SimpleRemote runs the script with the workspace root as its working
+# directory; a detached tree root (see RemoteSearchSubdir) is entered first,
+# so every path the script prints stays relative to the directory results are
+# resolved against.
 def RemoteShellCommand(script: string): list<string>
-  if !IsVirtualRemote() || exists('*g:SimpleRemoteShellCommand') != 1
+  if !RemoteTransportActive() || exists('*g:SimpleRemoteShellCommand') != 1
     return []
   endif
+  var subdir = RemoteSearchSubdir(s_remote_workspace)
+  var full = subdir ==# '' ? script
+    : 'cd ' .. shellescape(subdir) .. ' && ' .. script
   var Wrapper = function('g:SimpleRemoteShellCommand')
-  var command = call(Wrapper, [script])
+  var command = call(Wrapper, [full])
   return type(command) == v:t_list ? command : []
 enddef
 
@@ -2722,6 +2915,7 @@ def RemoteFileKey(kind: string): string
     transport: get(s_remote_workspace, 'kind', ''),
     target: get(s_remote_workspace, 'target', ''),
     root: get(s_remote_workspace, 'root', ''),
+    search_root: RemoteSearchRoot(s_remote_workspace),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
     includes: s_include_globs,
@@ -2936,6 +3130,16 @@ enddef
 def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
   var command = RemoteShellCommand(script)
   if empty(command)
+    if s_remote_switching
+      # SimpleRemote is between two connections and answers with no argv until
+      # the next one is ready.  The search is not lost: SimpleRemoteConnected
+      # re-dispatches whatever the panel is showing, so keep it on
+      # `searching…` rather than flash an error the user cannot act on.
+      s_loading = true
+      s_error = ''
+      PanelRender()
+      return false
+    endif
     s_loading = false
     s_current_id = 0
     s_error = 'SimpleRemote transport is unavailable'
@@ -3018,7 +3222,7 @@ def SendFilesRequest(query: string)
   if !PathGlobsReady()
     return
   endif
-  if IsVirtualRemote()
+  if RemoteTransportActive()
     SendRemoteFilesRequest(query)
     return
   endif
@@ -3056,7 +3260,7 @@ def SendGrepRequest(pattern: string)
     return
   endif
   if pattern ==# ''
-    if IsVirtualRemote() && s_remote_job_id > 0
+    if RemoteTransportActive() && s_remote_job_id > 0
       CancelRemoteJob()
     elseif s_current_id > 0
       Send({type: 'cancel', id: s_current_id})
@@ -3073,7 +3277,7 @@ def SendGrepRequest(pattern: string)
     PanelRender()
     return
   endif
-  if IsVirtualRemote()
+  if RemoteTransportActive()
     SendRemoteGrepRequest(pattern)
     return
   endif
@@ -3146,14 +3350,23 @@ enddef
 # Resolve an item's path against the project root when relative.
 def ResolvePath(item: dict<any>): string
   var path = get(item, 'path', '')
-  if IsVirtualRemote()
+  if RemoteTransportActive()
       && index(['files', 'gitfiles', 'grep', 'igrep', 'symbols'], s_mode) >= 0
     if path =~# '^remote://'
       return path
     endif
-    var root = substitute(get(s_remote_workspace, 'root', ''), '/\+$', '', '')
+    # Transport results are relative to the search directory.  A virtual
+    # workspace opens them as remote:// buffers; a projection (sshfs) has the
+    # same files under local_root, so they open as ordinary local files.
+    if !empty(get(s_remote_workspace, 'local_root', ''))
+      if path =~# '^/'
+        return path
+      endif
+      return ProjectedSearchRoot(s_remote_workspace) .. '/' .. path
+    endif
+    var root = RemoteSearchRoot(s_remote_workspace)
     var absolute = path =~# '^/' ? path
-      : (root ==# '' ? '/' : root .. '/') .. substitute(path, '^/', '', '')
+      : (root ==# '/' ? '/' : root .. '/') .. substitute(path, '^/', '', '')
     return 'remote://' .. absolute
   endif
   if s_mode ==# 'gitfiles' && s_git_root !=# ''
@@ -3430,6 +3643,14 @@ export def ProjectRoot(path: string = '')
     return
   endif
   var remote = ActiveRemoteWorkspace()
+  if empty(remote) && s_remote_switching && !empty(s_remote_workspace)
+    # Between two connections there is no workspace to re-root and no local
+    # project either; pinning a local root now would outlive the switch.
+    echohl WarningMsg
+    echom '[SimpleFinder] SimpleRemote is switching workspaces; try again when it is connected'
+    echohl None
+    return
+  endif
   if !empty(remote)
     var requested = substitute(path, '^remote://', '', '')
     var local_root = get(remote, 'local_root', '')
@@ -3452,7 +3673,29 @@ export def ProjectRoot(path: string = '')
     endif
     var SetRoot = function('g:SimpleRemoteTreeSetRoot')
     if call(SetRoot, [requested])
-      echom '[SimpleFinder] remote root: ' .. requested
+      if get(g:, 'simpleremote_sync_tree_root', 1) != 0
+        # The workspace itself moves: SimpleRemote reconnects there and the
+        # Connected event brings the finder along.
+        echom '[SimpleFinder] remote root: ' .. requested
+      else
+        # Tree-root sync is off, so the workspace root stays where it is and
+        # only the tree's view root moved.  Searches follow the view root as
+        # long as it is inside the workspace, and say so, because "root: X"
+        # would promise a workspace that was never asked for.
+        var workspace = ActiveRemoteWorkspace()
+        var search_root = RemoteSearchRoot(workspace)
+        var wanted = substitute(simplify(requested), '/\+$', '', '')
+        if search_root ==# (wanted ==# '' ? '/' : wanted)
+          echom printf('[SimpleFinder] remote search root: %s (workspace root %s)',
+            search_root, CleanRemoteRoot(workspace))
+        else
+          echohl WarningMsg
+          echom printf('[SimpleFinder] %s is outside the workspace root %s; '
+            .. 'searches stay in %s', requested, CleanRemoteRoot(workspace),
+            search_root)
+          echohl None
+        endif
+      endif
     endif
     return
   endif
@@ -3473,17 +3716,32 @@ enddef
 
 var s_all_buffers: list<dict<any>> = []
 
+# A SimpleRemote virtual file: the buffer is named by its remote:// URI and
+# saves through a BufWriteCmd, which is what 'buftype' acwrite means.  Every
+# other non-empty 'buftype' -- terminals, quickfix, scratch, prompts -- is
+# not a file the finder can offer.
+def IsRemoteFileBuffer(bufnr: number, name: string): bool
+  return name =~# '^remote://' && getbufvar(bufnr, '&buftype') ==# 'acwrite'
+enddef
+
 export def Buffers()
   s_all_buffers = []
   for info in getbufinfo({buflisted: 1})
-    if info.name ==# '' || getbufvar(info.bufnr, '&buftype') !=# ''
+    if info.name ==# ''
+      continue
+    endif
+    var remote = IsRemoteFileBuffer(info.bufnr, info.name)
+    if !remote && getbufvar(info.bufnr, '&buftype') !=# ''
       continue
     endif
     add(s_all_buffers, {
-      path: fnamemodify(info.name, ':~:.'),
+      # A remote:// name is kept verbatim: it is not relative to anything
+      # local, and it is what <CR> has to open.
+      path: remote ? info.name : fnamemodify(info.name, ':~:.'),
       bufnr: info.bufnr,
       modified: info.changed,
       lastused: info.lastused,
+      remote: remote,
     })
   endfor
   sort(s_all_buffers, (a, b) => b.lastused - a.lastused)
@@ -3694,7 +3952,7 @@ def SendSymbolRequest(query: string)
     PanelRender()
     return
   endif
-  if IsVirtualRemote()
+  if RemoteTransportActive()
     SendRemoteGrepRequest(pattern, true, query)
     return
   endif
@@ -3767,10 +4025,10 @@ def GitRootFor(dir: string): string
 enddef
 
 export def GitFiles()
-  var remote = ActiveRemoteWorkspace()
-  if !empty(remote) && empty(get(remote, 'local_root', ''))
+  var remote = CurrentRemoteWorkspace()
+  if RemoteTransportFor(remote)
     PanelOpen('gitfiles')
-    s_git_root = remote.root
+    s_git_root = RemoteSearchRoot(remote)
     var id = NextId()
     s_current_id = id
     s_loading = true
@@ -3841,11 +4099,24 @@ var s_all_recent: list<dict<any>> = []
 export def RecentFiles()
   var combined: list<string> = copy(s_recent_files)
   for f in v:oldfiles
-    var fp = fnamemodify(f, ':p')
-    if index(combined, fp) < 0 && filereadable(fp)
+    # A remote:// entry has no local file to check; whether it is still there
+    # is a question for the workspace it belongs to, answered when it opens.
+    var fp = f =~# '^remote://' ? f : fnamemodify(f, ':p')
+    if index(combined, fp) < 0 && (fp =~# '^remote://' || filereadable(fp))
       add(combined, fp)
     endif
   endfor
+  # In a workspace, the files of that workspace are the ones being worked on:
+  # they lead, in their own recency order, ahead of everything else.
+  var remote = ActiveRemoteWorkspace()
+  if !empty(remote)
+    var root = CleanRemoteRoot(remote)
+    var prefix = 'remote://' .. (root ==# '/' ? '/' : root .. '/')
+    var inside = filter(copy(combined), (_, f) => stridx(f, prefix) == 0)
+    if !empty(inside)
+      combined = inside + filter(combined, (_, f) => stridx(f, prefix) != 0)
+    endif
+  endif
   var mx = get(g:, 'simplefinder_recent_files_max', 100)
   # `list[: mx - 1]` is a Vim slice, not a Python one: at mx = 0 the end index
   # is -1, the *last* entry, so it keeps everything, and at mx = -1 it is -2,
@@ -3870,14 +4141,7 @@ def FilterRecentFiles()
   PanelRender()
 enddef
 
-export def TrackRecentFile()
-  var f = expand('%:p')
-  if f ==# '' || !filereadable(f)
-    return
-  endif
-  if &buftype !=# ''
-    return
-  endif
+def RecordRecentFile(f: string)
   filter(s_recent_files, (_, v) => v !=# f)
   insert(s_recent_files, f, 0)
   var mx = get(g:, 'simplefinder_recent_files_max', 100)
@@ -3886,6 +4150,42 @@ export def TrackRecentFile()
   if mx > 0 && len(s_recent_files) > mx
     s_recent_files = s_recent_files[: mx - 1]
   endif
+enddef
+
+export def TrackRecentFile()
+  var f = expand('%:p')
+  if f ==# ''
+    return
+  endif
+  if IsRemoteFileBuffer(bufnr('%'), f)
+    RecordRecentFile(f)
+    return
+  endif
+  if !filereadable(f) || &buftype !=# ''
+    return
+  endif
+  RecordRecentFile(f)
+enddef
+
+# A remote:// buffer is filled asynchronously by SimpleRemote's BufReadCmd, so
+# at its first BufEnter it is still an empty buffer with no 'buftype' and
+# TrackRecentFile() passes it over.  SimpleRemote says when the fill landed;
+# that is the moment the file was really visited.
+export def OnRemoteBufferRead()
+  var event = get(g:, 'simpleremote_event', {})
+  if type(event) != v:t_dict
+    return
+  endif
+  var buf = get(event, 'bufnr', 0)
+  var name = type(buf) == v:t_number && buf > 0 && bufexists(buf) ? bufname(buf) : ''
+  if name !~# '^remote://'
+    var path = get(event, 'path', '')
+    name = type(path) == v:t_string && path =~# '^/' ? 'remote://' .. path : ''
+  endif
+  if name ==# ''
+    return
+  endif
+  RecordRecentFile(name)
 enddef
 
 # =============================================================
@@ -4112,6 +4412,103 @@ export def QuickfixList(location: bool = false)
   })
 enddef
 
+# ─────────────────── SimpleRemote workspaces ───────────────────
+
+# What one entry looks like in a workspace's own words: kind:target root,
+# optionally its name, its projection and whether it is a profile.
+def RemoteWorkspaceLabel(workspace: dict<any>, connected: bool): string
+  var name = get(workspace, 'name', '')
+  var root = get(workspace, 'root', '')
+  var local_root = get(workspace, 'local_root', '')
+  var label = (connected ? '* ' : '  ')
+    .. (type(name) == v:t_string && name !=# '' ? name .. '  ' : '')
+    .. get(workspace, 'kind', '?') .. ':' .. get(workspace, 'target', '?')
+    .. ' ' .. (type(root) == v:t_string && root !=# '' ? root : '(choose a root)')
+  if type(local_root) == v:t_string && local_root !=# ''
+    label ..= ' -> ' .. local_root
+  endif
+  if get(workspace, 'source', '') ==# 'profile'
+    label ..= ' (profile)'
+  endif
+  return label
+enddef
+
+def RemoteWorkspaceKey(workspace: dict<any>): string
+  return json_encode([get(workspace, 'kind', ''), get(workspace, 'target', ''),
+    substitute(get(workspace, 'root', ''), '/\+$', '', '')])
+enddef
+
+def AcceptRemoteWorkspace(item: dict<any>, _mode: string)
+  if exists('*g:SimpleRemoteOpenWorkspace') != 1
+    echohl WarningMsg
+    echom '[SimpleFinder] SimpleRemote cannot open workspaces (g:SimpleRemoteOpenWorkspace missing)'
+    echohl None
+    return
+  endif
+  var Open = function('g:SimpleRemoteOpenWorkspace')
+  call(Open, [get(item, 'workspace', {})])
+enddef
+
+# Recent SimpleRemote workspaces, then the configured profiles that are not
+# already among them; <CR> connects.  The one connected now is marked, so the
+# list doubles as "where am I".  Nothing here needs a workspace to be open --
+# it is how you get to one.
+export def RemoteWorkspaces()
+  if exists('*g:SimpleRemoteRecentWorkspaces') != 1
+      && exists('*g:SimpleRemoteProfiles') != 1
+    echohl WarningMsg
+    echom '[SimpleFinder] SimpleRemote is not installed (no workspace API)'
+    echohl None
+    return
+  endif
+  var candidates: list<dict<any>> = []
+  if exists('*g:SimpleRemoteRecentWorkspaces') == 1
+    var Recent = function('g:SimpleRemoteRecentWorkspaces')
+    var recent = call(Recent, [])
+    if type(recent) == v:t_list
+      extend(candidates, recent)
+    endif
+  endif
+  if exists('*g:SimpleRemoteProfiles') == 1
+    var Profiles = function('g:SimpleRemoteProfiles')
+    var profiles = call(Profiles, [])
+    if type(profiles) == v:t_list
+      extend(candidates, profiles)
+    endif
+  endif
+  # The connection itself, not ActiveRemoteWorkspace(): the marker says what
+  # SimpleRemote is connected to, whether or not the finder follows it.
+  var active = get(g:, 'simpleremote_workspace', {})
+  var active_key = type(active) == v:t_dict && !empty(active)
+    ? RemoteWorkspaceKey(active) : ''
+  var seen: dict<bool> = {}
+  var items: list<dict<any>> = []
+  for workspace in candidates
+    if type(workspace) != v:t_dict || empty(get(workspace, 'kind', ''))
+        || empty(get(workspace, 'target', ''))
+      continue
+    endif
+    var key = RemoteWorkspaceKey(workspace)
+    if has_key(seen, key)
+      continue
+    endif
+    seen[key] = true
+    var connected = active_key !=# '' && key ==# active_key
+    add(items, {
+      display: RemoteWorkspaceLabel(workspace, connected),
+      workspace: workspace,
+      connected: connected,
+    })
+  endfor
+  if empty(items)
+    echohl WarningMsg
+    echom '[SimpleFinder] no recent SimpleRemote workspaces or profiles'
+    echohl None
+    return
+  endif
+  Pick({title: 'Remote workspaces', items: items, Accept: AcceptRemoteWorkspace})
+enddef
+
 # =============================================================
 # Open item
 # =============================================================
@@ -4192,24 +4589,109 @@ export def Reflow()
   endif
 enddef
 
-export def OnRemoteWorkspace()
-  var previous = s_remote_workspace
-  var current = ActiveRemoteWorkspace()
+# The panel modes whose results come from the workspace, and so have to be
+# re-fetched when it changes.  Buffers, recent files and the pickers read
+# Vim's own state and are left alone.
+const REMOTE_SEARCH_MODES: list<string> = ['files', 'grep', 'igrep', 'symbols', 'gitfiles']
+
+def PanelSearchesRemote(): bool
+  return s_panel_winid > 0 && !empty(getwininfo(s_panel_winid))
+    && index(REMOTE_SEARCH_MODES, s_mode) >= 0
+enddef
+
+# Two snapshots of the same connection: same generation, same host, same
+# root.  Everything cached from one is still true of the other.
+def SameRemoteConnection(left: dict<any>, right: dict<any>): bool
+  return !empty(left) && !empty(right)
+    && get(left, 'id', -1) == get(right, 'id', -2)
+    && get(left, 'kind', '') ==# get(right, 'kind', '')
+    && get(left, 'target', '') ==# get(right, 'target', '')
+    && CleanRemoteRoot(left) ==# CleanRemoteRoot(right)
+enddef
+
+def ClearRemoteCaches()
   s_remote_preview_epoch += 1
   s_remote_preview_path = ''
   s_remote_preview_cache = []
   s_remote_file_cache = {key: '', items: []}
+enddef
+
+def CancelActiveSearch()
   if s_remote_job_id > 0
     CancelRemoteJob()
   elseif s_current_id > 0 && simplefinder#core#IsRunning()
     Send({type: 'cancel', id: s_current_id})
   endif
   s_current_id = 0
-  s_remote_workspace = current
-  if s_panel_winid <= 0 || empty(getwininfo(s_panel_winid))
+enddef
+
+# Every SimpleRemote event the finder follows lands here; the event name in
+# g:simpleremote_event says which.  Without it (an older SimpleRemote, or a
+# test firing the autocommand by hand) the event is read as the plain
+# connect/disconnect it used to be.
+export def OnRemoteWorkspace()
+  var payload = get(g:, 'simpleremote_event', {})
+  if type(payload) != v:t_dict
+    payload = {}
+  endif
+  var event = get(payload, 'event', '')
+  var previous = s_remote_workspace
+  var current = ActiveRemoteWorkspace()
+
+  # A workspace switch is Disconnected(reason 'reconnect'), Connecting,
+  # Connected, with g:simpleremote_workspace gone in between.  Read literally,
+  # the first two say "no workspace" and the panel would announce a
+  # disconnection that is really a root change in progress.  Keep the old
+  # snapshot -- it still names the host, which is what the title shows -- and
+  # keep the panel on `searching…` until Connected brings the new root.
+  if event ==# 'SimpleRemoteConnecting'
+      || (event ==# 'SimpleRemoteDisconnected'
+        && get(payload, 'reason', '') ==# 'reconnect')
+    if empty(previous)
+      # Nothing was being followed; a first connection is plain Connected.
+      return
+    endif
+    s_remote_switching = true
+    ClearRemoteCaches()
+    CancelActiveSearch()
+    if PanelSearchesRemote()
+      s_loading = true
+      s_error = ''
+      PanelRender()
+    endif
     return
   endif
-  if index(['files', 'grep', 'igrep', 'symbols', 'gitfiles'], s_mode) < 0
+  s_remote_switching = false
+  if empty(previous) && empty(current)
+    # Nothing was followed and nothing is: an event about a workspace the
+    # finder does not use (g:simplefinder_remote = 0, or a disconnect that
+    # arrived twice) must not restart a local search.
+    return
+  endif
+
+  # A projection coming up (mounting -> sshfs) or a view-only tree re-root
+  # changes nothing a running search depends on: same host, same root, same
+  # search directory, same engine.  Cancelling it only to start the very same
+  # listing again would throw away the work in flight, so take the new
+  # snapshot and let it finish; its paths are relative and resolve against
+  # the new snapshot exactly as they would have against the old one.
+  if SameRemoteConnection(previous, current)
+      && RemoteSearchRoot(previous) ==# RemoteSearchRoot(current)
+      && RemoteTransportFor(previous) == RemoteTransportFor(current)
+    s_remote_workspace = current
+    if PanelSearchesRemote()
+      s_project_root = FindProjectRoot()
+      PanelRender()
+    endif
+    return
+  endif
+
+  if !SameRemoteConnection(previous, current)
+    ClearRemoteCaches()
+  endif
+  CancelActiveSearch()
+  s_remote_workspace = current
+  if !PanelSearchesRemote()
     return
   endif
   if empty(current) && !empty(previous)

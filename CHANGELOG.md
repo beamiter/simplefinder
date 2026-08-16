@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased - 2026-08-16
+
+### SimpleRemote 联动补全：buffer/recent、workspace 切换、sshfs、tree root、workspace 选择器
+
+- `:SimpleFinderBuffers` 现在列出已打开的 `remote://` buffer。SimpleRemote 给远端文件设
+  `buftype=acwrite` 好让保存走它的 BufWriteCmd，而 buffers 源以前把所有带 `buftype` 的
+  buffer 一律跳过，于是虚拟工作区里一个远端文件都列不出来。现在 `remote://` + acwrite
+  的 buffer 按完整名字列出并标 `[remote]`，其它 `buftype` 照旧不列。
+- `:SimpleFinderRecent` 会记录 `remote://` buffer：BufEnter 时接受 acwrite 的远端 buffer，
+  另外监听 `User SimpleRemoteBufferRead`（SimpleRemote 异步填充完成时才设 `buftype`，第一次
+  BufEnter 时它还是个空 buffer），viminfo 里的 `remote://` 条目不再因 `filereadable()` 失败
+  而被丢掉；有活动 workspace 时，该 workspace 下的条目按各自的新旧顺序排在最前。
+- workspace 切换不再闪一下 "remote workspace disconnected"。`:SimpleFinderRoot {dir}`（以及
+  远端树的换根）让 SimpleRemote 重连：先 Disconnected(reason `reconnect`)、再 Connecting、
+  再 Connected，中间 `g:simpleremote_workspace` 是 unlet 的。现在处理函数读
+  `g:simpleremote_event.event`/`reason`：这两个事件保留旧快照、面板显示 `searching…`、标题里
+  的主机不变；切换间隙里敲出来的搜索也停在 `searching…`（而不是 "transport is
+  unavailable"），Connected 到了自动重发。reason 为 `disconnect`（或 `transport-exit` 等
+  任何非 `reconnect`）时行为同以前。`SimpleRemoteConnecting`、`SimpleRemoteTreeRootChanged`
+  加入了监听列表。切换期间项目根也仍是被替换的那个 workspace，而不是回退到本地 cwd——
+  否则标题、搜索和 health 会各说各话。
+- 新增 `:SimpleFinderRemoteWorkspaces` 与 `<Plug>(simplefinder-remote-workspaces)`：用通用
+  `Pick()` 列出 `g:SimpleRemoteRecentWorkspaces()`，再接上不在其中的 `g:SimpleRemoteProfiles()`
+  （按 kind/target/root 去重，profile 标 `(profile)`，当前连接的标 `*`），`<CR>` 交给
+  `g:SimpleRemoteOpenWorkspace()`。不需要已有 workspace，也不受 `g:simplefinder_remote`
+  影响。
+- 去掉写死的 `['ssh', 'docker']` kind 白名单：所有 I/O 都经 SimpleRemote 的函数，kind 对
+  本插件不透明，只要求非空；SimpleRemote 以后新增的传输种类无需再改这里。
+- 关掉 SimpleRemote 的 `g:simpleremote_sync_tree_root` 时，树换根只改 `tree_root` 并发
+  `SimpleRemoteTreeRootChanged`，不重连。查找现在跟着走：远端脚本先 `cd` 进子目录，结果相对
+  该目录并解析回绝对路径（`remote://` 或挂载点下），文件列表缓存按搜索根分开；
+  `:SimpleFinderRoot {dir}` 的提示改为 "remote search root: X (workspace root Y)"，目标在
+  workspace 之外时给出警告并留在 workspace 根（SimpleRemote 拒绝读根之外的文件）。sync 打开
+  时 `tree_root` 只在 view-only reveal 期间不同于 `root`，查找不跟随，也不因此重跑。
+- sshfs 投影改为经传输在远端搜索：FUSE 挂载上跑本地 daemon 等于每个 syscall 走一次 SSH。
+  新增 `RemoteTransportActive()`（虚拟工作区，或 mode 为 `sshfs` 且新选项
+  `g:simplefinder_remote_search_projected`（默认 1）打开）替代原先的"local_root 为空即虚拟"
+  判断，用于 files/grep/symbols/gitfiles 的分派；有 `local_root` 时结果解析成
+  `local_root/子目录/相对路径` 的普通本地文件。`mounting → sshfs` 的 WorkspaceChanged 若
+  连接、搜索根、引擎都没变，不再取消并重跑正在进行的列举。
+- `:SimpleFinderHealth` 的 CONTEXT 在有 workspace 时打印 mode、用哪个引擎在哪个目录搜、
+  分离的 tree root、`g:simpleremote_workspace` 里的 runtime 路径与 protocol、
+  SimpleRemote API 是否齐全（`[OK]`/`[WARN]`）；没有 workspace 时说明原因（关掉了联动 /
+  SimpleRemote 状态）。workspace 选择器是否可用两种情况都会报——没有 workspace 时它正是
+  拿到一个的办法。
+- `tests/vim_remote.vim` 覆盖以上全部（仍用桩函数模拟 SimpleRemote，不把它放进
+  runtimepath）：buffers/recent 里的远端条目、`SimpleRemoteBufferRead`、切换序列与切换间隙
+  的输入、workspace 选择器、未知 kind、tree root 跟随与 view-only reveal、sshfs 经传输搜索
+  与本地打开、`mounting → sshfs` 不重跑、联动关闭时事件不打扰本地搜索。
+
 ## Unreleased - 2026-08-09
 
 ### SimpleRemote virtual workspace 现在可直接使用完整项目查找
