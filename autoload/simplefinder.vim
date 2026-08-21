@@ -2002,6 +2002,27 @@ def CacheRemotePreview(key: string, lines: list<string>)
   endif
 enddef
 
+# The bounded fetch for a remote preview body, or an empty string when there
+# is none to make.
+#
+# A preview never shows more than g:simplefinder_preview_max_bytes, and for a
+# local file getfsize() settles that before anything is read.  A remote file
+# has no size to measure, so the whole body used to cross the transport and
+# then be thrown away by the same limit.  A 150MB CSV sitting in the workspace
+# therefore timed out instead of previewing, and kept the agent busy encoding
+# it while every preview behind it queued.
+#
+# Asking for one byte past the limit answers both questions in a transfer the
+# limit bounds -- whether the file fits, and what it says -- and leaves the
+# too-large branch below deciding exactly what it decided before.
+def RemotePreviewCommand(path: string, max_bytes: number): string
+  if max_bytes <= 0 || exists('*g:SimpleRemoteExecute') != 1
+    return ''
+  endif
+  return 'head -c ' .. (max_bytes + 1) .. ' '
+    .. shellescape(substitute(path, '^remote://', '', ''))
+enddef
+
 def RemotePreview(path: string): dict<any>
   var key = RemotePreviewKey(path)
   var hit = indexof(s_remote_preview_cache, (_, entry) => entry.key ==# key)
@@ -2017,13 +2038,17 @@ def RemotePreview(path: string): dict<any>
   s_remote_preview_epoch += 1
   var epoch = s_remote_preview_epoch
   s_remote_preview_path = key
-  if exists('*g:SimpleRemoteReadFile') != 1
+  var maximum = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+  var bounded = RemotePreviewCommand(path, maximum)
+  if empty(bounded) && exists('*g:SimpleRemoteReadFile') != 1
     s_remote_preview_path = ''
     CacheRemotePreview(key, ['── SimpleRemote preview API unavailable ──'])
     return {ready: true, lines: s_remote_preview_cache[0].lines}
   endif
-  var Reader = function('g:SimpleRemoteReadFile')
-  call(Reader, [path, (ok, body) => {
+  var Reader = empty(bounded)
+    ? function('g:SimpleRemoteReadFile')
+    : function('g:SimpleRemoteExecute')
+  call(Reader, [empty(bounded) ? path : bounded, (ok, body) => {
     if epoch != s_remote_preview_epoch || key !=# s_remote_preview_path
       return
     endif
@@ -2031,18 +2056,15 @@ def RemotePreview(path: string): dict<any>
     var lines: list<string> = []
     if !ok
       lines = ['── remote preview failed: ' .. body .. ' ──']
+    elseif maximum > 0 && strlen(body) > maximum
+      lines = ['── file too large to preview ──']
     else
-      var maximum = get(g:, 'simplefinder_preview_max_bytes', 2097152)
-      if maximum > 0 && strlen(body) > maximum
-        lines = ['── file too large to preview ──']
-      else
-        lines = split(body, "\n", 1)
-        if body =~# "\n$" && len(lines) > 1 && lines[-1] ==# ''
-          remove(lines, -1)
-        endif
-        if empty(lines)
-          lines = ['']
-        endif
+      lines = split(body, "\n", 1)
+      if body =~# "\n$" && len(lines) > 1 && lines[-1] ==# ''
+        remove(lines, -1)
+      endif
+      if empty(lines)
+        lines = ['']
       endif
     endif
     CacheRemotePreview(key, lines)

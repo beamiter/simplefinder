@@ -21,6 +21,10 @@ call mkdir(s:second, 'p')
 call writefile(['fn alpha() {}', 'needle remote'], s:first .. '/src/alpha.rs')
 call writefile(['project one'], s:first .. '/README.md')
 call writefile(['beta workspace'], s:second .. '/beta.txt')
+" Two remote CSVs for the bounded-preview section: one past any preview limit
+" the test sets, one inside it.
+call writefile([repeat('x', 400), repeat('y', 400)], s:first .. '/big.csv')
+call writefile(['small remote csv'], s:first .. '/small.csv')
 
 let g:simpleremote_workspace = {
       \ 'id': 1, 'kind': 'ssh', 'target': 'fixture-target',
@@ -202,6 +206,52 @@ call feedkeys("\<CR>", 'xt')
 call assert_equal('remote://' .. s:first .. '/src/alpha.rs', bufname())
 call assert_equal('needle remote', getline(2))
 call assert_equal('acwrite', &buftype, 'the fixture opens remote files like SimpleRemote does')
+
+" ── Bounded preview: a remote file is never pulled whole to be refused ──
+"
+" The preview limit is enforced after the body arrives, and a remote file has
+" no size to measure beforehand.  A 150MB CSV in the workspace therefore
+" crossed the transport in full only to be answered with "file too large",
+" and the read timed out first.  With a remote exec available the body is
+" fetched one byte past the limit instead; the read API stays the fallback
+" for a SimpleRemote too old to have one, which is what the preview above
+" exercised.
+let g:remote_exec_calls = []
+function! g:SimpleRemoteExecute(command, Callback) abort
+  call add(g:remote_exec_calls, a:command)
+  let l:root = g:simpleremote_workspace.root
+  let l:output = system('cd ' .. shellescape(l:root) .. ' && ' .. a:command)
+  call timer_start(0, function('s:DeliverRead',
+        \ [a:Callback, v:shell_error == 0, l:output]))
+  return 1
+endfunction
+
+let s:reads_before = g:remote_preview_reads
+let g:simplefinder_preview_max_bytes = 512
+SimpleFinderFiles big.csv
+call s:WaitFor({-> s:SearchDone('big.csv')}, 'oversized preview search')
+call s:WaitFor({-> !empty(popup_list())
+      \ && join(getbufline(winbufnr(popup_list()[0]), 1, '$'), "\n")
+      \   =~# 'file too large to preview'},
+      \ 'oversized remote preview refused')
+call assert_equal(s:reads_before, g:remote_preview_reads,
+      \ 'the whole file was pulled across to be refused')
+call assert_true(!empty(g:remote_exec_calls)
+      \ && g:remote_exec_calls[-1] =~# 'head -c 513 ',
+      \ 'preview did not bound its fetch: ' .. string(g:remote_exec_calls))
+call feedkeys("\<Esc>", 'xt')
+
+" A file inside the limit still previews its contents through the same fetch.
+SimpleFinderFiles small.csv
+call s:WaitFor({-> s:SearchDone('small.csv')}, 'bounded preview search')
+call s:WaitFor({-> !empty(popup_list())
+      \ && join(getbufline(winbufnr(popup_list()[0]), 1, '$'), "\n")
+      \   =~# 'small remote csv'}, 'bounded remote preview contents')
+call assert_equal(s:reads_before, g:remote_preview_reads,
+      \ 'a bounded preview must not fall back to the whole-file read')
+call feedkeys("\<Esc>", 'xt')
+unlet g:simplefinder_preview_max_bytes
+delfunction g:SimpleRemoteExecute
 
 " ── Buffers: the remote file just opened is a buffer like any other ──
 "

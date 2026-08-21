@@ -394,7 +394,12 @@ Scrolling is relative to the match being previewed and starts over whenever
 another result is selected. g:simplefinder_preview_width (default 0 = fill the
 columns beside the panel) caps the popup width, and
 g:simplefinder_preview_max_bytes (default 2097152) is the size above which a
-file is not read at all; buffers are exempt, being already in memory.
+file is not read at all; buffers are exempt, being already in memory.  A
+remote file has no size to measure without asking the host, so the preview
+asks for one byte past the limit and refuses anything that fills it -- the
+limit bounds what crosses the transport, not just what is displayed.  With a
+SimpleRemote too old for g:SimpleRemoteExecute(), or the limit turned off, the
+body still arrives whole.
 
 A popup belongs to the tabpage it was created in, and the preview is sized from
 the panel window. Results arriving while you are in another tab therefore
