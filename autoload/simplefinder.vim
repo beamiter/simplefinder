@@ -304,6 +304,44 @@ export def ShowLog()
   simplefinder#core#ShowLog()
 enddef
 
+# Configuration is deliberately read at point of use so runtime toggles take
+# effect immediately. Every reader still has to enforce the type promised by
+# its default: ValidateConfig() can explain a bad vimrc, but a finder must keep
+# opening on safe defaults instead of throwing from a redraw or timer callback.
+def ConfigNumber(name: string, default_value: number): number
+  var value = get(g:, 'simplefinder_' .. name, default_value)
+  return type(value) == v:t_number ? value : default_value
+enddef
+
+def ConfigFlag(name: string, default_value: bool): bool
+  var value = get(g:, 'simplefinder_' .. name, default_value)
+  if type(value) == v:t_bool
+    return value
+  endif
+  if type(value) == v:t_number
+    return value != 0
+  endif
+  return default_value
+enddef
+
+def ConfigString(name: string, default_value: string): string
+  var value = get(g:, 'simplefinder_' .. name, default_value)
+  return type(value) == v:t_string ? value : default_value
+enddef
+
+def ConfigStringList(name: string, default_value: list<string>): list<string>
+  var value = get(g:, 'simplefinder_' .. name, default_value)
+  if type(value) != v:t_list
+    return copy(default_value)
+  endif
+  for entry in value
+    if type(entry) != v:t_string || entry ==# ''
+      return copy(default_value)
+    endif
+  endfor
+  return copy(value)
+enddef
+
 # =============================================================
 # Configuration validation
 #
@@ -412,9 +450,8 @@ def CheckOption(spec: dict<any>, value: any): list<string>
   # A flag is read with `!= 0`, so v:true and v:false serve as well as 1 and 0.
   var is_bool = type(value) == v:t_bool && get(spec, 'flag', false)
   if type(value) != want && !is_bool
-    # No claim about what happens next, because it differs per option: some
-    # readers fall back to the default, while g:simplefinder_panel_width goes
-    # through max() and aborts the panel with E1030.  The fact is enough.
+    # Runtime readers fall back to the declared default. The configured value
+    # is still named here so the typo can be fixed instead of staying silent.
     return [printf('[ERROR] %s = %s is not %s', name, Brief(value), TypeName(want))]
   endif
   if is_bool
@@ -463,8 +500,7 @@ def CrossCheck(): list<string>
 
   # Both are legal and one simply wins; saying which one saves the user the
   # experiment of grepping for a capital letter and not understanding why.
-  if get(g:, 'simplefinder_ignore_case', 0) != 0
-      && get(g:, 'simplefinder_smart_case', 1) != 0
+  if ConfigFlag('ignore_case', false) && ConfigFlag('smart_case', true)
     add(problems, '[WARN] g:simplefinder_ignore_case overrides '
       .. 'g:simplefinder_smart_case; set only one')
   endif
@@ -805,7 +841,7 @@ def RemoteContextLines(): list<string>
   var remote = ActiveRemoteWorkspace()
   if empty(remote)
     var status = get(g:, 'simpleremote_status', '')
-    var reason = get(g:, 'simplefinder_remote', 1) == 0
+    var reason = !ConfigFlag('remote', true)
       ? 'g:simplefinder_remote = 0'
       : type(status) == v:t_string && status !=# '' && status !=# 'disconnected'
         ? 'SimpleRemote status: ' .. status
@@ -874,7 +910,7 @@ def ContextLines(): list<string>
     add(lines, '[ERROR] path globs: ' .. v:exception)
   endtry
   add(lines, printf('[INFO] preview: %s',
-    get(g:, 'simplefinder_preview', 1) != 0
+    ConfigFlag('preview', true)
       ? 'on by default' : 'off (g:simplefinder_preview = 0)'))
   return lines
 enddef
@@ -1067,7 +1103,7 @@ enddef
 # =============================================================
 
 def ActiveRemoteWorkspace(): dict<any>
-  if get(g:, 'simplefinder_remote', 1) == 0
+  if !ConfigFlag('remote', true)
     return {}
   endif
   var workspace = get(g:, 'simpleremote_workspace', {})
@@ -1155,7 +1191,7 @@ def RemoteTransportFor(workspace: dict<any>): bool
     return true
   endif
   return get(workspace, 'mode', '') ==# 'sshfs'
-    && get(g:, 'simplefinder_remote_search_projected', 1) != 0
+    && ConfigFlag('remote_search_projected', true)
 enddef
 
 def RemoteTransportActive(): bool
@@ -1198,7 +1234,7 @@ def RemoteSwitchInProgress(): bool
   # The switching fallback follows a remote workspace, so it answers to the
   # setting that governs workspace-following: turning the integration off at
   # runtime must not leave the finder chasing the snapshot it took before.
-  if get(g:, 'simplefinder_remote', 1) == 0 || !RemoteSwitchPending()
+  if !ConfigFlag('remote', true) || !RemoteSwitchPending()
     s_remote_switching = false
     return false
   endif
@@ -1230,14 +1266,15 @@ def FindProjectRoot(): string
     return empty(get(remote, 'local_root', ''))
       ? RemoteSearchRoot(remote) : ProjectedSearchRoot(remote)
   endif
-  var configured = get(g:, 'simplefinder_root', '')
+  var configured = ConfigString('root', '')
   if configured !=# ''
     var root = fnamemodify(expand(configured), ':p')
     if isdirectory(root)
       return substitute(root, '/$', '', '')
     endif
   endif
-  var markers = get(g:, 'simplefinder_root_markers', ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
+  var markers = ConfigStringList('root_markers',
+    ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'CMakeLists.txt', 'Makefile', '.project_root'])
   var dir = expand('%:p:h')
   if dir ==# ''
     dir = getcwd()
@@ -1346,22 +1383,22 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   s_mark_order = []
   s_has_session = true
   if !keep_options
-    s_regex = get(g:, 'simplefinder_regex', 0) != 0
-    if get(g:, 'simplefinder_ignore_case', 0) != 0
+    s_regex = ConfigFlag('regex', false)
+    if ConfigFlag('ignore_case', false)
       s_case_mode = 'ignore'
-    elseif get(g:, 'simplefinder_smart_case', 1) != 0
+    elseif ConfigFlag('smart_case', true)
       s_case_mode = 'smart'
     else
       s_case_mode = 'sensitive'
     endif
-    s_hidden = get(g:, 'simplefinder_hidden', 0) != 0
-    s_no_ignore = get(g:, 'simplefinder_no_ignore', 0) != 0
+    s_hidden = ConfigFlag('hidden', false)
+    s_no_ignore = ConfigFlag('no_ignore', false)
     SnapshotPathGlobs(mode)
   endif
   if s_glob_error !=# ''
     s_error = s_glob_error
   endif
-  s_preview_on = get(g:, 'simplefinder_preview', 1) != 0
+  s_preview_on = ConfigFlag('preview', true)
   s_preview_scroll = 0
   s_remote_workspace = CurrentRemoteWorkspace()
   s_project_root = FindProjectRoot()
@@ -1376,7 +1413,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
 enddef
 
 def EnsurePanel()
-  var width = get(g:, 'simplefinder_panel_width', 50)
+  var width = ConfigNumber('panel_width', 50)
   width = min([max([width, 24]), max([&columns - 10, 24])])
 
   if s_panel_bufnr <= 0 || !bufexists(s_panel_bufnr)
@@ -1392,7 +1429,7 @@ def EnsurePanel()
   # have :edit-ed another file into it.
   if s_panel_winid <= 0 || win_id2win(s_panel_winid) == 0
       || winbufnr(s_panel_winid) != s_panel_bufnr
-    if get(g:, 'simplefinder_position', 'right') ==# 'left'
+    if ConfigString('position', 'right') ==# 'left'
       execute 'topleft vertical sbuffer ' .. s_panel_bufnr
     else
       execute 'botright vertical sbuffer ' .. s_panel_bufnr
@@ -1981,7 +2018,7 @@ def CachedFileLines(path: string): list<string>
     return []
   endtry
   insert(s_preview_cache, {key: key, lines: lines}, 0)
-  var mx = max([1, get(g:, 'simplefinder_preview_cache', 4)])
+  var mx = max([1, ConfigNumber('preview_cache', 4)])
   if len(s_preview_cache) > mx
     s_preview_cache = s_preview_cache[: mx - 1]
   endif
@@ -2025,7 +2062,7 @@ enddef
 
 def CacheRemotePreview(key: string, lines: list<string>)
   insert(s_remote_preview_cache, {key: key, lines: lines}, 0)
-  var maximum = max([1, get(g:, 'simplefinder_preview_cache', 4)])
+  var maximum = max([1, ConfigNumber('preview_cache', 4)])
   if len(s_remote_preview_cache) > maximum
     s_remote_preview_cache = s_remote_preview_cache[: maximum - 1]
   endif
@@ -2067,7 +2104,7 @@ def RemotePreview(path: string): dict<any>
   s_remote_preview_epoch += 1
   var epoch = s_remote_preview_epoch
   s_remote_preview_path = key
-  var maximum = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+  var maximum = ConfigNumber('preview_max_bytes', 2097152)
   var bounded = RemotePreviewCommand(path, maximum)
   if empty(bounded) && exists('*g:SimpleRemoteReadFile') != 1
     s_remote_preview_path = ''
@@ -2147,7 +2184,7 @@ var s_preview_filetypes: dict<string> = {
 }
 
 def PreviewFiletype(path: string, buf: number): string
-  if get(g:, 'simplefinder_preview_syntax', 1) == 0
+  if !ConfigFlag('preview_syntax', true)
     return ''
   endif
   if buf > 0 && bufloaded(buf)
@@ -2225,14 +2262,14 @@ def PreviewUpdate()
   var pcol = panel_info[0].wincol
   var width = 0
   var col = 2
-  if get(g:, 'simplefinder_position', 'right') !=# 'left'
+  if ConfigString('position', 'right') !=# 'left'
     width = pcol - 4
     col = 2
   else
     col = pcol + s_eff_width + 3
     width = &columns - col - 1
   endif
-  var wanted = get(g:, 'simplefinder_preview_width', 0)
+  var wanted = ConfigNumber('preview_width', 0)
   if wanted > 0
     width = min([width, max([30, wanted])])
   endif
@@ -2260,7 +2297,7 @@ def PreviewUpdate()
   # about the cost of previewing it.
   var fsize = buf > 0 && bufloaded(buf) ? 0
     : remote_path ? 0 : getfsize(path)
-  var max_bytes = get(g:, 'simplefinder_preview_max_bytes', 2097152)
+  var max_bytes = ConfigNumber('preview_max_bytes', 2097152)
   if remote_path && buf <= 0
     var preview = RemotePreview(path)
     lines = preview.lines
@@ -2760,7 +2797,7 @@ def RecordHistory()
   var entries = get(s_history, key, [])
   filter(entries, (_, v) => v !=# s_query)
   insert(entries, s_query, 0)
-  var mx = max([0, get(g:, 'simplefinder_history_max', 50)])
+  var mx = max([0, ConfigNumber('history_max', 50)])
   if len(entries) > mx
     entries = mx == 0 ? [] : entries[: mx - 1]
   endif
@@ -2842,7 +2879,7 @@ def DebouncedSearch()
   # treat a due time in the past as due now; nothing documents that.  Clamping
   # is what makes "below 0 the search fires as soon as the timer can run" —
   # which the health report says out loud — true by construction.
-  var ms = max([0, get(g:, 'simplefinder_debounce_ms', 50)])
+  var ms = max([0, ConfigNumber('debounce_ms', 50)])
   s_debounce_timer = timer_start(ms, (id) => {
     s_debounce_timer = 0
     DispatchSearch()
@@ -2880,7 +2917,7 @@ enddef
 # Worker threads for the daemon's walk and its scoring.  0 (the default) means
 # one per core; the daemon clamps anything absurd.
 def RequestThreads(): number
-  var value = get(g:, 'simplefinder_threads', 0)
+  var value = ConfigNumber('threads', 0)
   return type(value) == v:t_number && value > 0 ? value : 0
 enddef
 
@@ -2895,7 +2932,7 @@ enddef
 # Off by default on the wire, so a daemon that never heard of the field cannot
 # be assumed to honour it.
 def RequestFileCache(): bool
-  return get(g:, 'simplefinder_grep_cache', 1) != 0
+  return ConfigFlag('grep_cache', true)
     && simplefinder#core#HasCap('grep_cache')
 enddef
 
@@ -3076,7 +3113,7 @@ enddef
 
 def AddRemoteGrepMatch(id: number, item: dict<any>)
   s_remote_match_count += 1
-  var maximum = max([1, get(g:, 'simplefinder_max_results', 200)])
+  var maximum = max([1, ConfigNumber('max_results', 200)])
   if len(s_items) < maximum
     add(s_items, item)
   endif
@@ -3167,7 +3204,7 @@ enddef
 def FilterRemoteFiles(query: string)
   var matched = FuzzyFilterLocal(s_remote_file_cache.items, query)
   s_total = len(matched)
-  var maximum = max([1, get(g:, 'simplefinder_max_results', 200)])
+  var maximum = max([1, ConfigNumber('max_results', 200)])
   s_capped = len(matched) > maximum
   s_total_exact = true
   s_items = len(matched) > maximum ? matched[: maximum - 1] : matched
@@ -3380,7 +3417,7 @@ def SendFilesRequest(query: string)
     id: id,
     root: s_project_root,
     query: query,
-    max: get(g:, 'simplefinder_max_results', 200),
+    max: ConfigNumber('max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
@@ -3440,7 +3477,7 @@ def SendGrepRequest(pattern: string)
     pattern: pattern,
     regex: s_regex,
     ignore_case: eff_ignore_case,
-    max: get(g:, 'simplefinder_max_results', 200),
+    max: ConfigNumber('max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
@@ -3903,7 +3940,7 @@ var s_all_lines: list<dict<any>> = []
 export def Lines()
   var src_buf = bufnr('%')
   var src_name = fnamemodify(bufname(src_buf), ':~:.')
-  var mx = get(g:, 'simplefinder_lines_max', 50000)
+  var mx = ConfigNumber('lines_max', 50000)
   s_all_lines = []
   var ln = 0
   for text in getline(1, '$')
@@ -4049,9 +4086,18 @@ var s_symbol_words: list<string> = []
 def SymbolKeywordsFor(ft: string): list<string>
   var custom = get(g:, 'simplefinder_symbol_keywords', {})
   if type(custom) == v:t_dict && has_key(custom, ft) && type(custom[ft]) == v:t_list
-    return custom[ft]
+    var valid = true
+    for keyword in custom[ft]
+      if type(keyword) != v:t_string || keyword ==# ''
+        valid = false
+        break
+      endif
+    endfor
+    if valid
+      return copy(custom[ft])
+    endif
   endif
-  if get(g:, 'simplefinder_symbol_all_languages', 0) || ft ==# ''
+  if ConfigFlag('symbol_all_languages', false) || ft ==# ''
     return AllSymbolKeywords()
   endif
   return get(s_symbol_keywords, ft, AllSymbolKeywords())
@@ -4115,7 +4161,7 @@ def SendSymbolRequest(query: string)
     pattern: pattern,
     regex: true,
     ignore_case: eff_ignore_case,
-    max: get(g:, 'simplefinder_max_results', 200),
+    max: ConfigNumber('max_results', 200),
     hidden: s_hidden,
     no_ignore: s_no_ignore,
     include_globs: s_include_globs,
@@ -4251,7 +4297,7 @@ export def RecentFiles()
       combined = inside + filter(combined, (_, f) => stridx(f, prefix) != 0)
     endif
   endif
-  var mx = get(g:, 'simplefinder_recent_files_max', 100)
+  var mx = ConfigNumber('recent_files_max', 100)
   # `list[: mx - 1]` is a Vim slice, not a Python one: at mx = 0 the end index
   # is -1, the *last* entry, so it keeps everything, and at mx = -1 it is -2,
   # which quietly drops the oldest entry every time.  A value below the floor
@@ -4278,7 +4324,7 @@ enddef
 def RecordRecentFile(f: string)
   filter(s_recent_files, (_, v) => v !=# f)
   insert(s_recent_files, f, 0)
-  var mx = get(g:, 'simplefinder_recent_files_max', 100)
+  var mx = ConfigNumber('recent_files_max', 100)
   # Same slice, same reason as in RecentFiles(): below the floor the list is
   # kept whole rather than losing an entry per file visited.
   if mx > 0 && len(s_recent_files) > mx
@@ -4656,7 +4702,7 @@ def AcceptItem(mode: string)
   # Help tags open with :help instead of :edit.
   if s_mode ==# 'help'
     var tag = get(item, 'path', '')
-    if get(g:, 'simplefinder_close_on_select', 1) != 0
+    if ConfigFlag('close_on_select', true)
       PanelClose()
     elseif s_source_winid > 0 && win_id2win(s_source_winid) > 0
       win_gotoid(s_source_winid)
@@ -4673,7 +4719,7 @@ def AcceptItem(mode: string)
   var lnum = get(item, 'lnum', 0)
   var col = get(item, 'col', 0)
 
-  if get(g:, 'simplefinder_close_on_select', 1) != 0
+  if ConfigFlag('close_on_select', true)
     PanelClose()
   elseif s_source_winid > 0 && win_id2win(s_source_winid) > 0
     win_gotoid(s_source_winid)
@@ -4781,7 +4827,7 @@ export def OnRemoteWorkspace()
   if event ==# 'SimpleRemoteConnecting'
       || (event ==# 'SimpleRemoteDisconnected'
         && get(payload, 'reason', '') ==# 'reconnect')
-    if empty(previous) || get(g:, 'simplefinder_remote', 1) == 0
+    if empty(previous) || !ConfigFlag('remote', true)
       # Nothing was being followed; a first connection is plain Connected.
       # And with the integration switched off at runtime, `previous` is a
       # snapshot from before it was switched off: following its replacement

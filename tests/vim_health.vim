@@ -251,6 +251,44 @@ let g:simplefinder_panel_width = '50'
 call assert_match('g:simplefinder_panel_width = 50 is not a number',
       \ s:ProblemText(),
       \ 'a quoted number is the classic vimrc slip and must be named as one')
+
+" Diagnosis is only half the contract: runtime readers promise to use their
+" defaults, including readers reached from redraw and timer callbacks. Exercise
+" the real panel with several wrong-shaped values at once; before the guarded
+" accessors, panel_width alone raised E1210/E1013 in EnsurePanel().
+let g:simplefinder_panel_width = []
+let g:simplefinder_position = {}
+let g:simplefinder_regex = []
+let g:simplefinder_ignore_case = {}
+let g:simplefinder_smart_case = []
+let g:simplefinder_hidden = {}
+let g:simplefinder_no_ignore = []
+let g:simplefinder_preview = {}
+let g:simplefinder_lines_max = []
+let g:simplefinder_debounce_ms = {}
+new
+call setline(1, ['alpha', 'bravo'])
+try
+  SimpleFinderLines
+  let s:type_panel = bufnr('SimpleFinder')
+  let s:type_panel_text = s:type_panel > 0
+        \ ? join(getbufline(s:type_panel, 1, '$'), "\n") : ''
+  call assert_match('2 results', s:type_panel_text,
+        \ 'wrong option types fall back to defaults and the panel still opens')
+  call feedkeys("\<Esc>", 'xt')
+catch
+  call assert_true(0, 'wrong option types escaped into the panel: ' .. v:exception)
+endtry
+bwipeout!
+let g:simplefinder_position = 'right'
+let g:simplefinder_regex = 0
+let g:simplefinder_ignore_case = 0
+let g:simplefinder_smart_case = 1
+let g:simplefinder_hidden = 0
+let g:simplefinder_no_ignore = 0
+let g:simplefinder_preview = 0
+let g:simplefinder_lines_max = 50000
+let g:simplefinder_debounce_ms = 50
 " The floor is EnsurePanel()'s own clamp, min([max([width, 24]), ...]), not a
 " number invented here: a report that called 15 acceptable would be describing
 " a panel width the plugin never opens.

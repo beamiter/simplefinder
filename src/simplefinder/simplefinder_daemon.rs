@@ -8,6 +8,7 @@ use nucleo_matcher::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc,
@@ -16,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
@@ -1134,24 +1135,109 @@ fn handle_grep_sync(
 
 // ─────────────────── stdout writer ───────────────────
 
-type EventTx = tokio::sync::mpsc::Sender<String>;
+#[derive(Clone)]
+struct EventTx {
+    sender: tokio::sync::mpsc::Sender<String>,
+    stalled: Arc<AtomicBool>,
+}
 
-async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
-    let mut out = tokio::io::stdout();
-    while let Some(line) = rx.recv().await {
-        if out.write_all(line.as_bytes()).await.is_err() {
+impl EventTx {
+    fn new(sender: tokio::sync::mpsc::Sender<String>) -> Self {
+        Self {
+            sender,
+            stalled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::Acquire)
+    }
+}
+
+fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    while let Some(line) = rx.blocking_recv() {
+        if out.write_all(line.as_bytes()).is_err() {
             break;
         }
-        if out.write_all(b"\n").await.is_err() {
+        if out.write_all(b"\n").is_err() {
             break;
         }
-        let _ = out.flush().await;
+        let _ = out.flush();
     }
 }
 
 async fn send_event(tx: &EventTx, evt: &Event) {
+    if tx.is_stalled() {
+        return;
+    }
     if let Ok(line) = serde_json::to_string(evt) {
-        let _ = tx.send(line).await;
+        match tokio::time::timeout(Duration::from_secs(2), tx.sender.send(line)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => tx.stalled.store(true, Ordering::Release),
+        }
+    }
+}
+
+/// A request may contain 256 path globs of 4096 raw bytes each. JSON can expand
+/// every control byte to six ASCII bytes (`\u00xx`), so the glob fields alone
+/// can legitimately exceed six MiB. Eight MiB admits that documented field
+/// maximum plus request metadata while still bounding an unterminated line.
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+fn finish_request_line(mut bytes: Vec<u8>, too_long: bool, limit: usize) -> Result<String, String> {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if too_long || bytes.len() > limit {
+        return Err(format!("request line exceeds {limit} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "request line is not valid UTF-8".to_string())
+}
+
+/// Read one bounded JSONL record and, after rejecting an oversized one, resume
+/// exactly at the next newline. AsyncBufReadExt::lines() has no size limit and
+/// retains the whole record before serde gets a chance to reject it.
+async fn read_request_line<R>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Result<String, String>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut too_long = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() && !too_long {
+                Ok(None)
+            } else {
+                Ok(Some(finish_request_line(bytes, too_long, limit)))
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+
+        if !too_long {
+            // Keep one extra byte until the record ends: for CRLF that byte is
+            // the framing CR, not part of the JSON line's documented limit.
+            if bytes.len().saturating_add(content_len) > limit.saturating_add(1) {
+                bytes.clear();
+                too_long = true;
+            } else {
+                bytes.extend_from_slice(&available[..content_len]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some(finish_request_line(bytes, too_long, limit)));
+        }
     }
 }
 
@@ -1238,19 +1324,70 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+type CancelMap = Arc<RwLock<HashMap<u64, Arc<CancellationToken>>>>;
+
+/// Register one live request. Reusing an id supersedes and cancels its former
+/// owner; the old worker may still be unwinding, so retirement below must use
+/// identity rather than blindly removing whichever token now owns the id.
+async fn register_request(cancels: &CancelMap, id: u64) -> Arc<CancellationToken> {
+    let token = Arc::new(CancellationToken::new());
+    if let Some(previous) = cancels.write().await.insert(id, token.clone()) {
+        previous.cancel();
+    }
+    token
+}
+
+async fn cancel_request(cancels: &CancelMap, id: u64) {
+    if let Some(token) = cancels.read().await.get(&id) {
+        token.cancel();
+    }
+}
+
+async fn retire_request(cancels: &CancelMap, id: u64, token: &Arc<CancellationToken>) {
+    let mut map = cancels.write().await;
+    if map
+        .get(&id)
+        .is_some_and(|current| Arc::ptr_eq(current, token))
+    {
+        map.remove(&id);
+    }
+}
+
 async fn serve() -> std::io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
 
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    tokio::spawn(stdout_writer(out_rx));
+    let (sender, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
+    let out_tx = EventTx::new(sender);
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        stdout_writer(out_rx);
+        let _ = writer_done_tx.send(());
+    });
+    let mut request_tasks = tokio::task::JoinSet::new();
 
-    let cancels: Arc<RwLock<HashMap<u64, CancellationToken>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let cancels: CancelMap = Arc::new(RwLock::new(HashMap::new()));
 
     let file_cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        if out_tx.is_stalled() {
+            break;
+        }
+        let Some(line) = read_request_line(&mut stdin, MAX_REQUEST_LINE_BYTES).await? else {
+            break;
+        };
+        while let Some(result) = request_tasks.try_join_next() {
+            if let Err(error) = result {
+                eprintln!("simplefinder-daemon: request task failed: {error}");
+            }
+        }
+        let line = match line {
+            Ok(line) => line,
+            Err(message) => {
+                send_event(&out_tx, &Event::Error { id: 0, message }).await;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1283,10 +1420,7 @@ async fn serve() -> std::io::Result<()> {
                 .await;
             }
             Request::Cancel { id } => {
-                let map = cancels.read().await;
-                if let Some(token) = map.get(&id) {
-                    token.cancel();
-                }
+                cancel_request(&cancels, id).await;
             }
             Request::Files {
                 id,
@@ -1302,13 +1436,9 @@ async fn serve() -> std::io::Result<()> {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
                 let cache = file_cache.clone();
-                let token = CancellationToken::new();
-                {
-                    let mut map = cancels.write().await;
-                    map.insert(id, token.clone());
-                }
+                let token = register_request(&cancels, id).await;
 
-                tokio::spawn(async move {
+                request_tasks.spawn(async move {
                     let started = Instant::now();
                     let files = match get_or_walk_files(
                         &cache,
@@ -1327,21 +1457,18 @@ async fn serve() -> std::io::Result<()> {
                         Ok(Some(f)) => f,
                         Ok(None) => {
                             // Cancelled during walk
-                            let mut map = cancels.write().await;
-                            map.remove(&id);
+                            retire_request(&cancels, id, &token).await;
                             return;
                         }
                         Err(message) => {
                             send_event(&tx, &Event::Error { id, message }).await;
-                            let mut map = cancels.write().await;
-                            map.remove(&id);
+                            retire_request(&cancels, id, &token).await;
                             return;
                         }
                     };
 
                     if token.is_cancelled() {
-                        let mut map = cancels.write().await;
-                        map.remove(&id);
+                        retire_request(&cancels, id, &token).await;
                         return;
                     }
 
@@ -1354,8 +1481,7 @@ async fn serve() -> std::io::Result<()> {
                     let (items, total) = match result {
                         Ok(Some(result)) => result,
                         Ok(None) => {
-                            let mut map = cancels.write().await;
-                            map.remove(&id);
+                            retire_request(&cancels, id, &token).await;
                             return;
                         }
                         Err(e) => {
@@ -1367,11 +1493,14 @@ async fn serve() -> std::io::Result<()> {
                                 },
                             )
                             .await;
-                            let mut map = cancels.write().await;
-                            map.remove(&id);
+                            retire_request(&cancels, id, &token).await;
                             return;
                         }
                     };
+                    if token.is_cancelled() {
+                        retire_request(&cancels, id, &token).await;
+                        return;
+                    }
                     let capped = total > items.len();
                     send_event(
                         &tx,
@@ -1386,8 +1515,7 @@ async fn serve() -> std::io::Result<()> {
                     )
                     .await;
 
-                    let mut map = cancels.write().await;
-                    map.remove(&id);
+                    retire_request(&cancels, id, &token).await;
                 });
             }
             Request::Grep {
@@ -1408,13 +1536,9 @@ async fn serve() -> std::io::Result<()> {
                 let tx = out_tx.clone();
                 let cancels = cancels.clone();
                 let cache = file_cache.clone();
-                let token = CancellationToken::new();
-                {
-                    let mut map = cancels.write().await;
-                    map.insert(id, token.clone());
-                }
+                let token = register_request(&cancels, id).await;
 
-                tokio::spawn(async move {
+                request_tasks.spawn(async move {
                     let started = Instant::now();
                     let token_clone = token.clone();
                     let max = max.min(5_000);
@@ -1425,8 +1549,12 @@ async fn serve() -> std::io::Result<()> {
                     // one the panel is not allowed to miss.
                     let sink: Option<GrepSink> = stream.then(|| {
                         let tx = tx.clone();
+                        let stream_token = token.clone();
                         Arc::new(
                             move |items: Vec<GrepItem>, total: usize, total_exact: bool| {
+                                if stream_token.is_cancelled() {
+                                    return;
+                                }
                                 let event = Event::GrepResult {
                                     id,
                                     done: false,
@@ -1437,7 +1565,7 @@ async fn serve() -> std::io::Result<()> {
                                     items,
                                 };
                                 if let Ok(line) = serde_json::to_string(&event) {
-                                    let _ = tx.try_send(line);
+                                    let _ = tx.sender.try_send(line);
                                 }
                             },
                         ) as GrepSink
@@ -1481,6 +1609,11 @@ async fn serve() -> std::io::Result<()> {
                         )
                     })
                     .await;
+
+                    if token.is_cancelled() {
+                        retire_request(&cancels, id, &token).await;
+                        return;
+                    }
 
                     match result {
                         Ok(Ok(mut outcome)) => {
@@ -1535,11 +1668,37 @@ async fn serve() -> std::io::Result<()> {
                         }
                     }
 
-                    let mut map = cancels.write().await;
-                    map.remove(&id);
+                    retire_request(&cancels, id, &token).await;
                 });
             }
         }
+    }
+
+    // Closing stdin means no more requests, not that replies already accepted
+    // may be discarded.  Drain them, but keep shutdown bounded: a wedged
+    // filesystem worker or a client that stopped reading stdout must not keep
+    // a piped daemon alive forever.
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(result) = request_tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("simplefinder-daemon: request task failed during drain: {error}");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        for token in cancels.read().await.values() {
+            token.cancel();
+        }
+        request_tasks.abort_all();
+        while request_tasks.join_next().await.is_some() {}
+    }
+    drop(out_tx);
+    if writer_done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok()
+    {
+        let _ = writer.join();
     }
     Ok(())
 }
@@ -1548,6 +1707,91 @@ async fn serve() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::{fs, time::SystemTime};
+
+    #[tokio::test]
+    async fn reused_request_id_keeps_the_new_cancel_owner() {
+        let cancels: CancelMap = Arc::new(RwLock::new(HashMap::new()));
+        let first = register_request(&cancels, 7).await;
+        let second = register_request(&cancels, 7).await;
+
+        assert!(
+            first.is_cancelled(),
+            "a reused id supersedes the old worker"
+        );
+        assert!(!second.is_cancelled());
+
+        // The old worker commonly reaches its cleanup after the replacement
+        // was registered. It must not remove the replacement's token.
+        retire_request(&cancels, 7, &first).await;
+        assert!(
+            cancels
+                .read()
+                .await
+                .get(&7)
+                .is_some_and(|current| Arc::ptr_eq(current, &second))
+        );
+
+        cancel_request(&cancels, 7).await;
+        assert!(second.is_cancelled());
+        retire_request(&cancels, 7, &second).await;
+        assert!(cancels.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_request_reader_recovers_at_the_next_record() {
+        let input = b"0123456789\n{\"type\":\"ping\",\"id\":7}\r\n";
+        let mut reader = BufReader::new(&input[..]);
+
+        let oversized = read_request_line(&mut reader, 8)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(oversized, "request line exceeds 8 bytes");
+
+        let next = read_request_line(&mut reader, 64)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, r#"{"type":"ping","id":7}"#);
+        assert!(read_request_line(&mut reader, 64).await.unwrap().is_none());
+
+        let mut exact_crlf = BufReader::new(&b"12345678\r\n"[..]);
+        assert_eq!(
+            read_request_line(&mut exact_crlf, 8)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "12345678"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_reader_admits_worst_case_escaped_path_globs() {
+        let glob = "\u{1}".repeat(MAX_PATH_GLOB_BYTES);
+        let line = serde_json::to_string(&serde_json::json!({
+            "type": "files",
+            "id": 9,
+            "root": "/tmp",
+            "include_globs": vec![glob; MAX_PATH_GLOBS],
+        }))
+        .unwrap();
+        assert!(line.len() > 4 * 1024 * 1024);
+        assert!(line.len() <= MAX_REQUEST_LINE_BYTES);
+
+        let mut input = line.into_bytes();
+        input.push(b'\n');
+        let mut reader = BufReader::new(input.as_slice());
+        assert!(
+            read_request_line(&mut reader, MAX_REQUEST_LINE_BYTES)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
 
     fn temp_project() -> PathBuf {
         let unique = SystemTime::now()

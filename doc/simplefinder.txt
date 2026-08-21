@@ -474,11 +474,12 @@ g:simplefinder_remote_search_projected
 
 VALIDATION                                           *simplefinder-validation*
 
-Every option above is read through |get()| with its default as the fallback,
-which makes a misspelled name the one failure with no symptom at all: the
-setting is never read, the default is used, and nothing says so. The whole set
-of names is therefore declared once inside the plugin and checked against what
-you actually set.
+Every option above is read through a typed accessor with its default as the
+fallback. A wrong-shaped value is therefore diagnosed without escaping into a
+redraw or timer callback; a misspelled name remains the one failure with no
+runtime symptom at all, because the setting is never read and the default is
+used. The whole set of names is therefore declared once inside the plugin and
+checked against what you actually set.
 
                                                 *simplefinder#ValidateConfig()*
 simplefinder#ValidateConfig()
@@ -807,7 +808,10 @@ g:simplefinder_symbol_all_languages
 DAEMON COMMAND LINE                                  *simplefinder-daemon-cli*
 
 The daemon takes no arguments in normal use: the plugin starts it and speaks
-JSON over its stdin and stdout.  For diagnosis it also answers: >
+JSON over its stdin and stdout.  One request line is limited to 8 MiB; an
+oversized record is rejected without losing the next record, and stdin EOF
+still drains replies for requests already accepted.  For diagnosis it also
+answers: >
 
   simplefinder-daemon --version
   simplefinder-daemon --help
