@@ -722,6 +722,10 @@ impl GrepScan {
         !token.is_cancelled() && !self.ceiling_hit.load(Ordering::Relaxed)
     }
 
+    fn hit_ceiling(&self) -> bool {
+        self.ceiling_hit.load(Ordering::Relaxed)
+    }
+
     fn matcher_for_worker(&self) -> grep_regex::RegexMatcher {
         self.matcher.clone()
     }
@@ -841,10 +845,12 @@ impl GrepScan {
 
 /// Grep by walking the tree, returning every file the walk saw.
 ///
-/// The returned list is `None` unless the caller asked for it *and* the walk
-/// ran to completion: a scan that a cancelled keystroke or the ceiling cut
-/// short has seen only part of the tree, and caching that as the project's
-/// file list would make every later search blind to the rest of it.
+/// The returned list is `None` unless the caller asked for it and the walk ran
+/// to completion.  Once grep reaches its ceiling, a cache-producing walk keeps
+/// collecting paths without scanning them: the complete, sorted list gives the
+/// deterministic fallback below its canonical order.  The caller still does
+/// not publish that list after a truncated grep, preserving the rule that only
+/// an exact request warms the shared cache.
 fn grep_by_walk(
     scan: &Arc<GrepScan>,
     root_path: &std::path::Path,
@@ -889,7 +895,12 @@ fn grep_by_walk(
         let mut searcher = new_searcher();
 
         Box::new(move |entry| {
-            if !scan.running(&token) {
+            let should_scan = scan.running(&token);
+            // Without a receiver there is no reason to finish the walk after
+            // grep reached its ceiling.  With one, keep collecting the whole
+            // candidate set but stop opening files for this discarded first
+            // pass; the deterministic replay needs the stable path order.
+            if !should_scan && (token.is_cancelled() || file_tx.is_none()) {
                 return ignore::WalkState::Quit;
             }
             let entry = match entry {
@@ -905,7 +916,9 @@ fn grep_by_walk(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            scan.visit(&mut searcher, &matcher, &path, &rel, &token);
+            if should_scan {
+                scan.visit(&mut searcher, &matcher, &path, &rel, &token);
+            }
             if let Some(file_tx) = &file_tx {
                 let _ = file_tx.send(rel);
             }
@@ -918,13 +931,70 @@ fn grep_by_walk(
         return Ok(None);
     };
     let mut walked: Vec<String> = file_rx.into_iter().collect();
-    if !scan.running(token) {
+    if token.is_cancelled() {
         return Ok(None);
     }
     // Sorted, because this is handed to the same cache the file finder reads
     // and that list is ordered.
     walked.sort();
     Ok(Some(walked))
+}
+
+/// Collect the canonical candidate list for a ceiling-tripped grep that opted
+/// out of the shared cache.  This second walk is deliberately rare: ordinary
+/// queries keep the original fused walk-and-scan fast path, while a broad
+/// query pays for determinism only after the bounded first pass proves it is
+/// needed.
+fn collect_grep_files(
+    root_path: &std::path::Path,
+    options: &GrepOptions,
+    token: &CancellationToken,
+) -> Result<Option<Vec<String>>, String> {
+    let overrides =
+        build_path_overrides(root_path, &options.include_globs, &options.exclude_globs)?;
+    let mut builder = WalkBuilder::new(root_path);
+    builder
+        .hidden(!options.hidden)
+        .threads(worker_threads(options.threads))
+        .overrides(overrides);
+    if options.no_ignore {
+        builder
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
+
+    let (file_tx, file_rx) = std::sync::mpsc::channel::<String>();
+    builder.build_parallel().run(|| {
+        let file_tx = file_tx.clone();
+        let root_path = root_path.to_path_buf();
+        let token = token.clone();
+        Box::new(move |entry| {
+            if token.is_cancelled() {
+                return ignore::WalkState::Quit;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            if let Ok(relative) = entry.path().strip_prefix(&root_path) {
+                let _ = file_tx.send(relative.to_string_lossy().into_owned());
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    drop(file_tx);
+
+    if token.is_cancelled() {
+        return Ok(None);
+    }
+    let mut files: Vec<String> = file_rx.into_iter().collect();
+    files.sort();
+    Ok(Some(files))
 }
 
 /// Grep the files a recent walk already found.
@@ -959,6 +1029,30 @@ fn grep_by_list(
     });
 }
 
+/// Replay a ceiling-tripped query over the canonical path order.  The fast
+/// parallel pass is intentionally retained for every ordinary query; only a
+/// broad query reaches this single-worker path, which makes the exact prefix
+/// covered by the ceiling independent of walk and worker scheduling.
+fn grep_by_list_in_order(
+    matcher: grep_regex::RegexMatcher,
+    root_path: &std::path::Path,
+    files: &[String],
+    max_results: usize,
+    ceiling: usize,
+    token: &CancellationToken,
+) -> GrepOutcome {
+    let scan = GrepScan::new(matcher, max_results, ceiling, None);
+    let matcher = scan.matcher_for_worker();
+    let mut searcher = new_searcher();
+    for rel in files {
+        if !scan.running(token) {
+            break;
+        }
+        scan.visit(&mut searcher, &matcher, &root_path.join(rel), rel, token);
+    }
+    scan.finish()
+}
+
 fn new_searcher() -> grep_searcher::Searcher {
     SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -990,13 +1084,47 @@ fn handle_grep_sync(
         .max(GREP_SCAN_CEILING_MIN);
     let scan = Arc::new(GrepScan::new(matcher, max_results, ceiling, stream));
 
-    let walked = match cached {
+    let mut walked = match cached.as_ref() {
         Some(files) => {
-            grep_by_list(&scan, &root_path, &files, options.threads, token);
+            grep_by_list(&scan, &root_path, files, options.threads, token);
             None
         }
         None => grep_by_walk(&scan, &root_path, &options, token)?,
     };
+
+    // Completion-order accounting is ideal for the common exact case, but
+    // once the ceiling stops a parallel scan it makes the covered file set a
+    // scheduling accident.  Replay only that rare case over the globally
+    // sorted candidate list.  The replay is bounded by the same ceiling and
+    // has no stream sink, so the final result deterministically replaces any
+    // provisional batches from the fast pass.
+    if scan.hit_ceiling() && !token.is_cancelled() {
+        let mut files = match cached.as_ref() {
+            Some(files) => Some(files.as_ref().clone()),
+            None => walked.take(),
+        };
+        if files.is_none() {
+            files = collect_grep_files(&root_path, &options, token)?;
+        }
+        if let Some(mut files) = files {
+            files.sort();
+            return Ok(grep_by_list_in_order(
+                scan.matcher_for_worker(),
+                &root_path,
+                &files,
+                max_results,
+                ceiling,
+                token,
+            ));
+        }
+    }
+
+    // A ceiling-tripped walk may have completed its candidate list solely for
+    // the replay above.  Never publish it as a cache entry for an inexact
+    // request; exact walks preserve the existing cache-warming behaviour.
+    if scan.hit_ceiling() {
+        walked = None;
+    }
 
     Ok(GrepOutcome {
         walked,
@@ -1780,6 +1908,70 @@ mod tests {
             );
             assert_eq!(again.total, first.total);
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Once the ceiling trips, the fast pass has counted files in worker
+    /// completion order.  The deterministic replay must replace that result
+    /// with the same canonical prefix for a cold walk, a cached list and the
+    /// cache opt-out path (which has to collect its list only on fallback).
+    #[test]
+    fn a_ceiling_tripped_grep_is_deterministic_across_strategies() {
+        let root = temp_project();
+        for file in 0..120 {
+            let body: String = (0..100)
+                .map(|line| format!("needle {file} {line}\n"))
+                .collect();
+            fs::write(root.join(format!("file{file:03}.txt")), body).unwrap();
+        }
+
+        let mut options = grep_options(20);
+        options.threads = 4;
+        let run = |options: GrepOptions, cached: Option<Arc<Vec<String>>>| {
+            handle_grep_sync(
+                root.to_str().unwrap(),
+                "needle",
+                options,
+                cached,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        };
+
+        let first = run(options.clone(), None);
+        assert!(!first.total_exact, "the fixture must trip the ceiling");
+        assert_eq!(first.total, GREP_SCAN_CEILING_MIN);
+        assert_eq!(first.items.len(), 20);
+        assert_eq!(first.items[0].path, "file000.txt");
+        assert_eq!(first.items[0].lnum, 1);
+        assert!(
+            first.walked.is_none(),
+            "an inexact request must not publish its fallback list"
+        );
+
+        let expected = serde_json::to_string(&first.items).unwrap();
+        for _ in 0..4 {
+            let again = run(options.clone(), None);
+            assert_eq!(again.total, first.total);
+            assert_eq!(serde_json::to_string(&again.items).unwrap(), expected);
+        }
+
+        let files = Arc::new(
+            (0..120)
+                .map(|file| format!("file{file:03}.txt"))
+                .collect::<Vec<_>>(),
+        );
+        let cached = run(options.clone(), Some(files));
+        assert_eq!(cached.total, first.total);
+        assert_eq!(serde_json::to_string(&cached.items).unwrap(), expected);
+
+        options.file_cache = false;
+        let opted_out = run(options, None);
+        assert_eq!(opted_out.total, first.total);
+        assert_eq!(serde_json::to_string(&opted_out.items).unwrap(), expected);
+        assert!(opted_out.walked.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
