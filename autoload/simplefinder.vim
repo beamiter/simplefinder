@@ -18,6 +18,9 @@ var s_next_id: number = 0
 var s_panel_winid: number = 0
 var s_panel_bufnr: number = -1
 var s_panel_snapshot: list<string> = []
+# changedtick captured after the panel's own writes; a different tick on the
+# next keystroke means the buffer was edited outside the render path (paste).
+var s_panel_tick: number = 0
 var s_source_winid: number = 0
 var s_source_bufnr: number = 0
 var s_mode: string = ''          # 'files' | 'gitfiles' | 'grep' | 'igrep' | 'symbols' | 'recent' | 'buffers' | 'lines' | 'help'
@@ -1004,7 +1007,13 @@ def OnGrepResult(ev: dict<any>)
   # a match found late can sort in above it and shift every index below.
   var anchor = ''
   var anchor_row = 0
+  # A cursor still pinned at the top has nothing to follow: the reset below
+  # lands it right back at (0, 0), so skip the identity work in that case.
   if id != 0 && id == s_stream_id && s_cursor_idx < len(s_items)
+      && (s_cursor_idx != 0 || s_scroll_off != 0)
+    # PanelRender only assigns identities while marks exist, so assign them
+    # here, on demand, before reading the anchor.
+    AssignItemIdentities(s_items)
     anchor = ItemIdentity(s_items[s_cursor_idx])
     # Following the identity restores the *selection*; the viewport is a second,
     # independent thing.  Zeroing the scroll offset and letting PanelRender pull
@@ -1518,7 +1527,12 @@ def PanelRender()
   if empty(panel_info) || s_panel_bufnr < 0
     return
   endif
-  AssignItemIdentities(s_items)
+  # Item identities exist only to keep multi-select marks attached to their
+  # rows; with nothing marked the serialization pass buys nothing, and the
+  # first ToggleMark assigns identities on demand.
+  if !empty(s_mark_order)
+    AssignItemIdentities(s_items)
+  endif
 
   s_eff_width = panel_info[0].width
   s_eff_height = panel_info[0].height
@@ -1676,7 +1690,11 @@ def PanelRender()
   if last >= extra_start
     deletebufline(s_panel_bufnr, extra_start, last)
   endif
-  s_panel_snapshot = getbufline(s_panel_bufnr, 1, '$')
+  # The buffer now holds exactly `lines`; keep that list as the paste-diff
+  # reference instead of reading the whole buffer back.  The changedtick is
+  # the O(1) "edited outside the render path" check in PanelHandleKey.
+  s_panel_snapshot = copy(lines)
+  s_panel_tick = getbufvar(s_panel_bufnr, 'changedtick')
   setbufvar(s_panel_bufnr, '&modified', 0)
 
   # Highlight matched characters on the visible rows
@@ -1837,12 +1855,22 @@ def PanelMoveCursor(old_idx: number, new_idx: number)
 
   setbufvar(s_panel_bufnr, '&modifiable', 1)
   if old_idx >= 0 && old_idx < len(s_items)
-    setbufline(s_panel_bufnr, old_bufline, FormatItemLine(old_idx, width))
+    var old_line = FormatItemLine(old_idx, width)
+    setbufline(s_panel_bufnr, old_bufline, old_line)
+    # Keep the paste-diff reference in sync one row at a time rather than
+    # reading the whole buffer back.
+    if old_bufline - 1 < len(s_panel_snapshot)
+      s_panel_snapshot[old_bufline - 1] = old_line
+    endif
   endif
   if new_idx >= 0 && new_idx < len(s_items)
-    setbufline(s_panel_bufnr, new_bufline, FormatItemLine(new_idx, width))
+    var new_line = FormatItemLine(new_idx, width)
+    setbufline(s_panel_bufnr, new_bufline, new_line)
+    if new_bufline - 1 < len(s_panel_snapshot)
+      s_panel_snapshot[new_bufline - 1] = new_line
+    endif
   endif
-  s_panel_snapshot = getbufline(s_panel_bufnr, 1, '$')
+  s_panel_tick = getbufvar(s_panel_bufnr, 'changedtick')
   setbufvar(s_panel_bufnr, '&modified', 0)
   if old_idx >= 0 && old_idx < len(s_items)
     AddItemProps(old_idx)
@@ -1919,6 +1947,7 @@ enddef
 
 var s_preview_scroll: number = 0   # extra lines scrolled past the match line
 var s_preview_syntax: string = ''  # what the popup window is currently set to
+var s_preview_key: string = ''     # what the popup currently shows; '' = nothing drawn
 
 # Cached whole-file reads, newest first: {key: '<path>:<ftime>:<size>', lines}.
 #
@@ -2068,6 +2097,10 @@ def RemotePreview(path: string): dict<any>
       endif
     endif
     CacheRemotePreview(key, lines)
+    # The loading text is already up with this exact preview key, so the
+    # no-op guard in PreviewUpdate() would keep it on screen forever; force
+    # the repaint that swaps in the fetched body.
+    s_preview_key = ''
     PreviewUpdate()
   }])
   return {ready: false, lines: ['── loading remote preview… ──']}
@@ -2136,6 +2169,7 @@ def PreviewClose()
     endtry
     s_preview_winid = 0
     s_preview_syntax = ''
+    s_preview_key = ''
   endif
 enddef
 
@@ -2209,6 +2243,16 @@ def PreviewUpdate()
   var height = max([5, s_eff_height - 2])
 
   var lnum = get(item, 'lnum', 0)
+  # Repainting an identical popup is the common case while typing (the cursor
+  # stays pinned on the first result): same target, same line, same geometry,
+  # same scroll.  Skip the stats, the slice and the popup calls in that case.
+  var preview_key = join([path, lnum, buf, width, height, s_preview_scroll,
+    len(s_items)], "\n")
+  if preview_key ==# s_preview_key && s_preview_winid > 0
+      && !empty(popup_getpos(s_preview_winid))
+    return
+  endif
+  s_preview_key = preview_key
   var lines: list<string> = []
   var hl_line = 0
   var syntax = ''
@@ -2362,7 +2406,7 @@ def PanelHandleKey(winid: number, key: string): bool
   # mappings can run first on some Vim builds.  Never let that key's render
   # overwrite a literal paste that is still sitting in the scratch buffer.
   if s_panel_bufnr > 0
-      && getbufline(s_panel_bufnr, 1, '$') !=# s_panel_snapshot
+      && getbufvar(s_panel_bufnr, 'changedtick', -1) != s_panel_tick
     OnPanelTextChanged()
   endif
   # :wincmd T recreates the window with a new ID while keeping this buffer and

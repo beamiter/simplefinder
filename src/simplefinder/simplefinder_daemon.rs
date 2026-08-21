@@ -549,8 +549,19 @@ fn fuzzy_filter(
     };
 
     let total = scored.len();
-    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1])));
-    scored.truncate(max);
+    let mut cmp = |a: &(i64, usize), b: &(i64, usize)| {
+        b.0.cmp(&a.0).then_with(|| files[a.1].cmp(&files[b.1]))
+    };
+    // The comparator is a total order, so the sort's first `max` rows are
+    // decided without ordering every match: partition at `max` — everything
+    // before it is exactly that page, in some internal order — and order
+    // just the page.  The guard keeps `max` in range for
+    // `select_nth_unstable_by`; a shorter list is ordered whole.
+    if max < scored.len() {
+        scored.select_nth_unstable_by(max, &mut cmp);
+        scored.truncate(max);
+    }
+    scored.sort_unstable_by(cmp);
 
     // Only the surviving page is materialized and needs highlight positions.
     let mut matcher = NucleoMatcher::new(Config::DEFAULT);
@@ -774,6 +785,14 @@ impl GrepScan {
         {
             let mut heap = self.best.lock().unwrap();
             for item in local_items {
+                // The heap is a max-heap over the same (path, lnum, col)
+                // order in which one file's matches arrive, so once it is
+                // full an item at or past its maximum can never enter the
+                // top-k — pushing it just to pop the maximum is the
+                // identity — and neither can anything after it in this file.
+                if heap.len() >= self.max_results && heap.peek().is_some_and(|top| item >= *top) {
+                    break;
+                }
                 heap.push(item);
                 if heap.len() > self.max_results {
                     // BinaryHeap is a max-heap, so this drops the item
