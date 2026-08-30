@@ -9,12 +9,26 @@ let s:root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(s:root)
 call delete(s:root .. '/tests/globs-errors.log')
 
+" A missing daemon has to say so, and has to fail.  `make check` builds it
+" (Makefile) before running any of this, so its absence means the build stopped
+" producing a daemon -- not an environment worth skipping -- and a bare `qall!`
+" here made that indistinguishable from a pass.  `echoerr` is swallowed by the
+" silent-ex Vim these suites run under, so the message goes to /dev/stderr, the
+" way the SKIP in vim_tabs.vim does.
+function! s:Fail(why) abort
+  try
+    call writefile(['FAIL tests/vim_globs.vim: ' .. a:why], '/dev/stderr')
+  catch
+  endtry
+  cquit
+endfunction
+
 let s:daemon = s:root .. '/target/debug/simplefinder-daemon'
 if !executable(s:daemon)
   let s:daemon = s:root .. '/lib/simplefinder-daemon'
 endif
 if !executable(s:daemon)
-  qall!
+  call s:Fail('no simplefinder-daemon in target/debug or lib; build it with cargo build')
 endif
 
 let g:simplefinder_daemon_path = s:daemon

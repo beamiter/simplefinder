@@ -21,8 +21,17 @@ let s:root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(s:root)
 call delete(s:root .. '/tests/preview-errors.log')
 
-if !has('popupwin')
+" A skip has to say so: a silent `qall!` is indistinguishable from a pass.
+function! s:Skip(why) abort
+  try
+    call writefile(['SKIP tests/vim_preview.vim: ' .. a:why], '/dev/stderr')
+  catch
+  endtry
   qall!
+endfunction
+
+if !has('popupwin')
+  call s:Skip('this Vim has no popup windows')
 endif
 
 let g:simplefinder_preview = 1

@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
@@ -1154,7 +1154,24 @@ impl EventTx {
     }
 }
 
-fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
+/// Writes replies to an arbitrary sink from inside the runtime.  `run` uses
+/// this; the stdio path below keeps its own blocking thread.
+async fn stdout_writer<W>(
+    mut out: W,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(line) = rx.recv().await {
+        out.write_all(line.as_bytes()).await?;
+        out.write_all(b"\n").await?;
+        out.flush().await?;
+    }
+    Ok(())
+}
+
+fn blocking_stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     while let Some(line) = rx.blocking_recv() {
@@ -1253,35 +1270,52 @@ nothing useful to do with it interactively.
 Options:
   -V, --version    print the version and exit
   -h, --help       print this help and exit
-      --self-test  check that the handshake reply serialises and that it
-                   announces this build's protocol version, then exit
+      --self-test  run one request through the daemon in-process and exit
 ";
 
-/// Cheap coherence check for the installer.
+/// Drives a real request through [`run`] over in-memory pipes.
 ///
-/// The request loop lives inside `main` and cannot be driven in-process
-/// without restructuring it, so this stops short of a full round trip: it
-/// builds the handshake reply the Vim side gates its features on and confirms
-/// it serialises to the announced protocol version.  That catches a mismatched
-/// or half-linked binary, which is what the installer is actually asking about.
-fn self_test() -> Result<(), String> {
-    let pong = Event::Pong {
-        id: 0,
-        protocol_version: PROTOCOL_VERSION,
-        version: env!("CARGO_PKG_VERSION"),
-        capabilities: capabilities(),
-    };
-    let encoded =
-        serde_json::to_string(&pong).map_err(|error| format!("handshake reply: {error}"))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&encoded).map_err(|error| format!("handshake reply: {error}"))?;
+/// The installer needs to know that the binary it just built actually works,
+/// and a version string only proves the file is not corrupt.  This exercises
+/// the parse -> dispatch -> reply path that every request takes.  It used to
+/// build its own `Event::Pong` and then check that against the constant it had
+/// just put in it, which is a serde round-trip test wearing an installer gate's
+/// name: the ping handler could have announced any protocol at all and this
+/// still printed `ok`.
+async fn self_test() -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
 
-    match parsed.get("protocol_version").and_then(|v| v.as_u64()) {
+    let request = format!("{}\n", serde_json::json!({"id": 1, "type": "ping"}));
+
+    // `run` spawns its writer task, so the sink has to be owned and 'static --
+    // a borrowed Vec will not do.  A duplex pipe gives an owned write half;
+    // run drops it on the way out, which is what ends the read below.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    run(request.as_bytes(), server)
+        .await
+        .map_err(|error| format!("daemon loop failed: {error}"))?;
+
+    let mut reply = String::new();
+    client
+        .read_to_string(&mut reply)
+        .await
+        .map_err(|error| format!("could not read the reply: {error}"))?;
+    let first = reply
+        .lines()
+        .next()
+        .ok_or_else(|| "daemon produced no reply".to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(first).map_err(|error| format!("reply was not JSON: {error}"))?;
+
+    match parsed
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(version) if version == u64::from(PROTOCOL_VERSION) => Ok(()),
         Some(version) => Err(format!(
-            "handshake announced protocol {version}, this build is {PROTOCOL_VERSION}"
+            "daemon announced protocol {version}, this build is {PROTOCOL_VERSION}"
         )),
-        None => Err(format!("handshake carried no protocol version: {encoded}")),
+        None => Err(format!("reply carried no protocol version: {first}")),
     }
 }
 
@@ -1307,7 +1341,7 @@ async fn main() -> std::process::ExitCode {
             );
             std::process::ExitCode::SUCCESS
         }
-        Some("--self-test") => match self_test() {
+        Some("--self-test") => match self_test().await {
             Ok(()) => {
                 println!("ok");
                 std::process::ExitCode::SUCCESS
@@ -1353,16 +1387,12 @@ async fn retire_request(cancels: &CancelMap, id: u64, token: &Arc<CancellationTo
     }
 }
 
-async fn serve() -> std::io::Result<()> {
-    let mut stdin = BufReader::new(tokio::io::stdin());
+async fn process_requests<R>(input: R, out_tx: EventTx) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut input = BufReader::new(input);
 
-    let (sender, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    let out_tx = EventTx::new(sender);
-    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        stdout_writer(out_rx);
-        let _ = writer_done_tx.send(());
-    });
     let mut request_tasks = tokio::task::JoinSet::new();
 
     let cancels: CancelMap = Arc::new(RwLock::new(HashMap::new()));
@@ -1373,7 +1403,7 @@ async fn serve() -> std::io::Result<()> {
         if out_tx.is_stalled() {
             break;
         }
-        let Some(line) = read_request_line(&mut stdin, MAX_REQUEST_LINE_BYTES).await? else {
+        let Some(line) = read_request_line(&mut input, MAX_REQUEST_LINE_BYTES).await? else {
             break;
         };
         while let Some(result) = request_tasks.try_join_next() {
@@ -1694,19 +1724,99 @@ async fn serve() -> std::io::Result<()> {
         while request_tasks.join_next().await.is_some() {}
     }
     drop(out_tx);
+    Ok(())
+}
+
+/// The whole daemon over one pair of streams.  `serve` is this with stdin and
+/// stdout wired in; `self_test` is this with an in-memory pipe, which is what
+/// makes the self-test exercise the real dispatch path rather than a reply it
+/// built itself.
+async fn run<R, W>(input: R, output: W) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
+    let out_tx = EventTx::new(sender);
+    let writer = tokio::spawn(stdout_writer(output, out_rx));
+    let result = process_requests(input, out_tx).await;
+    let writer_result = writer
+        .await
+        .map_err(|error| std::io::Error::other(format!("stdout writer task failed: {error}")))?;
+    result?;
+    writer_result
+}
+
+/// [`run`] wired to stdin and stdout.  Stdout keeps the blocking writer thread
+/// it has always had -- the flush is a blocking write to a pipe Vim owns, and
+/// it stays off the runtime's worker threads.
+async fn serve() -> std::io::Result<()> {
+    let (sender, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
+    let out_tx = EventTx::new(sender);
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        blocking_stdout_writer(out_rx);
+        let _ = writer_done_tx.send(());
+    });
+
+    let result = process_requests(tokio::io::stdin(), out_tx).await;
+
     if writer_done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .is_ok()
     {
         let _ = writer.join();
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, time::SystemTime};
+
+    /// `--self-test` is the only gate `install-common.sh` applies to a freshly
+    /// built binary.  It used to build its own `Event::Pong` from
+    /// `PROTOCOL_VERSION` and then assert the result carried
+    /// `PROTOCOL_VERSION`, so its mismatch arm was unreachable and the real
+    /// ping handler -- a second, separate `Event::Pong` -- was never touched.
+    /// Change that handler to announce anything but this build's protocol and
+    /// this fails, which is the whole point of the gate.
+    #[tokio::test]
+    async fn self_test_drives_the_real_ping_handler() {
+        self_test()
+            .await
+            .expect("--self-test must pass on a coherent build");
+    }
+
+    #[tokio::test]
+    async fn ping_handler_announces_this_builds_protocol() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut request_writer, request_reader) = tokio::io::duplex(4096);
+        let (response_writer, mut response_reader) = tokio::io::duplex(64 * 1024);
+        let runner = tokio::spawn(run(request_reader, response_writer));
+
+        request_writer
+            .write_all(b"{\"type\":\"ping\",\"id\":11}\n")
+            .await
+            .unwrap();
+        request_writer.shutdown().await.unwrap();
+
+        let mut response = String::new();
+        response_reader.read_to_string(&mut response).await.unwrap();
+        runner.await.unwrap().unwrap();
+
+        let event: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(event["type"], "pong");
+        assert_eq!(event["id"], 11);
+        assert_eq!(
+            event["protocol_version"],
+            serde_json::json!(u64::from(PROTOCOL_VERSION)),
+            "the handshake the Vim side gates its features on"
+        );
+        assert_eq!(event["version"], env!("CARGO_PKG_VERSION"));
+    }
 
     #[tokio::test]
     async fn reused_request_id_keeps_the_new_cancel_owner() {

@@ -20,13 +20,22 @@ let s:root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(s:root)
 call delete(s:root .. '/tests/cache-errors.log')
 
+" A skip has to say so: a silent `qall!` is indistinguishable from a pass.
+function! s:Skip(why) abort
+  try
+    call writefile(['SKIP tests/vim_cache.vim: ' .. a:why], '/dev/stderr')
+  catch
+  endtry
+  qall!
+endfunction
+
 let s:fake = s:root .. '/tests/fake_echo_daemon.py'
 if !executable(s:fake)
   " CI checkouts do not always preserve the mode bit.
   call setfperm(s:fake, 'rwxr-xr-x')
 endif
 if !executable(s:fake)
-  qall!
+  call s:Skip('tests/fake_echo_daemon.py is not executable')
 endif
 
 let s:log = tempname()
