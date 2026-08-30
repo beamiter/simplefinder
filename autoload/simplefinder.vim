@@ -73,7 +73,14 @@ var s_remote_job_key: string = ''
 var s_remote_stdout: list<string> = []
 var s_remote_stderr: list<string> = []
 var s_remote_started: list<number> = []
+var s_remote_path_format: string = ''
 var s_remote_grep_format: string = ''
+var s_remote_hex_pending: string = ''
+var s_remote_grep_hex_path: string = ''
+var s_remote_grep_hex_need_path: bool = true
+var s_remote_command_status: number = -1
+var s_remote_exit_status: number = -1
+var s_remote_channel_closed: bool = false
 var s_remote_match_count: number = 0
 var s_remote_cap_stopped: bool = false
 var s_remote_render_timer: number = 0
@@ -2942,6 +2949,16 @@ def ShellJoin(argv: list<string>): string
   return join(mapnew(argv, (_, value) => shellescape(value)), ' ')
 enddef
 
+# Vim channels cannot carry NUL bytes: even raw mode maps them to NL. Remote
+# path producers therefore keep their NUL-safe protocol until `od` turns every
+# byte into hex. `fold` bounds callback lines without splitting a byte pair;
+# Vim decodes complete records after seeing their encoded 00 terminator.
+def RemoteHexStream(command: string): string
+  return '{ ' .. command
+    .. '; status=$?; printf "SIMPLEFINDER_STATUS %s\n" "$status" >&2; }'
+    .. " | od -An -v -tx1 | tr -d '[:space:]' | fold -w 4096"
+enddef
+
 # The argv that runs `script` in the workspace's search directory.
 #
 # SimpleRemote runs the script with the workspace root as its working
@@ -3025,12 +3042,15 @@ def RemoteFlags(argv: list<string>): list<string>
 enddef
 
 def RemoteFileCommand(): string
-  var rg = ShellJoin(RemoteFlags(['rg', '--files', '--color', 'never']))
+  var rg = ShellJoin(RemoteFlags(['rg', '--files', '--color', 'never', '--null']))
   var fallback = s_no_ignore
-    ? "find . -type f -print | sed 's#^\\./##'"
-    : "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard; else find . -type f -print | sed 's#^\\./##'; fi"
-  return 'if command -v rg >/dev/null 2>&1; then ' .. rg
+    ? 'find . -type f -print0'
+    : 'if git rev-parse --is-inside-work-tree >/dev/null 2>&1; '
+      .. 'then git ls-files -z --cached --others --exclude-standard; '
+      .. 'else find . -type f -print0; fi'
+  var producer = 'if command -v rg >/dev/null 2>&1; then ' .. rg
     .. '; status=$?; [ "$status" -le 1 ]; else ' .. fallback .. '; fi'
+  return "printf '%s\n' SIMPLEFINDER_PATH_HEX; " .. RemoteHexStream(producer)
 enddef
 
 def RemoteGrepCommand(pattern: string, force_regex: bool = false,
@@ -3046,24 +3066,45 @@ def RemoteGrepCommand(pattern: string, force_regex: bool = false,
   add(rg, ignore_case ? '--ignore-case' : '--case-sensitive')
   extend(rg, ['--', pattern, '.'])
 
-  var grep = ['grep', '-R', '-n', '-H']
+  # The fallback cannot rely on GNU grep's -Z/-R/-H/-I: BusyBox and BSD grep
+  # do not share that option set.  POSIX find passes pathnames as argv, one
+  # ordinary grep emits only `line:text`, and the wrapper prefixes every match
+  # with `path\0`.  That is both portable and unambiguous for filenames with
+  # newlines or `:digits:` segments.
+  var grep = ['grep', '-n']
   add(grep, s_regex || force_regex ? '-E' : '-F')
   if ignore_case
     add(grep, '-i')
   endif
-  add(grep, '--exclude-dir=.git')
-  for glob in s_include_globs
-    add(grep, '--include=' .. glob)
-  endfor
-  for glob in s_exclude_globs
-    add(grep, '--exclude=' .. glob)
-  endfor
-  extend(grep, ['--', pattern, '.'])
+  extend(grep, ['-e', pattern])
+  var grep_one = ShellJoin(grep) .. ' "$simplefinder_file"'
+  var portable_grep =
+    'simplefinder_tmp=$(mktemp "${TMPDIR:-/tmp}/simplefinder-grep.XXXXXX")'
+      .. ' || { printf ''SIMPLEFINDER_STATUS 1\n'' >&2; exit 1; }; '
+      .. 'trap ''rm -f "$simplefinder_tmp"'' 0 1 2 15; '
+      .. 'simplefinder_failed=0; '
+      .. 'for simplefinder_file do '
+      .. ': >"$simplefinder_tmp" || { simplefinder_failed=1; break; }; '
+      .. 'if ' .. grep_one .. ' >"$simplefinder_tmp"; then '
+      .. 'while IFS= read -r simplefinder_match '
+      .. '|| [ -n "$simplefinder_match" ]; do '
+      .. 'printf ''%s\000%s\n'' "$simplefinder_file" "$simplefinder_match"; '
+      .. 'done <"$simplefinder_tmp"; '
+      .. 'else simplefinder_code=$?; '
+      .. 'if [ "$simplefinder_code" -gt 1 ]; then '
+      .. 'simplefinder_failed=1; break; fi; fi; done; '
+      .. 'if [ "$simplefinder_failed" -ne 0 ]; then '
+      .. 'printf ''SIMPLEFINDER_STATUS 1\n'' >&2; fi; '
+      .. 'exit "$simplefinder_failed"'
+  var find_grep = ShellJoin([
+    'find', '.', '-path', './.git', '-prune', '-o', '-type', 'f',
+    '-exec', 'sh', '-c', portable_grep, 'simplefinder-grep', '{}', '+',
+  ])
 
   return "if command -v rg >/dev/null 2>&1; then printf '%s\\n' SIMPLEFINDER_RG_JSON; "
     .. ShellJoin(rg) .. '; status=$?; [ "$status" -le 1 ]; '
-    .. "else printf '%s\\n' SIMPLEFINDER_GREP; " .. ShellJoin(grep)
-    .. '; status=$?; [ "$status" -le 1 ]; fi'
+    .. "else printf '%s\\n' SIMPLEFINDER_GREP_HEX; "
+    .. RemoteHexStream(find_grep) .. '; fi'
 enddef
 
 def RemoteFileKey(kind: string): string
@@ -3126,9 +3167,133 @@ def AddRemoteGrepMatch(id: number, item: dict<any>)
   QueueRemoteGrepRender(id)
 enddef
 
+def DecodeRemoteHex(field: string): string
+  if field ==# ''
+    return ''
+  endif
+  if field !~# '^\%([0-9A-Fa-f]\{2}\)\+$'
+    throw 'invalid hex path field'
+  endif
+  # eval() is safe here because validation leaves only hex digits, and it is
+  # the one Vim primitive that can rebuild the original UTF-8 bytes rather
+  # than treating each byte value as a separate Unicode codepoint.
+  var expression = '"'
+  var offset = 0
+  while offset < strlen(field)
+    expression ..= '\x' .. strpart(field, offset, 2)
+    offset += 2
+  endwhile
+  expression ..= '"'
+  var decoded = eval(expression)
+  return type(decoded) == v:t_string ? decoded : ''
+enddef
+
+def AppendRemoteHex(line: string): bool
+  if line !~# '^\%([0-9A-Fa-f]\{2}\)*$'
+    add(s_remote_stderr, 'invalid remote hex stream')
+    return false
+  endif
+  s_remote_hex_pending ..= line
+  return true
+enddef
+
+# Remove one field ending in the encoded byte `delimiter` (for example 00 or
+# 0a). Search on byte-pair boundaries: a plain string search would mistake the
+# middle two nibbles of `1001` for a NUL.
+def PopRemoteHexField(delimiter: string): any
+  var offset = 0
+  while offset + 1 < strlen(s_remote_hex_pending)
+    if strpart(s_remote_hex_pending, offset, 2) ==# delimiter
+      var field = strpart(s_remote_hex_pending, 0, offset)
+      s_remote_hex_pending = strpart(s_remote_hex_pending, offset + 2)
+      return field
+    endif
+    offset += 2
+  endwhile
+  return v:null
+enddef
+
+def AddRemotePathField(field: string)
+  try
+    var path = substitute(DecodeRemoteHex(field), '^\./', '', '')
+    if s_remote_job_kind ==# 'files'
+      if RemotePathAllowed(path)
+        add(s_remote_stdout, path)
+      endif
+    elseif path !=# '' && path !~# '^\.git/'
+      add(s_remote_stdout, path)
+    endif
+  catch
+    add(s_remote_stderr, 'invalid remote path encoding: ' .. v:exception)
+  endtry
+enddef
+
+def ConsumeRemotePathHex(line: string)
+  if !AppendRemoteHex(line)
+    return
+  endif
+  while true
+    var field = PopRemoteHexField('00')
+    if type(field) == v:t_none
+      return
+    endif
+    if field !=# ''
+      AddRemotePathField(field)
+    endif
+  endwhile
+enddef
+
+def ConsumeRemoteGrepHex(id: number, line: string)
+  if !AppendRemoteHex(line)
+    return
+  endif
+  while true
+    var field = PopRemoteHexField(s_remote_grep_hex_need_path ? '00' : '0a')
+    if type(field) == v:t_none
+      return
+    endif
+    if s_remote_grep_hex_need_path
+      try
+        s_remote_grep_hex_path = substitute(DecodeRemoteHex(field), '^\./', '', '')
+        s_remote_grep_hex_need_path = false
+      catch
+        add(s_remote_stderr, 'invalid remote grep path encoding: ' .. v:exception)
+        s_remote_grep_hex_path = ''
+        s_remote_grep_hex_need_path = false
+      endtry
+      continue
+    endif
+
+    try
+      var payload = substitute(DecodeRemoteHex(field), '\r$', '', '')
+      var fields = matchlist(payload, '^\(\d\+\):\(.*\)$')
+      if !empty(fields) && RemotePathAllowed(s_remote_grep_hex_path)
+        AddRemoteGrepMatch(id, {
+          path: s_remote_grep_hex_path,
+          lnum: str2nr(fields[1]), col: 0, col_end: 0,
+          text: fields[2],
+        })
+      endif
+    catch
+      add(s_remote_stderr, 'invalid remote grep encoding: ' .. v:exception)
+    endtry
+    s_remote_grep_hex_path = ''
+    s_remote_grep_hex_need_path = true
+  endwhile
+enddef
+
 def OnRemoteStdout(id: number, _channel: channel, line: string)
   if id != s_remote_job_id || line ==# ''
     return
+  endif
+  if index(['files', 'gitfiles'], s_remote_job_kind) >= 0
+    if line ==# 'SIMPLEFINDER_PATH_HEX'
+      s_remote_path_format = 'hex'
+      return
+    elseif s_remote_path_format ==# 'hex'
+      ConsumeRemotePathHex(line)
+      return
+    endif
   endif
   if s_remote_job_kind ==# 'files'
     var path = substitute(line, '^\./', '', '')
@@ -3150,8 +3315,15 @@ def OnRemoteStdout(id: number, _channel: channel, line: string)
   if line ==# 'SIMPLEFINDER_RG_JSON'
     s_remote_grep_format = 'json'
     return
+  elseif line ==# 'SIMPLEFINDER_GREP_HEX'
+    s_remote_grep_format = 'grep_hex'
+    return
   elseif line ==# 'SIMPLEFINDER_GREP'
     s_remote_grep_format = 'grep'
+    return
+  endif
+  if s_remote_grep_format ==# 'grep_hex'
+    ConsumeRemoteGrepHex(id, line)
     return
   endif
   if s_remote_grep_format ==# 'json'
@@ -3194,6 +3366,17 @@ enddef
 
 def OnRemoteStderr(id: number, _channel: channel, line: string)
   if id == s_remote_job_id && line !=# ''
+    var status = matchlist(line, '^SIMPLEFINDER_STATUS \(\d\+\)$')
+    if !empty(status)
+      var code = str2nr(status[1])
+      # The portable grep wrapper may report an error from one find batch
+      # before the outer hex pipeline exits successfully.  A later zero must
+      # never erase that earlier failure.
+      if s_remote_command_status < 0 || code != 0
+        s_remote_command_status = code
+      endif
+      return
+    endif
     add(s_remote_stderr, line)
     if len(s_remote_stderr) > 20
       remove(s_remote_stderr, 0)
@@ -3252,17 +3435,25 @@ def OnRemoteExit(id: number, _job: job, status: number)
   CancelRemoteRender()
   var kind = s_remote_job_kind
   var key = s_remote_job_key
+  var effective_status = status != 0 ? status
+    : s_remote_command_status >= 0 ? s_remote_command_status : 0
+  if !s_remote_cap_stopped
+      && (s_remote_hex_pending !=# ''
+        || (s_remote_grep_format ==# 'grep_hex' && !s_remote_grep_hex_need_path))
+    add(s_remote_stderr, 'truncated remote encoded output')
+    effective_status = effective_status == 0 ? 1 : effective_status
+  endif
   s_remote_job = null_job
   s_remote_job_id = 0
   s_remote_job_kind = ''
   s_remote_job_key = ''
   s_elapsed_ms = empty(s_remote_started) ? 0
     : float2nr(reltimefloat(reltime(s_remote_started)) * 1000.0)
-  if status != 0 && !s_remote_cap_stopped
+  if effective_status != 0 && !s_remote_cap_stopped
     s_loading = false
     s_current_id = 0
     s_error = empty(s_remote_stderr)
-      ? printf('remote %s exited with code %d', kind, status)
+      ? printf('remote %s exited with code %d', kind, effective_status)
       : s_remote_stderr[-1]
     PanelRender()
     return
@@ -3282,6 +3473,32 @@ def OnRemoteExit(id: number, _job: job, status: number)
     s_stream_id = 0
     PanelRender()
   endif
+enddef
+
+# A process may exit while stdout still has one final buffered line.  The hex
+# encoder commonly emits exactly one line at EOF, so finishing from exit_cb
+# alone can publish an empty cache and then discard that late line.  Vim's
+# close_cb is ordered after all channel callbacks; wait for both signals.
+def MaybeFinishRemoteJob(id: number)
+  if id == s_remote_job_id && s_remote_exit_status >= 0 && s_remote_channel_closed
+    OnRemoteExit(id, s_remote_job, s_remote_exit_status)
+  endif
+enddef
+
+def OnRemoteProcessExit(id: number, _job: job, status: number)
+  if id != s_remote_job_id
+    return
+  endif
+  s_remote_exit_status = status
+  MaybeFinishRemoteJob(id)
+enddef
+
+def OnRemoteChannelClosed(id: number, _channel: channel)
+  if id != s_remote_job_id
+    return
+  endif
+  s_remote_channel_closed = true
+  MaybeFinishRemoteJob(id)
 enddef
 
 def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
@@ -3324,7 +3541,14 @@ def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
   s_remote_stdout = []
   s_remote_stderr = []
   s_remote_started = reltime()
+  s_remote_path_format = ''
   s_remote_grep_format = ''
+  s_remote_hex_pending = ''
+  s_remote_grep_hex_path = ''
+  s_remote_grep_hex_need_path = true
+  s_remote_command_status = -1
+  s_remote_exit_status = -1
+  s_remote_channel_closed = false
   s_remote_match_count = 0
   s_remote_cap_stopped = false
   s_remote_job = job_start(command, {
@@ -3332,7 +3556,8 @@ def StartRemoteJob(kind: string, id: number, key: string, script: string): bool
     out_mode: 'nl', err_mode: 'nl',
     out_cb: (channel, line) => OnRemoteStdout(id, channel, line),
     err_cb: (channel, line) => OnRemoteStderr(id, channel, line),
-    exit_cb: (job, status) => OnRemoteExit(id, job, status),
+    exit_cb: (job, status) => OnRemoteProcessExit(id, job, status),
+    close_cb: (channel) => OnRemoteChannelClosed(id, channel),
   })
   if job_status(s_remote_job) ==# 'fail'
     s_remote_job = null_job
@@ -4215,8 +4440,9 @@ export def GitFiles()
     s_error = ''
     PanelRender()
     StartRemoteJob('gitfiles', id, RemoteFileKey('gitfiles'),
-      'git -c core.quotepath=false ls-files --cached --others '
-        .. '--exclude-standard --deduplicate')
+      "printf '%s\n' SIMPLEFINDER_PATH_HEX; "
+        .. RemoteHexStream('git ls-files -z --cached --others '
+          .. '--exclude-standard --deduplicate'))
     return
   endif
   var start = expand('%:p:h')

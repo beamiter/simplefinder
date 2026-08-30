@@ -16,11 +16,28 @@ let s:repo = fnamemodify(expand('<sfile>'), ':p:h:h')
 call delete('/tmp/simplefinder-remote-errors.log')
 let s:first = tempname()
 let s:second = tempname()
+let s:grep_shim_dir = tempname()
 call mkdir(s:first .. '/src', 'p')
 call mkdir(s:second, 'p')
+call mkdir(s:grep_shim_dir, 'p')
+let s:real_grep = exepath('grep')
+call writefile([
+      \ '#!/bin/sh',
+      \ 'for arg do',
+      \ '  [ "$arg" != "-Z" ] || exit 91',
+      \ 'done',
+      \ 'exec ' .. shellescape(s:real_grep) .. ' "$@"',
+      \ ], s:grep_shim_dir .. '/grep')
+call setfperm(s:grep_shim_dir .. '/grep', 'rwxr-xr-x')
 call writefile(['fn alpha() {}', 'needle remote'], s:first .. '/src/alpha.rs')
 call writefile(['project one'], s:first .. '/README.md')
 call writefile(['beta workspace'], s:second .. '/beta.txt')
+let s:unicode_name = "\u540d\u5b57.txt"
+let s:newline_name = "line\nbreak.txt"
+let s:colon_name = 'foo:123:bar.txt'
+call writefile(['unicode remote path'], s:first .. '/' .. s:unicode_name)
+call writefile(['special-newline-token'], s:first .. '/' .. s:newline_name)
+call writefile(['special-colon-token'], s:first .. '/' .. s:colon_name)
 " Two remote CSVs for the bounded-preview section: one past any preview limit
 " the test sets, one inside it.
 call writefile([repeat('x', 400), repeat('y', 400)], s:first .. '/big.csv')
@@ -32,6 +49,7 @@ let g:simpleremote_workspace = {
 let g:simpleremote_status = 'ssh:fixture-target'
 let g:remote_preview_reads = 0
 let g:remote_shell_calls = 0
+let g:remote_grep_shim = ''
 
 " The workspace root, or its projection when there is one: the fixture has no
 " real remote host, so the "remote" scripts run in the local directory that
@@ -51,7 +69,10 @@ function! g:SimpleRemoteShellCommand(command) abort
   let l:command = get(g:, 'remote_force_no_rg', 0)
         \ ? substitute(a:command, 'command -v rg >/dev/null 2>&1', 'false', 'g')
         \ : a:command
-  return ['sh', '-c', 'cd ' .. shellescape(s:ShellRoot()) .. ' && ' .. l:command]
+  let l:prefix = empty(g:remote_grep_shim) ? ''
+        \ : 'export PATH=' .. shellescape(g:remote_grep_shim) .. ':"$PATH"; '
+  return ['sh', '-c', 'cd ' .. shellescape(s:ShellRoot()) .. ' && '
+        \ .. l:prefix .. l:command]
 endfunction
 
 function! s:DeliverRead(Callback, ok, body, timer) abort
@@ -311,6 +332,33 @@ call assert_match('remote://' .. s:first .. '/README.md', s:recent_rows[1],
 call feedkeys("\<Esc>", 'xt')
 let g:simpleremote_workspace = s:saved_workspace
 
+" The no-rg file fallback is NUL-framed before it crosses Vim's line-oriented
+" channel. UTF-8 and an embedded newline must both remain the actual filename,
+" not Git C quoting or two unrelated result rows. Keep this after the recent-
+" files assertions above: opening these fixtures intentionally adds them to
+" the editor's recent list.
+if executable('git')
+  " Make Files take its Git fallback, whose default C quoting used to expose
+  " the literal octal spelling of this Unicode name. On a host without Git the
+  " same assertions cover find -print0 instead.
+  call system('git -C ' .. shellescape(s:first) .. ' init -q')
+endif
+let g:remote_force_no_rg = 1
+let g:simplefinder_hidden = 1
+execute 'SimpleFinderFiles ' .. s:unicode_name
+call s:WaitFor({-> s:SearchDone(s:unicode_name)}, 'remote fallback Unicode file')
+call feedkeys("\<CR>", 'xt')
+call assert_equal('remote://' .. s:first .. '/' .. s:unicode_name, bufname())
+call assert_equal('unicode remote path', getline(1))
+
+SimpleFinderFiles break.txt
+call s:WaitFor({-> s:SearchDone('break.txt')}, 'remote fallback newline file')
+call feedkeys("\<CR>", 'xt')
+call assert_equal('remote://' .. s:first .. '/' .. s:newline_name, bufname())
+call assert_equal('special-newline-token', getline(1))
+let g:remote_force_no_rg = 0
+let g:simplefinder_hidden = 0
+
 " Grep-derived entry points share the same transport and path resolution.
 SimpleFinderIGrep needle
 call s:WaitFor({-> s:SearchDone('src/alpha.rs:2:')}, 'remote interactive grep')
@@ -323,10 +371,37 @@ cclose
 
 " Targets without ripgrep still retain a functional grep path.
 let g:remote_force_no_rg = 1
+let g:remote_grep_shim = s:grep_shim_dir
 SimpleFinderGrep remote
 call s:WaitFor({-> s:SearchDone('src/alpha.rs:2:')}, 'remote grep fallback')
 call feedkeys("\<Esc>", 'xt')
+
+" The per-file fallback wrapper separates the filename from line:text with a
+" NUL before the whole stream is hex encoded. A `:digits:` segment and a
+" newline in a filename therefore remain paths rather than becoming a fake
+" line number or a second record. The PATH shim above rejects GNU grep -Z, so
+" this also pins the BusyBox/BSD-compatible path.
+SimpleFinderGrep special-colon-token
+call s:WaitFor({-> s:SearchDone('foo:123:bar.txt:1:')},
+      \ 'remote grep fallback colon path')
+call feedkeys("\<C-q>", 'xt')
+let s:qf = getqflist()
+call assert_equal(1, len(s:qf))
+call assert_equal('remote://' .. s:first .. '/' .. s:colon_name,
+      \ bufname(s:qf[0].bufnr), 'fallback grep keeps :digits: in the path')
+cclose
+
+SimpleFinderGrep special-newline-token
+call s:WaitFor({-> s:SearchDone('break.txt:1:')},
+      \ 'remote grep fallback newline path')
+call feedkeys("\<C-q>", 'xt')
+let s:qf = getqflist()
+call assert_equal(1, len(s:qf))
+call assert_equal('remote://' .. s:first .. '/' .. s:newline_name,
+      \ bufname(s:qf[0].bufnr), 'fallback grep keeps newline in the path')
+cclose
 let g:remote_force_no_rg = 0
+let g:remote_grep_shim = ''
 
 setfiletype rust
 SimpleFinderSymbols alpha
@@ -336,9 +411,13 @@ call feedkeys("\<Esc>", 'xt')
 " Git files also execute on the target rather than inspecting the local cwd.
 if executable('git')
   call system('git -C ' .. shellescape(s:first) .. ' init -q')
-  call system('git -C ' .. shellescape(s:first) .. ' add README.md src/alpha.rs')
+  call system('git -C ' .. shellescape(s:first) .. ' add -A')
   SimpleFinderGitFiles
   call s:WaitFor({-> s:SearchDone('src/alpha.rs')}, 'remote git files')
+  call assert_match(s:unicode_name, s:Panel(),
+        \ 'remote git files keeps a Unicode path readable')
+  call assert_match('break.txt', s:Panel(),
+        \ 'remote git files keeps an embedded-newline path in one item')
   call feedkeys("\<Esc>", 'xt')
 endif
 
@@ -754,6 +833,7 @@ let g:simplefinder_root = ''
 call simplefinder#Stop()
 call delete(s:first, 'rf')
 call delete(s:second, 'rf')
+call delete(s:grep_shim_dir, 'rf')
 
 if !empty(v:errors)
   call writefile(v:errors, '/tmp/simplefinder-remote-errors.log')
