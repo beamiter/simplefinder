@@ -275,7 +275,7 @@ def OnDaemonEvent(ev: dict<any>)
     return
   endif
 
-  var id = get(ev, 'id', 0)
+  var id = CoerceNumber(get(ev, 'id', 0), 0)
   # Only handle events for the current active request
   if id != s_current_id
     return
@@ -5080,8 +5080,14 @@ enddef
 # a quoted string for the same generation, and Vim9 `==` throws E1030 on
 # that mix, which aborted OnRemoteWorkspace() mid-switch.
 def SameRemoteId(left: dict<any>, right: dict<any>): bool
-  return has_key(left, 'id') && has_key(right, 'id')
-    && string(left.id) ==# string(right.id)
+  if !has_key(left, 'id') || !has_key(right, 'id')
+      || index([v:t_number, v:t_string], type(left.id)) < 0
+      || index([v:t_number, v:t_string], type(right.id)) < 0
+    return false
+  endif
+  var left_id = type(left.id) == v:t_string ? left.id : string(left.id)
+  var right_id = type(right.id) == v:t_string ? right.id : string(right.id)
+  return left_id ==# right_id
 enddef
 
 def SameRemoteConnection(left: dict<any>, right: dict<any>): bool
