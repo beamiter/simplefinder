@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased - 2026-10-04
+
+### workspace `id` 数字/字符串混用不再把 SameRemoteConnection 炸掉
+
+- SimpleRemote 的 generation 有时是数字、有时是 `'51'` 这种字符串。Vim9 里 `get(id) == get(id)` 会
+  `E1030`，`OnRemoteWorkspace()` 半路退出，sshfs 挂上、tree 换根都被当成新连接，正在跑的列举被取消。
+  现在按 `string(id)` 比较。
+
+### 带引号的数字选项按数字用，不再悄悄回落到默认值
+
+- vimrc 里 `let g:simplefinder_debounce_ms = '0'` 是 `v:t_string`，`ConfigNumber()` 只认
+  `v:t_number`，于是一直用默认的 50ms；`g:simplefinder_remote = '0'` 也关不掉联动。
+  现在整串数字字符串按 `str2nr()` 读取。健康检查改报 `[WARN] quoted number; N is used`，
+  不再把实际生效的值当成 `[ERROR] is not a number`。
+
+### `g:simplefinder_root` 里的 `$HOME` 不再被 `expand()` 改写成别的目录
+
+- 健康检查的 `isdirectory(expand(root))` 和 `FindProjectRoot()` / `:SimpleFinderRoot` 的 `fnamemodify(expand(...), ':p')` 把目录名里的 `$HOME` 当成环境变量。目录明明在,报告却说不是目录,搜索走了另一条探测路径。现在只做 `fnamemodify(':p')`。
+
 ## Unreleased - 2026-08-16
 
 ### SimpleRemote 联动补全：buffer/recent、workspace 切换、sshfs、tree root、workspace 选择器

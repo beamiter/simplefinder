@@ -315,9 +315,21 @@ enddef
 # effect immediately. Every reader still has to enforce the type promised by
 # its default: ValidateConfig() can explain a bad vimrc, but a finder must keep
 # opening on safe defaults instead of throwing from a redraw or timer callback.
+# A quoted number is the classic vimrc slip (`let g:foo = '0'`).  Treating it
+# as "not a number, use the default" silently keeps debounce at 50 ms when the
+# user asked for 0, and leaves a flag on when they wrote '0' to turn it off.
+def CoerceNumber(value: any, default_value: number): number
+  if type(value) == v:t_number
+    return value
+  endif
+  if type(value) == v:t_string && value =~# '^[-+]\?\d\+$'
+    return str2nr(value)
+  endif
+  return default_value
+enddef
+
 def ConfigNumber(name: string, default_value: number): number
-  var value = get(g:, 'simplefinder_' .. name, default_value)
-  return type(value) == v:t_number ? value : default_value
+  return CoerceNumber(get(g:, 'simplefinder_' .. name, default_value), default_value)
 enddef
 
 def ConfigFlag(name: string, default_value: bool): bool
@@ -327,6 +339,9 @@ def ConfigFlag(name: string, default_value: bool): bool
   endif
   if type(value) == v:t_number
     return value != 0
+  endif
+  if type(value) == v:t_string && value =~# '^[-+]\?\d\+$'
+    return str2nr(value) != 0
   endif
   return default_value
 enddef
@@ -456,7 +471,9 @@ def CheckOption(spec: dict<any>, value: any): list<string>
   var want: number = spec.type
   # A flag is read with `!= 0`, so v:true and v:false serve as well as 1 and 0.
   var is_bool = type(value) == v:t_bool && get(spec, 'flag', false)
-  if type(value) != want && !is_bool
+  var quoted_number = want == v:t_number
+    && type(value) == v:t_string && value =~# '^[-+]\?\d\+$'
+  if type(value) != want && !is_bool && !quoted_number
     # Runtime readers fall back to the declared default. The configured value
     # is still named here so the typo can be fixed instead of staying silent.
     return [printf('[ERROR] %s = %s is not %s', name, Brief(value), TypeName(want))]
@@ -466,16 +483,21 @@ def CheckOption(spec: dict<any>, value: any): list<string>
   endif
 
   var problems: list<string> = []
+  var number_value = quoted_number ? str2nr(value) : value
+  if quoted_number
+    add(problems, printf('[WARN] %s = %s is a quoted number; %d is used',
+      name, Brief(value), number_value))
+  endif
   if want == v:t_number
-    if has_key(spec, 'min') && value < spec.min
+    if has_key(spec, 'min') && number_value < spec.min
       add(problems, has_key(spec, 'min_note')
         ? printf('[WARN] %s = %d is below the minimum %d; %s',
-            name, value, spec.min, spec.min_note)
-        : printf('[ERROR] %s = %d is below the minimum %d', name, value, spec.min))
+            name, number_value, spec.min, spec.min_note)
+        : printf('[ERROR] %s = %d is below the minimum %d', name, number_value, spec.min))
     endif
-    if get(spec, 'flag', false) && value != 0 && value != 1
+    if get(spec, 'flag', false) && number_value != 0 && number_value != 1
       add(problems, printf('[WARN] %s = %d is an on/off flag; anything but 0 means on',
-        name, value))
+        name, number_value))
     endif
   elseif want == v:t_string && has_key(spec, 'allowed')
     if index(spec.allowed, value) < 0
@@ -500,7 +522,7 @@ def CrossCheck(): list<string>
   endif
 
   var root = get(g:, 'simplefinder_root', '')
-  if type(root) == v:t_string && root !=# '' && !isdirectory(expand(root))
+  if type(root) == v:t_string && root !=# '' && !isdirectory(fnamemodify(root, ':p'))
     add(problems, printf('[ERROR] g:simplefinder_root = %s is not a directory — '
       .. 'the root is detected from the markers instead', Brief(root)))
   endif
@@ -1042,7 +1064,7 @@ def OnFilesResult(ev: dict<any>)
 enddef
 
 def OnGrepResult(ev: dict<any>)
-  var id = get(ev, 'id', 0)
+  var id = CoerceNumber(get(ev, 'id', 0), 0)
   # A streaming daemon repaints the same request several times, each batch a
   # refined snapshot rather than an append.  The first batch of a request is a
   # new result set and belongs at the top; a later one must not yank the
@@ -1069,9 +1091,9 @@ def OnGrepResult(ev: dict<any>)
   for item in get(ev, 'items', [])
     add(s_items, {
       path: get(item, 'path', ''),
-      lnum: get(item, 'lnum', 0),
-      col: get(item, 'col', 0),
-      col_end: get(item, 'col_end', 0),
+      lnum: CoerceNumber(get(item, 'lnum', 0), 0),
+      col: CoerceNumber(get(item, 'col', 0), 0),
+      col_end: CoerceNumber(get(item, 'col_end', 0), 0),
       text: get(item, 'text', ''),
     })
   endfor
@@ -1275,7 +1297,7 @@ def FindProjectRoot(): string
   endif
   var configured = ConfigString('root', '')
   if configured !=# ''
-    var root = fnamemodify(expand(configured), ':p')
+    var root = fnamemodify(configured, ':p')
     if isdirectory(root)
       return substitute(root, '/$', '', '')
     endif
@@ -1340,6 +1362,13 @@ def PathGlobsReady(): bool
     s_error = s_glob_error
     PanelRender()
     return false
+  endif
+  # Remote searches apply globs in the transport command (rg --glob / the
+  # portable fallback).  The local daemon's path_globs capability is irrelevant
+  # there, and an older daemon left running from a previous local search must
+  # not fail-close a remote listing that never talks to it.
+  if RemoteTransportActive()
+    return true
   endif
   if (!empty(s_include_globs) || !empty(s_exclude_globs))
       && simplefinder#core#Ready() && !simplefinder#core#HasCap('path_globs')
@@ -1472,6 +1501,12 @@ def PanelClose()
     timer_stop(s_debounce_timer)
     s_debounce_timer = 0
   endif
+  CancelRemoteRender()
+  if s_negotiate_timer > 0
+    timer_stop(s_negotiate_timer)
+    s_negotiate_timer = 0
+  endif
+  s_deferred = false
   # Cancel running request
   if s_remote_job_id > 0
     CancelRemoteJob()
@@ -3125,20 +3160,50 @@ def CompareRemoteLocation(left: dict<any>, right: dict<any>): number
   if left.path !=# right.path
     return left.path <# right.path ? -1 : 1
   endif
-  if get(left, 'lnum', 0) != get(right, 'lnum', 0)
-    return get(left, 'lnum', 0) - get(right, 'lnum', 0)
+  var left_lnum = CoerceNumber(get(left, 'lnum', 0), 0)
+  var right_lnum = CoerceNumber(get(right, 'lnum', 0), 0)
+  if left_lnum != right_lnum
+    return left_lnum - right_lnum
   endif
-  return get(left, 'col', 0) - get(right, 'col', 0)
+  return CoerceNumber(get(left, 'col', 0), 0) - CoerceNumber(get(right, 'col', 0), 0)
+enddef
+
+def RestoreRemoteCursor(anchor: string, anchor_row: number)
+  s_cursor_idx = 0
+  s_scroll_off = 0
+  if anchor ==# ''
+    return
+  endif
+  AssignItemIdentities(s_items)
+  var found = indexof(s_items, (_, item) => ItemIdentity(item) ==# anchor)
+  if found >= 0
+    s_cursor_idx = found
+    s_scroll_off = max([0, found - anchor_row])
+  endif
+enddef
+
+def SnapshotRemoteCursor(): list<any>
+  if s_cursor_idx < len(s_items) && (s_cursor_idx != 0 || s_scroll_off != 0)
+    AssignItemIdentities(s_items)
+    return [ItemIdentity(s_items[s_cursor_idx]), s_cursor_idx - s_scroll_off]
+  endif
+  return ['', 0]
+enddef
+
+def FinalizeRemoteGrep()
+  var snap = SnapshotRemoteCursor()
+  sort(s_items, CompareRemoteLocation)
+  s_total = s_remote_match_count
+  s_capped = s_total > len(s_items) || s_remote_cap_stopped
+  s_total_exact = !s_remote_cap_stopped
+  RestoreRemoteCursor(snap[0], snap[1])
 enddef
 
 def RenderRemoteGrep(id: number)
   if id != s_remote_job_id
     return
   endif
-  sort(s_items, CompareRemoteLocation)
-  s_total = s_remote_match_count
-  s_capped = s_total > len(s_items) || s_remote_cap_stopped
-  s_total_exact = !s_remote_cap_stopped
+  FinalizeRemoteGrep()
   PanelRender()
 enddef
 
@@ -3342,9 +3407,9 @@ def OnRemoteStdout(id: number, _channel: channel, line: string)
       var first = empty(matches) ? {} : matches[0]
       AddRemoteGrepMatch(id, {
         path: path,
-        lnum: get(data, 'line_number', 0),
-        col: get(first, 'start', 0) + 1,
-        col_end: get(first, 'end', 0) + 1,
+        lnum: CoerceNumber(get(data, 'line_number', 0), 0),
+        col: CoerceNumber(get(first, 'start', 0), 0) + 1,
+        col_end: CoerceNumber(get(first, 'end', 0), 0) + 1,
         text: text,
       })
     catch
@@ -3385,6 +3450,7 @@ def OnRemoteStderr(id: number, _channel: channel, line: string)
 enddef
 
 def FilterRemoteFiles(query: string)
+  var snap = SnapshotRemoteCursor()
   var matched = FuzzyFilterLocal(s_remote_file_cache.items, query)
   s_total = len(matched)
   var maximum = max([1, ConfigNumber('max_results', 200)])
@@ -3394,8 +3460,7 @@ def FilterRemoteFiles(query: string)
   s_loading = false
   s_error = ''
   s_current_id = 0
-  s_cursor_idx = 0
-  s_scroll_off = 0
+  RestoreRemoteCursor(snap[0], snap[1])
   PanelRender()
 enddef
 
@@ -3463,10 +3528,7 @@ def OnRemoteExit(id: number, _job: job, status: number)
   elseif kind ==# 'gitfiles'
     FinishRemoteGitFiles()
   elseif kind ==# 'grep'
-    sort(s_items, CompareRemoteLocation)
-    s_total = s_remote_match_count
-    s_capped = s_total > len(s_items) || s_remote_cap_stopped
-    s_total_exact = !s_remote_cap_stopped
+    FinalizeRemoteGrep()
     s_loading = false
     s_error = ''
     s_current_id = 0
@@ -4015,7 +4077,13 @@ export def Resume()
   if mode ==# 'gitfiles'
     GitFiles()
     SetQuery(query)
-    FilterGitFiles()
+    # A remote gitfiles listing is a job: filtering the (empty or previous)
+    # snapshot here would paint a stale list and clear `searching…` while
+    # the transport is still walking.  FinishRemoteGitFiles() filters with
+    # s_query when the listing lands.
+    if !RemoteTransportActive()
+      FilterGitFiles()
+    endif
     return
   endif
   if mode ==# 'list'
@@ -4052,7 +4120,7 @@ export def ProjectRoot(path: string = '')
     var local_root = get(remote, 'local_root', '')
     if !empty(local_root) && exists('*g:SimpleRemoteRemotePath') == 1
       var Mapper = function('g:SimpleRemoteRemotePath')
-      var mapped = call(Mapper, [fnamemodify(expand(requested), ':p')])
+      var mapped = call(Mapper, [fnamemodify(requested, ':p')])
       if !empty(mapped)
         requested = mapped
       endif
@@ -4095,7 +4163,7 @@ export def ProjectRoot(path: string = '')
     endif
     return
   endif
-  var root = fnamemodify(expand(path), ':p')
+  var root = fnamemodify(path, ':p')
   if !isdirectory(root)
     echohl ErrorMsg
     echom '[SimpleFinder] not a directory: ' .. path
@@ -5007,9 +5075,18 @@ enddef
 
 # Two snapshots of the same connection: same generation, same host, same
 # root.  Everything cached from one is still true of the other.
+#
+# Workspace `id` is compared as text: SimpleRemote has used both a number and
+# a quoted string for the same generation, and Vim9 `==` throws E1030 on
+# that mix, which aborted OnRemoteWorkspace() mid-switch.
+def SameRemoteId(left: dict<any>, right: dict<any>): bool
+  return has_key(left, 'id') && has_key(right, 'id')
+    && string(left.id) ==# string(right.id)
+enddef
+
 def SameRemoteConnection(left: dict<any>, right: dict<any>): bool
   return !empty(left) && !empty(right)
-    && get(left, 'id', -1) == get(right, 'id', -2)
+    && SameRemoteId(left, right)
     && get(left, 'kind', '') ==# get(right, 'kind', '')
     && get(left, 'target', '') ==# get(right, 'target', '')
     && CleanRemoteRoot(left) ==# CleanRemoteRoot(right)

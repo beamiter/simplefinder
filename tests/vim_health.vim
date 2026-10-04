@@ -261,9 +261,12 @@ call assert_match("g:simplefinder_position = middle is not one of left/right",
 let g:simplefinder_position = 'right'
 
 let g:simplefinder_panel_width = '50'
-call assert_match('g:simplefinder_panel_width = 50 is not a number',
+call assert_match("g:simplefinder_panel_width = 50 is a quoted number; 50 is used",
       \ s:ProblemText(),
       \ 'a quoted number is the classic vimrc slip and must be named as one')
+call assert_notmatch('\[ERROR\] g:simplefinder_panel_width', s:ProblemText(),
+      \ 'a quoted number the plugin honours is a warning, not an unused value')
+let g:simplefinder_panel_width = 50
 
 " Diagnosis is only half the contract: runtime readers promise to use their
 " defaults, including readers reached from redraw and timer callbacks. Exercise
@@ -375,6 +378,18 @@ call s:WaitFor({-> s:Panel() =~# '1 results'}, 'a debounced search below the flo
 call assert_notmatch('alpha line', s:Panel(),
       \ 'debounce_ms below the floor searches as soon as the timer can run')
 call feedkeys("\<Esc>", 'xt')
+
+" `let g:simplefinder_debounce_ms = '0'` used to keep the default 50 ms because
+" ConfigNumber only accepted v:t_number, so the search the user asked to fire
+" immediately still waited.
+let g:simplefinder_debounce_ms = '0'
+SimpleFinderLines
+call feedkeys('charlie', 'xt')
+sleep 20m
+call assert_match('1 results', s:Panel(),
+      \ 'quoted debounce_ms 0 searches as soon as the timer can run')
+call assert_notmatch('alpha line', s:Panel())
+call feedkeys("\<Esc>", 'xt')
 let g:simplefinder_debounce_ms = 50
 bwipeout!
 
@@ -410,6 +425,15 @@ let g:simplefinder_symbol_keywords = {}
 
 let g:simplefinder_root = s:root .. '/no-such-directory'
 call assert_match('is not a directory', s:ProblemText())
+" expand() would rewrite a directory whose name contains $HOME; health then
+" said the root was missing while FindProjectRoot looked at a different path.
+let s:dollar_root = s:root .. '/tests/root-$HOME'
+call mkdir(s:dollar_root, 'p')
+let g:simplefinder_root = s:dollar_root
+call assert_notmatch('is not a directory', s:ProblemText())
+call assert_false(s:dollar_root ==# expand(s:dollar_root),
+      \ 'this fixture is worthless if expand() leaves $HOME alone')
+call delete(s:dollar_root, 'rf')
 let g:simplefinder_root = ''
 
 let g:simplefinder_ignore_case = 1

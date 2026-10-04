@@ -64,6 +64,14 @@ function! g:SimpleRemoteShellCommand(command) abort
   if !exists('g:simpleremote_workspace')
     return []
   endif
+  if get(g:, 'remote_slow_grep', 0)
+        \ && a:command =~# 'SIMPLEFINDER_RG_JSON\|SIMPLEFINDER_GREP'
+    let l:late = '{"type":"match","data":{"path":{"text":"zzz.txt"},"lines":{"text":"late needle"},"line_number":"1","submatches":[]}}'
+    let l:early = '{"type":"match","data":{"path":{"text":"aaa.txt"},"lines":{"text":"early needle"},"line_number":1,"submatches":[]}}'
+    return ['sh', '-c', "printf '%s\\n' SIMPLEFINDER_RG_JSON; printf '%s\\n' "
+          \ .. shellescape(l:late) .. '; sleep 0.35; printf ''%s\n'' '
+          \ .. shellescape(l:early)]
+  endif
   let g:remote_shell_calls += 1
   let g:remote_last_script = a:command
   let l:command = get(g:, 'remote_force_no_rg', 0)
@@ -196,6 +204,15 @@ endfunction
 function! s:SearchDone(needle) abort
   let l:text = s:Panel()
   return l:text =~# a:needle && l:text !~# 'searching…'
+endfunction
+
+function! s:CursorRow() abort
+  for l:line in getbufline(bufnr('SimpleFinder'), 4, '$')
+    if l:line =~# '^▸'
+      return l:line
+    endif
+  endfor
+  return ''
 endfunction
 
 " The health report, read from its buffer and closed again.
@@ -756,6 +773,26 @@ call assert_match('src/alpha.rs', s:Panel())
 call feedkeys("\<CR>", 'xt')
 call assert_equal(s:first .. '/src/alpha.rs', bufname(),
       \ 'results listed while mounting open under the mount once it is up')
+
+" SimpleRemote has published the generation as a string.  Vim9 `id == id`
+" threw E1030 and the WorkspaceChanged handler aborted, so the listing was
+" cancelled as if this were a different connection.
+SimpleFinderFiles alpha
+call s:WaitFor({-> s:SearchDone('src/alpha.rs')}, 'listing before string-id event')
+let s:calls = g:remote_shell_calls
+let g:simpleremote_workspace.id = string(g:simpleremote_workspace.id)
+let g:simpleremote_event = {'event': 'SimpleRemoteWorkspaceChanged',
+      \ 'status': 'ssh:fixture-target', 'time': localtime()}
+try
+  doautocmd <nomodeline> User SimpleRemoteWorkspaceChanged
+  call assert_true(1)
+catch
+  call assert_true(0, 'string workspace id must not throw: ' .. v:exception)
+endtry
+sleep 50m
+call assert_equal(s:calls, g:remote_shell_calls,
+      \ 'a string generation of the same connection does not re-list')
+call feedkeys("\<Esc>", 'xt')
 
 " A projected workspace of another mode takes the other branch: the ordinary
 " daemon searches local_root and results remain normal filesystem buffers.

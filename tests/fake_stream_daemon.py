@@ -48,7 +48,9 @@ def emit(obj):
 
 
 def item(path, text):
-    return {"path": path, "lnum": 1, "col": 1, "col_end": 7, "text": text}
+    # String coordinates: a JSON daemon is free to send them, and Vim9 `==`
+    # / subtraction on a mix with the plugin's number cursor math throws E1030.
+    return {"path": path, "lnum": "1", "col": "1", "col_end": "7", "text": text}
 
 
 A = item("a.txt", "aaa needle")
@@ -124,7 +126,7 @@ def main():
                 }
             )
         elif kind == "grep":
-            ident = req.get("id", 0)
+            ident = str(req.get("id", 0))
             first_gate, batches = SEQUENCES.get(req.get("pattern", ""), (0, None))
             if not req.get("stream") or batches is None:
                 emit(
