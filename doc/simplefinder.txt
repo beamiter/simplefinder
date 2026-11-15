@@ -401,6 +401,12 @@ limit bounds what crosses the transport, not just what is displayed.  With a
 SimpleRemote too old for g:SimpleRemoteExecute(), or the limit turned off, the
 body still arrives whole.
 
+Local disk previews accept only regular files (including symlinks to regular
+files). FIFOs, devices and other special files are skipped: being readable or
+reporting a small size does not mean reading them will finish. An already
+loaded buffer still previews from memory, regardless of its disk file type.
+This check is not an atomic guarantee against concurrent file replacement.
+
 A popup belongs to the tabpage it was created in, and the preview is sized from
 the panel window. Results arriving while you are in another tab therefore
 repaint the panel but not the preview, which would otherwise have to be drawn

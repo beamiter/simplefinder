@@ -70,6 +70,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_stream.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_prompt.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_preview.vim
+	python3 tests/preview_special.py
 	vim -Nu NONE -n -i NONE -es -S tests/vim_pick.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_cache.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_tabs.vim

@@ -2043,7 +2043,22 @@ def PreviewCacheClear()
   s_remote_preview_cache = []
 enddef
 
+# filereadable() also accepts FIFOs and devices. A zero size says nothing
+# about whether readfile() will wait forever or consume an unbounded stream.
+# Follow symlinks for ordinary files, but never read special files for preview.
+def PreviewDiskFile(path: string): bool
+  try
+    return path !=# '' && getftype(resolve(path)) ==# 'file' && filereadable(path)
+  catch
+    # A cyclic symlink or other failed resolution is not a previewable file.
+    return false
+  endtry
+enddef
+
 def CachedFileLines(path: string): list<string>
+  if !PreviewDiskFile(path)
+    return []
+  endif
   var key = printf('%s:%d:%d', path, getftime(path), getfsize(path))
   var hit = indexof(s_preview_cache, (_, e) => e.key ==# key)
   if hit >= 0
@@ -2295,7 +2310,7 @@ def PreviewUpdate()
   if buf <= 0 || !bufloaded(buf)
     buf = LoadedBufferFor(path)
   endif
-  if buf <= 0 && !remote_path && (path ==# '' || !filereadable(path))
+  if buf <= 0 && !remote_path && !PreviewDiskFile(path)
     PreviewClose()
     return
   endif
