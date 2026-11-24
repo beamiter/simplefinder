@@ -117,9 +117,10 @@ mod tests {
     #[test]
     fn renamed_subtree_retires_nested_roots_but_not_prefix_siblings() {
         let renamed = PathBuf::from("/work/dir");
-        assert!(affected(Path::new("/work"), &[renamed.clone()]));
-        assert!(affected(Path::new("/work/dir/nested"), &[renamed.clone()]));
-        assert!(!affected(Path::new("/work/directory"), &[renamed]));
+        let paths = std::slice::from_ref(&renamed);
+        assert!(affected(Path::new("/work"), paths));
+        assert!(affected(Path::new("/work/dir/nested"), paths));
+        assert!(!affected(Path::new("/work/directory"), paths));
     }
 
     #[cfg(unix)]
@@ -146,8 +147,10 @@ mod tests {
             .unwrap();
         let resolved = dir.join("origin").canonicalize().unwrap().join("leaf");
         assert_eq!(
-            mutation_paths(std::slice::from_ref(&leaf)).unwrap(),
-            [resolved.clone()]
+            mutation_paths(std::slice::from_ref(&leaf))
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&resolved)
         );
         fs::remove_file(dir.join("origin/leaf")).unwrap();
         assert_eq!(mutation_paths(&[leaf]).unwrap(), [resolved]);
