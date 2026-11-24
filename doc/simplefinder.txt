@@ -37,10 +37,11 @@ Grep does not walk the tree for every keystroke. The daemon keeps the file list
 it built for |:SimpleFinderFiles| for 30 seconds, and a grep whose filters match
 that list reads it instead of walking again — no directory stat-ed twice, no
 ignore file re-read — while a grep that does have to walk publishes its own list
-so the next keystroke can skip it. The trade is that a file created while a
-panel is open is not searched until the list expires; set
-|g:simplefinder_grep_cache| to 0 to walk every time. This is negotiated too
-(`grep_cache` capability), so an older daemon keeps walking.
+so the next keystroke can skip it. A compatible daemon invalidates affected
+local walks after a successful SimpleTree create, rename, or delete, without
+starting Finder or changing remote searches. Other changes still follow the
+30-second TTL. Set |g:simplefinder_grep_cache| to 0 to walk for every grep.
+An older daemon keeps its existing behavior without Tree invalidation.
 
 The first search of a session is the one that starts the daemon, so it is
 raised before that negotiation has finished. It waits for the handshake (up to
@@ -587,9 +588,10 @@ g:simplefinder_grep_cache
 	ceiling publishes nothing, since a partial tree must never be cached as
 	a whole one.
 
-	The list is at most 30 seconds old, so a file created while a panel is
-	open is not searched until it expires. Set this to 0 to walk for every
-	request, as versions before 0.5.0 always did.
+	The list is at most 30 seconds old. With a daemon advertising
+	`invalidate_files`, successful SimpleTree create, rename, and delete
+	events also evict affected local lists. Other changes retain the TTL.
+	Set this to 0 to walk for every grep, as versions before 0.5.0 did.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs

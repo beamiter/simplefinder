@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -21,6 +21,9 @@ use tokio::{
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
+
+mod cache_epochs;
+use cache_epochs::{RootEpoch, RootEpochs, affected, mutation_paths};
 
 // ─────────────────── Protocol ───────────────────
 
@@ -82,6 +85,8 @@ enum Request {
         #[serde(default)]
         threads: usize,
     },
+    #[serde(rename = "invalidate_files")]
+    InvalidateFiles { id: u64, paths: Vec<String> },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
     /// Capability handshake.  The Vim side sends this once per daemon start and
@@ -145,6 +150,8 @@ enum Event {
         total_exact: bool,
         elapsed_ms: u128,
     },
+    #[serde(rename = "files_invalidated")]
+    FilesInvalidated { id: u64 },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
     #[serde(rename = "pong")]
@@ -165,6 +172,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("path_globs", true),
         ("stream", true),
         ("grep_cache", true),
+        ("invalidate_files", true),
     ])
 }
 
@@ -218,11 +226,37 @@ const CACHE_TTL_SECS: u64 = 30;
 const CACHE_MAX_ROOTS: usize = 16;
 
 struct CacheEntry {
+    root: PathBuf,
     files: Arc<Vec<String>>,
     created: Instant,
 }
 
-type FileCache = Arc<RwLock<HashMap<String, CacheEntry>>>;
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<String, CacheEntry>,
+    epochs: RootEpochs,
+}
+
+type FileCache = Arc<RwLock<CacheState>>;
+
+async fn invalidate_file_cache(cache: &FileCache, paths: &[PathBuf]) {
+    let mut state = cache.write().await;
+    state
+        .entries
+        .retain(|_, entry| !affected(&entry.root, paths));
+    state.epochs.invalidate(paths);
+}
+
+struct TrackedRoot {
+    path: PathBuf,
+    epoch: RootEpoch,
+}
+
+async fn begin_file_search(cache: &FileCache, raw_root: &str) -> Result<TrackedRoot, String> {
+    let path = validate_root(raw_root)?;
+    let epoch = cache.write().await.epochs.begin(&path);
+    Ok(TrackedRoot { path, epoch })
+}
 
 /// Drop entries that can no longer be served from cache, then enforce the
 /// size bound by evicting the oldest.  Called while inserting, so the write
@@ -278,43 +312,56 @@ fn walk_cache_key(
 /// before — walk — so a cold cache costs nothing but the lookup.
 async fn cached_files(
     cache: &FileCache,
-    root: &str,
+    root: &TrackedRoot,
     options: &WalkOptions<'_>,
 ) -> Option<Arc<Vec<String>>> {
-    let root_path = validate_root(root).ok()?;
-    let key = walk_cache_key(&root_path, options).ok()?;
-    let map = cache.read().await;
-    let entry = map.get(&key)?;
-    (entry.created.elapsed().as_secs() < CACHE_TTL_SECS).then(|| Arc::clone(&entry.files))
+    let key = walk_cache_key(&root.path, options).ok()?;
+    let state = cache.read().await;
+    let entry = state.entries.get(&key)?;
+    (root.epoch.is_current()
+        && entry.root == root.path
+        && entry.created.elapsed().as_secs() < CACHE_TTL_SECS)
+        .then(|| Arc::clone(&entry.files))
 }
 
-/// Publish a file list produced outside `get_or_walk_files` — a grep walk —
-/// so the next request can skip its own walk.  The caller must have walked the
-/// whole tree with these options; a partial list here is invisible corruption.
-async fn store_files(cache: &FileCache, root: &str, options: &WalkOptions<'_>, files: Vec<String>) {
-    // Both failures mean the root vanished or is unserialisable, which the
-    // grep that produced this list has already reported; there is nothing to
-    // cache and nothing further to say.
-    let Ok(root_path) = validate_root(root) else {
-        return;
-    };
-    let Ok(key) = walk_cache_key(&root_path, options) else {
-        return;
-    };
-    let mut map = cache.write().await;
-    map.insert(
+async fn publish_files(
+    cache: &FileCache,
+    root: &TrackedRoot,
+    key: String,
+    files: Arc<Vec<String>>,
+    token: &CancellationToken,
+) -> bool {
+    let mut state = cache.write().await;
+    if !root.epoch.is_current() || token.is_cancelled() {
+        return false;
+    }
+    state.entries.insert(
         key,
         CacheEntry {
-            files: Arc::new(files),
+            root: root.path.clone(),
+            files,
             created: Instant::now(),
         },
     );
-    prune_cache(&mut map);
+    prune_cache(&mut state.entries);
+    true
+}
+
+async fn store_files(
+    cache: &FileCache,
+    root: &TrackedRoot,
+    options: &WalkOptions<'_>,
+    files: Vec<String>,
+    token: &CancellationToken,
+) {
+    if let Ok(key) = walk_cache_key(&root.path, options) {
+        publish_files(cache, root, key, Arc::new(files), token).await;
+    }
 }
 
 async fn get_or_walk_files(
     cache: &FileCache,
-    root: &str,
+    root: &TrackedRoot,
     options: &WalkOptions<'_>,
     token: &CancellationToken,
 ) -> Result<Option<Arc<Vec<String>>>, String> {
@@ -325,22 +372,19 @@ async fn get_or_walk_files(
         exclude_globs,
         threads,
     } = *options;
-    let root_path = validate_root(root)?;
+    let root_path = root.path.clone();
     let cache_key = walk_cache_key(&root_path, options)?;
     let overrides = build_path_overrides(&root_path, include_globs, exclude_globs)?;
-
-    // Check cache first (with TTL)
-    {
-        let c = cache.read().await;
-        if let Some(entry) = c.get(&cache_key)
-            && entry.created.elapsed().as_secs() < CACHE_TTL_SECS
-        {
-            return Ok(Some(Arc::clone(&entry.files)));
-        }
+    if let Some(files) = cached_files(cache, root, options).await {
+        return Ok(Some(files));
+    }
+    if !root.epoch.is_current() || token.is_cancelled() {
+        return Ok(None);
     }
 
     // Walk in blocking thread to avoid stalling the async runtime
     let token_clone = token.clone();
+    let epoch = root.epoch.clone();
     let files = tokio::task::spawn_blocking(move || {
         let mut builder = WalkBuilder::new(&root_path);
         builder
@@ -360,8 +404,9 @@ async fn get_or_walk_files(
             let file_tx = file_tx.clone();
             let root_path = root_path.clone();
             let token = token_clone.clone();
+            let epoch = epoch.clone();
             Box::new(move |entry| {
-                if token.is_cancelled() {
+                if token.is_cancelled() || !epoch.is_current() {
                     return ignore::WalkState::Quit;
                 }
                 let entry = match entry {
@@ -379,7 +424,7 @@ async fn get_or_walk_files(
         });
         drop(file_tx);
 
-        if token_clone.is_cancelled() {
+        if token_clone.is_cancelled() || !epoch.is_current() {
             return None;
         }
         let mut files: Vec<String> = file_rx.into_iter().collect();
@@ -394,18 +439,11 @@ async fn get_or_walk_files(
     };
 
     let files = Arc::new(files);
-    {
-        let mut c = cache.write().await;
-        c.insert(
-            cache_key,
-            CacheEntry {
-                files: Arc::clone(&files),
-                created: Instant::now(),
-            },
-        );
-        prune_cache(&mut c);
-    }
-    Ok(Some(files))
+    Ok(
+        publish_files(cache, root, cache_key, Arc::clone(&files), token)
+            .await
+            .then_some(files),
+    )
 }
 
 fn validate_root(root: &str) -> Result<PathBuf, String> {
@@ -1060,8 +1098,27 @@ fn new_searcher() -> grep_searcher::Searcher {
         .build()
 }
 
+#[cfg(test)]
 fn handle_grep_sync(
     root: &str,
+    pattern: &str,
+    options: GrepOptions,
+    cached: Option<Arc<Vec<String>>>,
+    stream: Option<GrepSink>,
+    token: &CancellationToken,
+) -> Result<GrepOutcome, String> {
+    handle_grep_at(
+        &validate_root(root)?,
+        pattern,
+        options,
+        cached,
+        stream,
+        token,
+    )
+}
+
+fn handle_grep_at(
+    root_path: &Path,
     pattern: &str,
     options: GrepOptions,
     cached: Option<Arc<Vec<String>>>,
@@ -1078,7 +1135,6 @@ fn handle_grep_sync(
         .build(&expression)
         .map_err(|e| e.to_string())?;
 
-    let root_path = validate_root(root)?;
     let max_results = options.max.max(1);
     let ceiling = max_results
         .saturating_mul(GREP_SCAN_CEILING_FACTOR)
@@ -1087,10 +1143,10 @@ fn handle_grep_sync(
 
     let mut walked = match cached.as_ref() {
         Some(files) => {
-            grep_by_list(&scan, &root_path, files, options.threads, token);
+            grep_by_list(&scan, root_path, files, options.threads, token);
             None
         }
-        None => grep_by_walk(&scan, &root_path, &options, token)?,
+        None => grep_by_walk(&scan, root_path, &options, token)?,
     };
 
     // Completion-order accounting is ideal for the common exact case, but
@@ -1105,13 +1161,13 @@ fn handle_grep_sync(
             None => walked.take(),
         };
         if files.is_none() {
-            files = collect_grep_files(&root_path, &options, token)?;
+            files = collect_grep_files(root_path, &options, token)?;
         }
         if let Some(mut files) = files {
             files.sort();
             return Ok(grep_by_list_in_order(
                 scan.matcher_for_worker(),
-                &root_path,
+                root_path,
                 &files,
                 max_results,
                 ceiling,
@@ -1194,6 +1250,32 @@ async fn send_event(tx: &EventTx, evt: &Event) {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => tx.stalled.store(true, Ordering::Release),
         }
+    }
+}
+
+// Reserve outside the cache lock. Then check the generation and enqueue
+// synchronously under it, so an old result cannot cross an invalidation ACK.
+async fn send_search_event(
+    tx: &EventTx,
+    event: &Event,
+    cache: &FileCache,
+    root: &TrackedRoot,
+    token: &CancellationToken,
+) {
+    if tx.is_stalled() || !root.epoch.is_current() || token.is_cancelled() {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(event) else {
+        return;
+    };
+    let permit = tokio::time::timeout(Duration::from_secs(2), tx.sender.reserve()).await;
+    let _state = cache.read().await;
+    if !root.epoch.is_current() || token.is_cancelled() {
+        return;
+    }
+    match permit {
+        Ok(Ok(permit)) => permit.send(line),
+        Ok(Err(_)) | Err(_) => tx.stalled.store(true, Ordering::Release),
     }
 }
 
@@ -1397,7 +1479,7 @@ where
 
     let cancels: CancelMap = Arc::new(RwLock::new(HashMap::new()));
 
-    let file_cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
+    let file_cache: FileCache = Arc::new(RwLock::new(CacheState::default()));
 
     loop {
         if out_tx.is_stalled() {
@@ -1449,6 +1531,22 @@ where
                 )
                 .await;
             }
+            Request::InvalidateFiles { id, paths } => match mutation_paths(&paths) {
+                Ok(paths) => {
+                    invalidate_file_cache(&file_cache, &paths).await;
+                    send_event(&out_tx, &Event::FilesInvalidated { id }).await;
+                }
+                Err(message) => {
+                    send_event(
+                        &out_tx,
+                        &Event::Error {
+                            id,
+                            message: message.into(),
+                        },
+                    )
+                    .await
+                }
+            },
             Request::Cancel { id } => {
                 cancel_request(&cancels, id).await;
             }
@@ -1470,6 +1568,14 @@ where
 
                 request_tasks.spawn(async move {
                     let started = Instant::now();
+                    let root = match begin_file_search(&cache, &root).await {
+                        Ok(root) => root,
+                        Err(message) => {
+                            send_event(&tx, &Event::Error { id, message }).await;
+                            retire_request(&cancels, id, &token).await;
+                            return;
+                        }
+                    };
                     let files = match get_or_walk_files(
                         &cache,
                         &root,
@@ -1491,7 +1597,14 @@ where
                             return;
                         }
                         Err(message) => {
-                            send_event(&tx, &Event::Error { id, message }).await;
+                            send_search_event(
+                                &tx,
+                                &Event::Error { id, message },
+                                &cache,
+                                &root,
+                                &token,
+                            )
+                            .await;
                             retire_request(&cancels, id, &token).await;
                             return;
                         }
@@ -1515,12 +1628,15 @@ where
                             return;
                         }
                         Err(e) => {
-                            send_event(
+                            send_search_event(
                                 &tx,
                                 &Event::Error {
                                     id,
                                     message: format!("fuzzy match failed: {e}"),
                                 },
+                                &cache,
+                                &root,
+                                &token,
                             )
                             .await;
                             retire_request(&cancels, id, &token).await;
@@ -1532,7 +1648,7 @@ where
                         return;
                     }
                     let capped = total > items.len();
-                    send_event(
+                    send_search_event(
                         &tx,
                         &Event::FilesResult {
                             id,
@@ -1542,6 +1658,9 @@ where
                             capped,
                             elapsed_ms: started.elapsed().as_millis(),
                         },
+                        &cache,
+                        &root,
+                        &token,
                     )
                     .await;
 
@@ -1570,6 +1689,14 @@ where
 
                 request_tasks.spawn(async move {
                     let started = Instant::now();
+                    let root = match begin_file_search(&cache, &root).await {
+                        Ok(root) => root,
+                        Err(message) => {
+                            send_event(&tx, &Event::Error { id, message }).await;
+                            retire_request(&cancels, id, &token).await;
+                            return;
+                        }
+                    };
                     let token_clone = token.clone();
                     let max = max.min(5_000);
                     // Partial batches are best-effort: each one supersedes the
@@ -1580,11 +1707,10 @@ where
                     let sink: Option<GrepSink> = stream.then(|| {
                         let tx = tx.clone();
                         let stream_token = token.clone();
+                        let stream_epoch = root.epoch.clone();
+                        let stream_cache = cache.clone();
                         Arc::new(
                             move |items: Vec<GrepItem>, total: usize, total_exact: bool| {
-                                if stream_token.is_cancelled() {
-                                    return;
-                                }
                                 let event = Event::GrepResult {
                                     id,
                                     done: false,
@@ -1594,7 +1720,11 @@ where
                                     elapsed_ms: started.elapsed().as_millis(),
                                     items,
                                 };
-                                if let Ok(line) = serde_json::to_string(&event) {
+                                if let Ok(line) = serde_json::to_string(&event)
+                                    && let Ok(_state) = stream_cache.try_read()
+                                    && stream_epoch.is_current()
+                                    && !stream_token.is_cancelled()
+                                {
                                     let _ = tx.sender.try_send(line);
                                 }
                             },
@@ -1616,11 +1746,11 @@ where
                     } else {
                         None
                     };
-                    let root_for_cache = root.clone();
+                    let grep_root = root.path.clone();
                     let globs_for_cache = (include_globs.clone(), exclude_globs.clone());
                     let result = tokio::task::spawn_blocking(move || {
-                        handle_grep_sync(
-                            &root,
+                        handle_grep_at(
+                            &grep_root,
                             &pattern,
                             GrepOptions {
                                 is_regex: regex,
@@ -1656,7 +1786,7 @@ where
                                 let (include_globs, exclude_globs) = globs_for_cache;
                                 store_files(
                                     &cache,
-                                    &root_for_cache,
+                                    &root,
                                     &WalkOptions {
                                         hidden,
                                         no_ignore,
@@ -1665,11 +1795,12 @@ where
                                         threads,
                                     },
                                     walked,
+                                    &token,
                                 )
                                 .await;
                             }
                             let capped = outcome.total > outcome.items.len();
-                            send_event(
+                            send_search_event(
                                 &tx,
                                 &Event::GrepResult {
                                     id,
@@ -1680,19 +1811,32 @@ where
                                     total_exact: outcome.total_exact,
                                     elapsed_ms: started.elapsed().as_millis(),
                                 },
+                                &cache,
+                                &root,
+                                &token,
                             )
                             .await;
                         }
                         Ok(Err(msg)) => {
-                            send_event(&tx, &Event::Error { id, message: msg }).await;
+                            send_search_event(
+                                &tx,
+                                &Event::Error { id, message: msg },
+                                &cache,
+                                &root,
+                                &token,
+                            )
+                            .await;
                         }
                         Err(e) => {
-                            send_event(
+                            send_search_event(
                                 &tx,
                                 &Event::Error {
                                     id,
                                     message: format!("task failed: {e}"),
                                 },
+                                &cache,
+                                &root,
+                                &token,
                             )
                             .await;
                         }
@@ -2366,7 +2510,10 @@ mod tests {
         )
         .unwrap();
 
-        let cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: FileCache = Arc::new(RwLock::new(CacheState::default()));
+        let tracked = begin_file_search(&cache, root.to_str().unwrap())
+            .await
+            .unwrap();
         let options = WalkOptions {
             hidden: false,
             no_ignore: false,
@@ -2374,15 +2521,10 @@ mod tests {
             exclude_globs: &[],
             threads: 0,
         };
-        let walked = get_or_walk_files(
-            &cache,
-            root.to_str().unwrap(),
-            &options,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let walked = get_or_walk_files(&cache, &tracked, &options, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             outcome.walked.as_deref(),
@@ -2391,20 +2533,17 @@ mod tests {
         );
 
         // And it really does land in the cache the next request reads.
-        assert!(
-            cached_files(&cache, root.to_str().unwrap(), &options)
-                .await
-                .is_some()
-        );
+        assert!(cached_files(&cache, &tracked, &options).await.is_some());
         store_files(
             &cache,
-            root.to_str().unwrap(),
+            &tracked,
             &options,
             outcome.walked.unwrap(),
+            &CancellationToken::new(),
         )
         .await;
         assert_eq!(
-            cached_files(&cache, root.to_str().unwrap(), &options)
+            cached_files(&cache, &tracked, &options)
                 .await
                 .unwrap()
                 .as_ref(),
@@ -2547,11 +2686,14 @@ mod tests {
 
         let include = vec!["*.rs".to_owned()];
         let exclude = vec!["*.generated.rs".to_owned()];
-        let cache: FileCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: FileCache = Arc::new(RwLock::new(CacheState::default()));
+        let tracked = begin_file_search(&cache, root.to_str().unwrap())
+            .await
+            .unwrap();
         let token = CancellationToken::new();
         let files = get_or_walk_files(
             &cache,
-            root.to_str().unwrap(),
+            &tracked,
             &WalkOptions {
                 hidden: false,
                 no_ignore: false,
@@ -2570,7 +2712,7 @@ mod tests {
         // root with another include set must walk/cache a distinct path list.
         let markdown = get_or_walk_files(
             &cache,
-            root.to_str().unwrap(),
+            &tracked,
             &WalkOptions {
                 hidden: false,
                 no_ignore: false,
@@ -2584,7 +2726,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(markdown.as_ref(), &["docs/readme.md"]);
-        assert_eq!(cache.read().await.len(), 2);
+        assert_eq!(cache.read().await.entries.len(), 2);
 
         let grepped = handle_grep_sync(
             root.to_str().unwrap(),
@@ -2628,8 +2770,80 @@ mod tests {
 
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn retired_walks_cannot_rewarm_the_cache_or_send_final_results() {
+        let path = temp_project();
+        let cache: FileCache = Arc::new(RwLock::new(CacheState::default()));
+        let options = WalkOptions {
+            hidden: false,
+            no_ignore: false,
+            include_globs: &[],
+            exclude_globs: &[],
+            threads: 1,
+        };
+        let before_files = begin_file_search(&cache, path.to_str().unwrap())
+            .await
+            .unwrap();
+        let before_grep = begin_file_search(&cache, path.to_str().unwrap())
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let key = walk_cache_key(&before_files.path, &options).unwrap();
+        store_files(&cache, &before_grep, &options, vec!["stale".into()], &token).await;
+        assert!(
+            cached_files(&cache, &before_files, &options)
+                .await
+                .is_some()
+        );
+
+        invalidate_file_cache(&cache, &[before_files.path.join("retired")]).await;
+        let after = begin_file_search(&cache, path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(cached_files(&cache, &after, &options).await.is_none());
+        assert!(
+            !publish_files(
+                &cache,
+                &before_files,
+                key,
+                Arc::new(vec!["retired".into()]),
+                &token,
+            )
+            .await
+        );
+        store_files(
+            &cache,
+            &before_grep,
+            &options,
+            vec!["retired".into()],
+            &token,
+        )
+        .await;
+        assert!(cached_files(&cache, &after, &options).await.is_none());
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let tx = EventTx::new(sender);
+        let late = Event::Error {
+            id: 41,
+            message: "retired search".into(),
+        };
+        let fresh = Event::Error {
+            id: 42,
+            message: "current search".into(),
+        };
+        send_search_event(&tx, &late, &cache, &before_files, &token).await;
+        send_search_event(&tx, &late, &cache, &before_grep, &token).await;
+        send_search_event(&tx, &fresh, &cache, &after, &token).await;
+        let received: serde_json::Value =
+            serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(received["id"], 42);
+        assert!(receiver.try_recv().is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
     fn cache_entry(age: Duration) -> CacheEntry {
         CacheEntry {
+            root: PathBuf::new(),
             files: Arc::new(Vec::new()),
             created: Instant::now() - age,
         }

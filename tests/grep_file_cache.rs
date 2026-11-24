@@ -121,7 +121,7 @@ impl Daemon {
                 event["type"], "error",
                 "the daemon reported an error: {line}"
             );
-            if event["type"] == kind && event["done"] == true {
+            if event["type"] == kind && (event["done"] == true || kind == "files_invalidated") {
                 return event;
             }
         }
@@ -261,5 +261,49 @@ fn a_grep_that_asked_for_the_cache_reads_the_shared_list() {
         vec!["alpha.txt"],
         "the grep searched the file finder's list, which is what makes a \
          keystroke cost one read of known files instead of a fresh walk"
+    );
+}
+
+#[test]
+fn invalidation_refreshes_only_affected_roots_and_walk_variants() {
+    let a = Tree::new("invalidate-a");
+    let b = Tree::new("invalidate-b");
+    a.write("old.txt", "needle");
+    b.write("other.txt", "needle");
+    let mut daemon = Daemon::start();
+    let mut hidden_variant = files_request(2, &a.root());
+    hidden_variant["hidden"] = true.into();
+    for request in [
+        files_request(1, &a.root()),
+        hidden_variant.clone(),
+        files_request(3, &b.root()),
+    ] {
+        daemon.send(&request);
+        daemon.wait_for("files_result");
+    }
+    std::fs::rename(a.path.join("old.txt"), a.path.join("new.txt")).unwrap();
+    b.write("not_yet_visible.txt", "needle");
+    // Prove both requests came from the still-hot old cache, not a walk.
+    // Files serves the old name; grep cannot read that now-absent path.
+    daemon.send(&files_request(4, &a.root()));
+    assert_eq!(paths(&daemon.wait_for("files_result")), ["old.txt"]);
+    daemon.send(&grep_request(5, &a.root(), true));
+    assert!(paths(&daemon.wait_for("grep_result")).is_empty());
+    daemon.send(&serde_json::json!({
+        "type": "invalidate_files",
+        "id": 6,
+        "paths": [a.path.join("old.txt"), a.path.join("new.txt")],
+    }));
+    assert_eq!(daemon.wait_for("files_invalidated")["id"], 6);
+    daemon.send(&grep_request(7, &a.root(), true));
+    assert_eq!(paths(&daemon.wait_for("grep_result")), ["new.txt"]);
+    hidden_variant["id"] = 8.into();
+    daemon.send(&hidden_variant);
+    assert_eq!(paths(&daemon.wait_for("files_result")), ["new.txt"]);
+    daemon.send(&files_request(9, &b.root()));
+    assert_eq!(
+        paths(&daemon.wait_for("files_result")),
+        ["other.txt"],
+        "an unrelated root must retain its normal TTL cache"
     );
 }

@@ -32,6 +32,7 @@ var s_total: number = 0
 var s_current_id: number = 0
 var s_debounce_timer: number = 0
 var s_project_root: string = ''
+var s_local_search_root: string = '' # canonical root of the last local request
 var s_scroll_off: number = 0
 var s_eff_width: number = 50
 var s_eff_height: number = 20
@@ -1438,6 +1439,7 @@ def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = fal
   s_preview_scroll = 0
   s_remote_workspace = CurrentRemoteWorkspace()
   s_project_root = FindProjectRoot()
+  s_local_search_root = ''
 
   EnsurePanel()
   SetupSyntax()
@@ -2943,15 +2945,15 @@ def DebouncedSearch()
   })
 enddef
 
-def DispatchSearch()
+def DispatchSearch(may_start: bool = true)
   if s_mode ==# 'files'
-    SendFilesRequest(s_query)
+    SendFilesRequest(s_query, may_start)
   elseif s_mode ==# 'grep'
-    SendGrepRequest(s_query)
+    SendGrepRequest(s_query, may_start)
   elseif s_mode ==# 'igrep'
-    SendGrepRequest(s_query)
+    SendGrepRequest(s_query, may_start)
   elseif s_mode ==# 'symbols'
-    SendSymbolRequest(s_query)
+    SendSymbolRequest(s_query, may_start)
   elseif s_mode ==# 'buffers'
     FilterBuffers()
   elseif s_mode ==# 'recent'
@@ -3691,7 +3693,7 @@ def SendRemoteGrepRequest(pattern: string, force_regex: bool = false,
     RemoteGrepCommand(pattern, force_regex, case_query))
 enddef
 
-def SendFilesRequest(query: string)
+def SendFilesRequest(query: string, may_start: bool = true)
   if !PathGlobsReady()
     return
   endif
@@ -3699,7 +3701,12 @@ def SendFilesRequest(query: string)
     SendRemoteFilesRequest(query)
     return
   endif
-  if !EnsureBackend()
+  if may_start ? !EnsureBackend() : !simplefinder#core#Ready()
+    if !may_start
+      s_loading = false
+      s_error = 'local backend stopped before the refreshed search'
+      PanelRender()
+    endif
     return
   endif
   if AwaitNegotiation()
@@ -3711,6 +3718,7 @@ def SendFilesRequest(query: string)
   endif
   var id = NextId()
   s_current_id = id
+  s_local_search_root = resolve(s_project_root)
   s_loading = true
   s_error = ''
   PanelRender()
@@ -3728,7 +3736,7 @@ def SendFilesRequest(query: string)
   })
 enddef
 
-def SendGrepRequest(pattern: string)
+def SendGrepRequest(pattern: string, may_start: bool = true)
   if !PathGlobsReady()
     return
   endif
@@ -3754,7 +3762,12 @@ def SendGrepRequest(pattern: string)
     SendRemoteGrepRequest(pattern)
     return
   endif
-  if !EnsureBackend()
+  if may_start ? !EnsureBackend() : !simplefinder#core#Ready()
+    if !may_start
+      s_loading = false
+      s_error = 'local backend stopped before the refreshed search'
+      PanelRender()
+    endif
     return
   endif
   if AwaitNegotiation()
@@ -3766,6 +3779,7 @@ def SendGrepRequest(pattern: string)
   endif
   var id = NextId()
   s_current_id = id
+  s_local_search_root = resolve(s_project_root)
   s_loading = true
   s_error = ''
   PanelRender()
@@ -4429,7 +4443,7 @@ def SymbolPattern(query: string): string
   return '(^|[^A-Za-z0-9_])(' .. alternation .. ')[ \t]+[A-Za-z0-9_*&]*' .. name
 enddef
 
-def SendSymbolRequest(query: string)
+def SendSymbolRequest(query: string, may_start: bool = true)
   if !PathGlobsReady()
     return
   endif
@@ -4444,7 +4458,12 @@ def SendSymbolRequest(query: string)
     SendRemoteGrepRequest(pattern, true, query)
     return
   endif
-  if !EnsureBackend()
+  if may_start ? !EnsureBackend() : !simplefinder#core#Ready()
+    if !may_start
+      s_loading = false
+      s_error = 'local backend stopped before the refreshed search'
+      PanelRender()
+    endif
     return
   endif
   if AwaitNegotiation()
@@ -4455,6 +4474,7 @@ def SendSymbolRequest(query: string)
   endif
   var id = NextId()
   s_current_id = id
+  s_local_search_root = resolve(s_project_root)
   s_loading = true
   s_error = ''
   PanelRender()
@@ -5127,6 +5147,116 @@ def CancelActiveSearch()
     Send({type: 'cancel', id: s_current_id})
   endif
   s_current_id = 0
+enddef
+
+# The Tree event describes a filesystem entry, not the target of a leaf
+# symlink. For scope comparison resolve its parent, even after rename/delete.
+def LocalMutationPath(value: any): string
+  if type(value) != v:t_string || strlen(value) > 4096
+    return ''
+  endif
+  var path: string = value
+  if has('win32')
+    path = substitute(path, '\\', '/', 'g')
+  endif
+  var components = split(path, '/')
+  var absolute = has('win32') ? (path =~# '^\a:/' || path =~# '^//') : path =~# '^/'
+  if !absolute || index(components, '.') >= 0 || index(components, '..') >= 0
+      || path =~# '/$'
+    return ''
+  endif
+  return path
+enddef
+
+def MutationComparisonPath(path: string): string
+  var parent = resolve(fnamemodify(path, ':h'))
+  return substitute(parent, '/\+$', '', '') .. '/' .. fnamemodify(path, ':t')
+enddef
+
+def PathsOverlap(left: string, right: string): bool
+  var a = substitute(left, '/\+$', '', '')
+  var b = substitute(right, '/\+$', '', '')
+  if has('win32')
+    a = tolower(substitute(a, '\\', '/', 'g'))
+    b = tolower(substitute(b, '\\', '/', 'g'))
+  endif
+  return a ==# b || stridx(a, b .. '/') == 0 || stridx(b, a .. '/') == 0
+enddef
+
+export def OnTreeMutation(event: string)
+  # A notification is not authorization to start Finder or touch a remote
+  # projection. An unnegotiated/older standalone daemon keeps its normal TTL.
+  if !s_core_ready || !simplefinder#core#Negotiated()
+      || !simplefinder#core#HasCap('invalidate_files')
+      || !empty(s_remote_workspace)
+    return
+  endif
+  var data: any = get(g:, 'simpletree_event', {})
+  if type(data) != v:t_dict
+    return
+  endif
+  var paths: list<string>
+  if event ==# 'SimpleTreeFileRenamed'
+    paths = [LocalMutationPath(get(data, 'old', '')), LocalMutationPath(get(data, 'new', ''))]
+  elseif event ==# 'SimpleTreeFileCreated' || event ==# 'SimpleTreeFileDeleted'
+    paths = [LocalMutationPath(get(data, 'path', ''))]
+  else
+    return
+  endif
+  if index(paths, '') >= 0
+    return
+  endif
+  var publication: any = get(g:, 'simpleremote_workspace', {})
+  if type(publication) != v:t_dict
+    return
+  endif
+  var projected: any = get(publication, 'local_root', '')
+  if type(projected) != v:t_string
+      || (projected !=# '' && !empty(filter(copy(paths), (_, path) => PathsOverlap(projected, path))))
+    return
+  endif
+
+  var refresh = s_panel_winid > 0
+    && winbufnr(s_panel_winid) == s_panel_bufnr
+    && index(['files', 'grep', 'igrep', 'symbols'], s_mode) >= 0
+    && s_project_root !=# ''
+    && !empty(filter(copy(paths), (_, path) =>
+      PathsOverlap(s_project_root, MutationComparisonPath(path))
+      || (s_local_search_root !=# ''
+        && PathsOverlap(s_local_search_root, MutationComparisonPath(path)))))
+  if refresh
+    # Retire the old local id before any I/O or rendering. Replies already
+    # queued on the channel must not paint into the replacement search.
+    var retired = s_current_id
+    s_current_id = 0
+    s_stream_id = 0
+    if retired > 0
+      Send({type: 'cancel', id: retired})
+    endif
+    if s_debounce_timer > 0
+      timer_stop(s_debounce_timer)
+      s_debounce_timer = 0
+    endif
+    s_items = []
+    s_total = 0
+    s_capped = false
+    s_total_exact = true
+    s_elapsed_ms = 0
+    s_cursor_idx = 0
+    s_scroll_off = 0
+    s_loading = false
+  endif
+  # The daemon handles invalidation synchronously in the input loop. The
+  # subsequent search on the same channel cannot run before that cache fence.
+  var sent = Send({type: 'invalidate_files', id: NextId(), paths: paths})
+  if refresh
+    if sent
+      DispatchSearch(false)
+    else
+      s_error = 'local backend stopped before cache invalidation'
+      PanelRender()
+    endif
+  endif
 enddef
 
 # Every SimpleRemote event the finder follows lands here; the event name in

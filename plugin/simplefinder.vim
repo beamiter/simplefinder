@@ -149,4 +149,6 @@ augroup SimpleFinder
     \SimpleRemoteWorkspaceChanged,SimpleRemoteTreeRootChanged,
     \SimpleRemoteDisconnected simplefinder#OnRemoteWorkspace()
   autocmd User SimpleRemoteBufferRead simplefinder#OnRemoteBufferRead()
+  autocmd User SimpleTreeFileCreated,SimpleTreeFileRenamed,SimpleTreeFileDeleted
+    \ simplefinder#OnTreeMutation(expand('<amatch>'))
 augroup END
