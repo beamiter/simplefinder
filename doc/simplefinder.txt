@@ -38,8 +38,9 @@ it built for |:SimpleFinderFiles| for 30 seconds, and a grep whose filters match
 that list reads it instead of walking again — no directory stat-ed twice, no
 ignore file re-read — while a grep that does have to walk publishes its own list
 so the next keystroke can skip it. A compatible daemon invalidates affected
-local walks after a successful SimpleTree create, rename, or delete, without
-starting Finder or changing remote searches. Other changes still follow the
+local walks after a successful SimpleTree create, rename, or delete, or when
+Tree publishes |SimpleFinder-tree-paths-changed|, without starting Finder or
+changing remote searches. Other changes still follow the
 30-second TTL. Set |g:simplefinder_grep_cache| to 0 to walk for every grep.
 An older daemon keeps its existing behavior without Tree invalidation.
 
@@ -592,6 +593,15 @@ g:simplefinder_grep_cache
 	`invalidate_files`, successful SimpleTree create, rename, and delete
 	events also evict affected local lists. Other changes retain the TTL.
 	Set this to 0 to walk for every grep, as versions before 0.5.0 did.
+
+					*SimpleFinder-tree-paths-changed*
+	Finder also accepts the User event SimpleTreePathsChanged from
+	compatible SimpleTree versions. g:simpletree_event.paths must name
+	one or two absolute local filesystem entries. This reports changes to
+	entries, not an operation's success: a copy changes its destination,
+	while a move can change the source and destination even when cleanup
+	of the source is incomplete. Invalid or projected paths cause the
+	event to be ignored; no full-cache invalidation is performed.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs

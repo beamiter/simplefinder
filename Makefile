@@ -74,6 +74,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_pick.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_cache.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_invalidation.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_tree_paths_changed.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_tabs.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_negotiate.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_health.vim

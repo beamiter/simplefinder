@@ -63,8 +63,18 @@ let before = len(s:Requests('invalidate_files'))
 call s:Emit('SimpleTreeFileCreated', {'path': 'relative/../bad', 'is_dir': v:false})
 call s:Emit('SimpleTreeFileCreated', {'path': s:root .. '/../escape', 'is_dir': v:false})
 call s:Emit('SimpleTreeFileCreated', {'path': ['bad'], 'is_dir': v:false})
+call s:Emit('SimpleTreePathsChanged', {'paths': []})
+call s:Emit('SimpleTreePathsChanged', {'paths': s:root .. '/not-a-list'})
+call s:Emit('SimpleTreePathsChanged', {'paths': [s:root .. '/valid', {'bad': 1}]})
+call s:Emit('SimpleTreePathsChanged', {'paths': [s:root .. '/one', s:root .. '/two', s:root .. '/three']})
 let g:simpleremote_workspace = {'local_root': s:root}
 call s:Emit('SimpleTreeFileCreated', {'path': s:root .. '/projection', 'is_dir': v:false})
+call s:Emit('SimpleTreePathsChanged', {'paths': [s:other .. '/valid', s:root .. '/projection']})
+if has('unix')
+  call system('ln -s ' .. shellescape(s:root) .. ' ' .. shellescape(s:base .. '/alias'))
+  call assert_equal(0, v:shell_error, 'symlink test fixture setup')
+  call s:Emit('SimpleTreePathsChanged', {'paths': [s:base .. '/alias/projected-through-symlink']})
+endif
 unlet g:simpleremote_workspace
 sleep 30m
 call assert_equal(before, len(s:Requests('invalidate_files')), 'malformed event must not reach the daemon')
@@ -106,6 +116,7 @@ let $INVALIDATION_CAP = '0'
 SimpleFinderFiles
 call s:Until({-> len(s:Requests('files')) == 1}, 'legacy daemon continues standalone')
 call s:Emit('SimpleTreeFileDeleted', {'path': s:root .. '/another'})
+call s:Emit('SimpleTreePathsChanged', {'paths': [s:root .. '/local']})
 sleep 30m
 call assert_equal([], s:Requests('invalidate_files'), 'legacy peer must not receive unknown wire type')
 call assert_equal(1, len(s:Requests('files')), 'legacy TTL behavior must stay untouched')

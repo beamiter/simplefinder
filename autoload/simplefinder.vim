@@ -5200,6 +5200,19 @@ export def OnTreeMutation(event: string)
     paths = [LocalMutationPath(get(data, 'old', '')), LocalMutationPath(get(data, 'new', ''))]
   elseif event ==# 'SimpleTreeFileCreated' || event ==# 'SimpleTreeFileDeleted'
     paths = [LocalMutationPath(get(data, 'path', ''))]
+  elseif event ==# 'SimpleTreePathsChanged'
+    # A transfer can change two entries without constituting a rename (for
+    # example, when the destination is installed but source cleanup fails).
+    # Keep the existing one-or-two-path wire contract, and reject the whole
+    # event before sending anything if a member is invalid.
+    var changed: any = get(data, 'paths', [])
+    if type(changed) != v:t_list || empty(changed) || len(changed) > 2
+      return
+    endif
+    paths = []
+    for path in changed
+      paths->add(LocalMutationPath(path))
+    endfor
   else
     return
   endif
@@ -5216,14 +5229,18 @@ export def OnTreeMutation(event: string)
     return
   endif
 
+  var comparisons = mapnew(paths, (_, path) => MutationComparisonPath(path))
+  if projected !=# '' && event ==# 'SimpleTreePathsChanged'
+      && !empty(filter(copy(comparisons), (_, path) => PathsOverlap(resolve(projected), path)))
+    return
+  endif
   var refresh = s_panel_winid > 0
     && winbufnr(s_panel_winid) == s_panel_bufnr
     && index(['files', 'grep', 'igrep', 'symbols'], s_mode) >= 0
     && s_project_root !=# ''
-    && !empty(filter(copy(paths), (_, path) =>
-      PathsOverlap(s_project_root, MutationComparisonPath(path))
-      || (s_local_search_root !=# ''
-        && PathsOverlap(s_local_search_root, MutationComparisonPath(path)))))
+    && !empty(filter(comparisons, (_, path) =>
+      PathsOverlap(s_project_root, path)
+      || (s_local_search_root !=# '' && PathsOverlap(s_local_search_root, path))))
   if refresh
     # Retire the old local id before any I/O or rendering. Replies already
     # queued on the channel must not paint into the replacement search.
