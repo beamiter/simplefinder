@@ -58,7 +58,12 @@ call assert_true(simplefinder#core#HasCap('invalidate_files'))
 
 call writefile(['new'], s:a .. '/after-copy.txt')
 call s:Changed([s:a .. '/after-copy.txt'])
-call s:Until({-> s:Panel() =~# 'after-copy\.txt'}, 'one installed copy destination refreshes Finder')
+call writefile(['second'], s:a .. '/after-copy-two.txt')
+call s:Changed([s:a .. '/after-copy-two.txt'])
+call writefile(['third'], s:a .. '/after-copy-three.txt')
+call s:Changed([s:a .. '/after-copy-three.txt'])
+call s:Until({-> s:Panel() =~# 'after-copy\.txt' && s:Panel() =~# 'after-copy-two\.txt'
+      \ && s:Panel() =~# 'after-copy-three\.txt'}, 'three copy destinations refresh Finder')
 call assert_match('before-move\.txt', s:Panel(), 'a copy keeps its source')
 
 call assert_equal(0, rename(s:a .. '/before-move.txt', s:a .. '/after-move.txt'))

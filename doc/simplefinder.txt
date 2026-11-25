@@ -601,7 +601,11 @@ g:simplefinder_grep_cache
 	entries, not an operation's success: a copy changes its destination,
 	while a move can change the source and destination even when cleanup
 	of the source is incomplete. Invalid or projected paths cause the
-	event to be ignored; no full-cache invalidation is performed.
+	event to be ignored; no full-cache invalidation is performed. The daemon
+	receives each cache invalidation immediately. For a burst of paste
+	changes, the visible search is rerun once per 30 ms window, so slow
+	transfers can still show progress without rescanning after every item.
+	Starting another search takes precedence over the pending refresh.
 
 					*g:simplefinder_include_globs*
 g:simplefinder_include_globs

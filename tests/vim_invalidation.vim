@@ -124,6 +124,41 @@ call simplefinder#Stop()
 call s:Until({-> !simplefinder#core#IsRunning()}, 'legacy daemon stopped')
 call delete($INVALIDATION_LOG)
 
+" Tree paste emits one bounded path set per installed item. Fence them all
+" immediately; only the replacement query should be coalesced.
+let $INVALIDATION_CAP = '1'
+let g:simplefinder_root = s:root
+SimpleFinderFiles
+call s:Until({-> len(s:Requests('files')) == 1}, 'paste burst original search')
+let s:batch = [[s:root .. '/copy1'], [s:root .. '/copy2'], [s:root .. '/old3', s:root .. '/new3']]
+for s:paths in s:batch
+  call s:Emit('SimpleTreePathsChanged', {'paths': s:paths})
+endfor
+call s:Until({-> len(s:Requests('files')) >= 2}, 'paste burst replacement')
+sleep 60m
+call assert_equal(s:batch, map(s:Requests('invalidate_files'), 'v:val.paths'))
+call assert_equal(['ping', 'files', 'cancel', 'invalidate_files', 'invalidate_files',
+      \ 'invalidate_files', 'files'], map(readfile($INVALIDATION_LOG), 'json_decode(v:val).type'),
+      \ 'three exact cache fences must precede one replacement query')
+call assert_notmatch('STALE-RETIRED-RESULT',
+      \ join(getbufline(bufnr('SimpleFinder'), 1, '$'), "\n"), 'old results stay retired')
+
+call delete($INVALIDATION_LOG)
+call s:Emit('SimpleTreePathsChanged', {'paths': [s:root .. '/before-switch']})
+tabnew
+let g:simplefinder_root = s:other
+SimpleFinderFiles
+call s:Until({-> len(s:Requests('files')) >= 1}, 'project B opens before the paste timer')
+sleep 60m
+call assert_equal([s:other], map(s:Requests('files'), 'v:val.root'),
+      \ 'a deferred A refresh must not search A or duplicate the new B request')
+call assert_equal([[s:root .. '/before-switch']], map(s:Requests('invalidate_files'), 'v:val.paths'),
+      \ 'cancel the refresh, not the cache fence')
+tabclose
+call simplefinder#Stop()
+call s:Until({-> !simplefinder#core#IsRunning()}, 'paste burst daemon stopped')
+call delete($INVALIDATION_LOG)
+
 " Switch from A to the sibling root B before the A invalidate acknowledgment
 " and both A searches return. B retains its own pending request while the
 " controlled peer releases the old A acknowledgment and results.

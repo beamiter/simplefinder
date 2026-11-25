@@ -31,6 +31,7 @@ var s_cursor_idx: number = 0
 var s_total: number = 0
 var s_current_id: number = 0
 var s_debounce_timer: number = 0
+var s_tree_refresh_timer: number = 0
 var s_project_root: string = ''
 var s_local_search_root: string = '' # canonical root of the last local request
 var s_scroll_off: number = 0
@@ -296,12 +297,14 @@ def OnDaemonEvent(ev: dict<any>)
 enddef
 
 export def Stop()
+  CancelTreeRefresh()
   SetupCore()
   CancelNegotiation()
   simplefinder#core#Stop()
 enddef
 
 export def Restart()
+  CancelTreeRefresh()
   SetupCore()
   if simplefinder#core#Restart()
     echom '[SimpleFinder] daemon restarted'
@@ -1386,6 +1389,7 @@ enddef
 # =============================================================
 
 def PanelOpen(mode: string, initial_query: string = '', keep_options: bool = false)
+  CancelTreeRefresh()
   # Whatever the panel was searching for is now history, even when the user
   # went straight from one source to another without closing it.
   RecordHistory()
@@ -1494,6 +1498,7 @@ def EnsurePanel()
 enddef
 
 def PanelClose()
+  CancelTreeRefresh()
   RecordHistory()
   PreviewClose()
   PreviewCacheClear()
@@ -2931,6 +2936,7 @@ enddef
 # ─────────────────── Debounced search ───────────────────
 
 def DebouncedSearch()
+  CancelTreeRefresh()
   if s_debounce_timer > 0
     timer_stop(s_debounce_timer)
   endif
@@ -2946,6 +2952,7 @@ def DebouncedSearch()
 enddef
 
 def DispatchSearch(may_start: bool = true)
+  CancelTreeRefresh()
   if s_mode ==# 'files'
     SendFilesRequest(s_query, may_start)
   elseif s_mode ==# 'grep'
@@ -5141,6 +5148,7 @@ def ClearRemoteCaches()
 enddef
 
 def CancelActiveSearch()
+  CancelTreeRefresh()
   if s_remote_job_id > 0
     CancelRemoteJob()
   elseif s_current_id > 0 && simplefinder#core#IsRunning()
@@ -5181,6 +5189,39 @@ def PathsOverlap(left: string, right: string): bool
     b = tolower(substitute(b, '\\', '/', 'g'))
   endif
   return a ==# b || stridx(a, b .. '/') == 0 || stridx(b, a .. '/') == 0
+enddef
+
+def CancelTreeRefresh()
+  if s_tree_refresh_timer > 0
+    timer_stop(s_tree_refresh_timer)
+    s_tree_refresh_timer = 0
+  endif
+enddef
+
+def ScheduleTreeRefresh()
+  if s_tree_refresh_timer > 0
+    return
+  endif
+  var win = s_panel_winid
+  var buf = s_panel_bufnr
+  var root = s_project_root
+  var mode = s_mode
+  # Fixed window, not a trailing debounce. A slow async paste can still show
+  # progress; steady transfer traffic cannot postpone refresh indefinitely.
+  s_tree_refresh_timer = timer_start(30, (id) => {
+    if s_tree_refresh_timer != id
+      return
+    endif
+    s_tree_refresh_timer = 0
+    if win == s_panel_winid && buf == s_panel_bufnr && winbufnr(win) == buf
+        && root ==# s_project_root && mode ==# s_mode && empty(s_remote_workspace)
+      DispatchSearch(false)
+    endif
+  })
+  if s_tree_refresh_timer < 0
+    s_tree_refresh_timer = 0
+    DispatchSearch(false)
+  endif
 enddef
 
 export def OnTreeMutation(event: string)
@@ -5268,8 +5309,13 @@ export def OnTreeMutation(event: string)
   var sent = Send({type: 'invalidate_files', id: NextId(), paths: paths})
   if refresh
     if sent
-      DispatchSearch(false)
+      if event ==# 'SimpleTreePathsChanged'
+        ScheduleTreeRefresh()
+      else
+        DispatchSearch(false)
+      endif
     else
+      CancelTreeRefresh()
       s_error = 'local backend stopped before cache invalidation'
       PanelRender()
     endif
